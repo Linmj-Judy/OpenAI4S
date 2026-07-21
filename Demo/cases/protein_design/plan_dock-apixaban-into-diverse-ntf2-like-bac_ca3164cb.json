@@ -1,0 +1,99 @@
+{
+  "version": 3,
+  "created_at": "2026-07-21T11:17:51.253Z",
+  "task_summary": "Dock apixaban into diverse NTF2-like backbones and design binding sequences",
+  "agents": [],
+  "phases": [
+    {
+      "name": "Data preparation: ligand and scaffolds",
+      "delegations": [
+        {
+          "name": "Scaffolds",
+          "steps": [
+            {
+              "title": "Fetch NTF2-like protein structures from PDB",
+              "description": "Search PDB for NTF2-like domain structures (PFAM PF02136 or SCOP NTF2-like fold) with diverse pocket geometries. Select 3-5 structures spanning different pocket volumes, shapes, and electrostatic profiles. Download and prepare clean backbones (remove ligands, waters, keep only protein atoms)."
+            },
+            {
+              "title": "Characterize pocket geometries",
+              "description": "Compute pocket volumes, depths, and lining residue identities for each scaffold. Report on the diversity of the selected set."
+            }
+          ]
+        },
+        {
+          "name": "Ligand prep",
+          "steps": [
+            {
+              "title": "Obtain apixaban structure",
+              "description": "Get apixaban SMILES from PubChem (CID 10182969). Validate the structure and prepare an SDF file for docking."
+            }
+          ]
+        }
+      ],
+      "id": "phase-0"
+    },
+    {
+      "name": "Blind docking with DiffDock",
+      "delegations": [
+        {
+          "name": "Docking",
+          "steps": [
+            {
+              "title": "Dock apixaban into each NTF2-like backbone",
+              "description": "Run DiffDock-L blind docking of apixaban against each scaffold. Generate 40 samples per complex, ranked by confidence score. Extract top-ranked pose for each scaffold."
+            },
+            {
+              "title": "Analyze docking results",
+              "description": "Compare binding poses across scaffolds — pocket occupancy, key interactions, confidence scores. Select the most promising complexes (top 2-3) for sequence design."
+            }
+          ]
+        }
+      ],
+      "id": "phase-1"
+    },
+    {
+      "name": "Sequence design with LigandMPNN",
+      "delegations": [
+        {
+          "name": "Design",
+          "steps": [
+            {
+              "title": "Design sequences around docked apixaban",
+              "description": "For each selected complex, run LigandMPNN with ligand context enabled. Design sequences at multiple temperatures (0.1, 0.3, 0.5) to sample diversity. Redesign all residues within 8Å of the ligand; keep the scaffold core fixed."
+            },
+            {
+              "title": "Analyze designed sequences",
+              "description": "Compare designed sequences across scaffolds. Report sequence recovery vs native, ligand confidence scores, and identify conserved binding motifs. Output threaded PDBs and FASTA files."
+            }
+          ]
+        }
+      ],
+      "id": "phase-2"
+    },
+    {
+      "name": "Validation and reporting",
+      "delegations": [
+        {
+          "name": "Report",
+          "steps": [
+            {
+              "title": "Compile summary report",
+              "description": "Create a summary report with: scaffold pocket geometries, docking poses and confidence scores, designed sequences with ligand-confidence metrics, and recommendations for the best apixaban-binding designs. Include PyMOL-session files for visualization."
+            }
+          ]
+        }
+      ],
+      "id": "phase-3"
+    }
+  ],
+  "desired_outputs": [
+    "NTF2-like scaffold set with pocket characterization (CSV)",
+    "Docked apixaban poses ranked by confidence (SDF + summary CSV)",
+    "Designed protein sequences with ligand-confidence scores (FASTA + threaded PDBs)",
+    "Summary report with comparative analysis (HTML/PDF)"
+  ],
+  "feasibility": {
+    "rationale": "NTF2-like proteins are well-represented in the PDB. DiffDock provides blind docking without a predefined pocket, making it suitable for diverse scaffolds. LigandMPNN handles small-molecule context for sequence design. The main limitations are that DiffDock predicts pose geometry (not binding affinity), and designed sequences require experimental validation.",
+    "confidence": "high"
+  }
+}

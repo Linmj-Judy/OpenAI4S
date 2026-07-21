@@ -1,0 +1,6 @@
+pdb_id,resolution,organism,num_residues,description,cleaned_filename
+1GY6,1.6,Rattus norvegicus,125,Canonical NTF2 nuclear transport factor (dimer),1GY6_clean.pdb
+4FCJ,1.62,Homo sapiens,128,"G3BP1 NTF2-like domain, stress granule scaffolding protein",4FCJ_clean.pdb
+3MG1,1.65,Synechocystis sp.,302,"Orange Carotenoid Protein N-terminal domain, light-sensing carotenoid binder",3MG1_clean.pdb
+2QIY,1.69,Saccharomyces cerevisiae,134,"Bre5 cofactor of Ubp3 deubiquitinase, tetrameric assembly",2QIY_clean.pdb
+2A15,1.68,Mycobacterium tuberculosis,133,"RV0760 NTF2-like protein, unknown function, monomeric",2A15_clean.pdb

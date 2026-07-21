@@ -1,0 +1,6 @@
+rank,pdb_id,description,best_affinity,mode2_affinity,mode3_affinity,mode2_rmsd_lb,pocket_volume,druggability_score,hydrophobic_ratio,n_lining_residues
+1,3MG1,cyanobacterial OCP,-8.741,-7.964,-7.604,9.371,15549.2,1.5,0.664,125
+2,4FCJ,human G3BP1 NTF2-like,-7.242,-7.123,-6.912,0.9522,3765.7,1.5,0.682,44
+3,1GY6,rat NTF2,-6.094,-6.074,-5.806,0.8002,3907.4,1.5,0.681,47
+4,2QIY,yeast Bre5,-5.993,-5.64,-5.568,19.67,4395.9,1.3,0.729,48
+5,2A15,M. tuberculosis RV0760,-4.993,-4.758,-4.749,5.627,4258.0,1.5,0.58,50

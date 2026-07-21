@@ -1,0 +1,13 @@
+请使用 retrosynthesis_planning skill，对 aspirin 做逆合成规划。
+
+目标 SMILES:
+CC(=O)Oc1ccccc1C(=O)O
+
+要求：
+1. 先调用 host.search_skills("retrosynthesis route planning") 读取 skill。
+2. 使用 conda 环境 retro 调用 AiZynthFinder。
+3. 配置文件使用 /Users/wangyu/Documents/Openai4S/retro_data/config.yml。
+4. 生成 aspirin_routes.json。
+5. 解析并排序路线。
+6. 生成 HTML route tree 和 Markdown 分析报告。
+7. 总结 top route 的 score、steps、stock precursors 和风险点。

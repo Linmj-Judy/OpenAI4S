@@ -1,0 +1,2 @@
+name,cid,smiles,molecular_formula,molecular_weight,num_rotatable_bonds,num_hbd,num_hba,tpsa,logp
+Apixaban,10182969,COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N,C25H25N5O4,459.5,5,1,5,110.8,2.7

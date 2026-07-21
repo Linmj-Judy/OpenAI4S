@@ -1,0 +1,547 @@
+# 基于 NTF2 Scaffold 的 Apixaban 结合蛋白设计
+
+## 1. 你的角色
+
+你是一名计算蛋白质设计、蛋白–小分子 docking 和结构生物信息学研究员。
+
+请参考论文：
+
+**Small-molecule binding and sensing with a designed protein family**
+
+独立完成一个计算复现任务：
+
+> 将 apixaban 装入一组具有 NTF2-like fold 的蛋白口袋中，使用 RIFdock 搜索合理的 protein–ligand pose，使用 LigandMPNN 设计与配体兼容的蛋白序列，再通过 Rosetta、AlphaFold2 和 GALigandDock 对候选进行筛选和迭代优化。
+
+本 case 只包含计算设计和回顾性分析，不执行湿实验。
+
+不得编造未实际运行的结果。
+
+---
+
+## 2. 固定输入
+
+### 2.1 小分子
+
+目标小分子为 **Apixaban，APX**。
+
+使用以下标识交叉核对分子身份：
+
+* PubChem CID：**10182969**
+* ChEBI ID：**CHEBI:72296**
+* PDB Chemical Component ID：**GG2**
+* 分子式：**C25H25N5O4**
+* InChIKey：**QNZCBYKSOIHPEH-UHFFFAOYSA-N**
+* SMILES：
+
+```text
+COc1ccc(-n2nc(C(N)=O)c3c2C(=O)N(c2ccc(N4CCCCC4=O)cc2)CC3)cc1
+```
+
+从至少两个化学数据库核验：
+
+* 元素组成；
+* 键级；
+* 芳香性；
+* 净电荷；
+* 质子化状态；
+* 分子立体化学；
+* tautomer 状态。
+
+Apixaban 在本任务中应按中性分子处理，但必须重新使用 pKa 或结构规则确认其在目标实验 pH 下的主要微观状态。
+
+---
+
+### 2.2 蛋白 Scaffold
+
+主要 scaffold 输入为论文作者生成的：
+
+* **NTF2 scaffold Set 2**
+* **NTF2 scaffold Set 3**
+
+这些是 de novo scaffold library，不具有统一的天然蛋白 PDB ID。必须保留作者数据包中每个 scaffold 的原始内部 ID。
+
+论文中：
+
+* Set 2 包含 **3,230** 个通过 ProteinMPNN 和 AlphaFold2 筛选的 backbone；
+* Set 3 包含 **6,838** 个参数化生成并通过 ProteinMPNN、AlphaFold2 筛选的 backbone。
+
+从论文 Source Data 或作者归档中取得 scaffold PDB 文件。不得用 apx1049 的实验结构作为设计输入。
+
+### 2.3 可选天然结构对照
+
+可以加入以下天然 KSI/NTF2-like 结构作为独立对照：
+
+* PDB：**3OV4**
+* Chain：**A**
+
+论文的回顾性结构分析中，3OV4_A 是 apx1049 最接近的天然 KSI 结构，TM-score 为 0.80。
+
+它只能作为：
+
+* scaffold-space 对照；
+* pocket 几何参照；
+* 结构相似性分析对象。
+
+不要把其中原有配体或配体相互作用直接转移到设计结果中。
+
+---
+
+## 3. 隐藏答案和盲测规则
+
+以下数据在最终候选排序冻结前不得用于设计或筛选：
+
+* 设计名称：**apx1049**
+* PDB：**8VFQ**
+* PDB：**8VEZ**
+* 8VFQ/8VEZ 中的蛋白序列；
+* 8VFQ/8VEZ 中 apixaban 的坐标；
+* apx1049 的口袋残基身份；
+* apx1049 的实验氢键和芳香相互作用；
+* 论文中成功 APX hits 的序列与实验排名。
+
+候选排名完成后：
+
+1. 导出全部评分表；
+2. 保存 top candidates；
+3. 记录随机种子；
+4. 计算 SHA256；
+5. 记录冻结时间；
+6. 再下载 8VFQ 和 8VEZ；
+7. 进行回顾性结构比较。
+
+---
+
+## 4. 科学问题
+
+回答以下问题：
+
+1. 多样化 NTF2-like scaffold 是否能容纳 apixaban？
+2. LigandMPNN 是否能够生成同时支持蛋白折叠和 ligand interaction 的序列？
+3. Rosetta 中看起来较好的设计，在 AlphaFold2 预测后是否仍能保持原 pocket？
+4. GALigandDock 重新采样后，apixaban 是否回到接近设计 pose 的位置？
+5. 最终设计能否独立恢复与实验结构类似的口袋几何和相互作用原理？
+
+---
+
+## 5. Scaffold 预处理
+
+对每个 Set 2 和 Set 3 scaffold：
+
+1. 检查 PDB 完整性；
+2. 删除无关原子和标签；
+3. 统一链 ID 和 residue numbering；
+4. 识别 NTF2 中央口袋；
+5. 计算：
+
+   * 蛋白长度；
+   * 二级结构组成；
+   * pocket volume；
+   * pocket depth；
+   * pocket opening area；
+   * radius of gyration；
+   * buried cavity volume；
+   * buried unsatisfied polar atoms；
+   * Rosetta monomer energy；
+   * potential aggregation patches。
+
+重新进行单序列结构预测。
+
+尽量采用论文设置：
+
+* AlphaFold2 model 4；
+* 10 recycles；
+* 不使用模板；
+* 不使用 MSA。
+
+参考论文 scaffold 过滤条件：
+
+* 平均 pLDDT > 92；
+* AlphaFold2 模型与输入 backbone 的 Cα RMSD < 1 Å。
+
+若使用其他结构预测器，必须使用其真实指标名称，不得将其他 confidence score 冒充为 AlphaFold2 pLDDT。
+
+---
+
+## 6. Apixaban 构象生成
+
+从给定 SMILES 生成 apixaban 的三维构象。
+
+按照论文流程：
+
+1. 使用 RDKit ETKDGv2 生成 **200 个构象**；
+2. 使用 MMFF 对每个构象进行局部优化；
+3. 删除：
+
+   * 价态错误结构；
+   * 高能异常结构；
+   * 明显原子碰撞；
+   * 重复构象；
+4. 按 heavy-atom RMSD 聚类；
+5. 从主要聚类中选择最低能代表；
+6. 目标保留 **26 个代表构象**；
+7. 使用 AIMNet 或可验证的量子化学近似势进行最后最小化。
+
+输出：
+
+* SDF；
+* MOL2；
+* conformer energy；
+* cluster ID；
+* heavy-atom RMSD matrix；
+* 关键 rotatable-bond dihedral；
+* Rosetta params；
+* partial charges。
+
+验证 RDKit、OpenBabel 和 Rosetta 中的原子命名可以一一对应。
+
+---
+
+## 7. RIFdock Protein–Ligand Docking
+
+将全部 apixaban conformer docking 至通过预筛选的 Set 2 和 Set 3 scaffold。
+
+采用论文的 design approach 2：
+
+* unconstrained RIFdock；
+* 不固定原 scaffold 的氨基酸身份；
+* RIFgen 中列入多种氨基酸与 apixaban 原子的潜在氢键组合；
+* 不要求使用预安装 HBNet；
+* 允许后续 LigandMPNN 完整重设计序列。
+
+初筛指标：
+
+* contact molecular surface，CMS；
+* ligand burial fraction；
+* protein–ligand clash；
+* shape complementarity；
+* pocket occupancy；
+* ligand SASA change；
+* potential hydrogen bonds；
+* buried unsatisfied ligand polar atoms；
+* ligand strain energy。
+
+Pilot 最低规模：
+
+* 至少 500 个不同 scaffold；
+* 覆盖全部 26 个 conformer；
+* 至少评价 100,000 个 docking pose；
+* 保留至少 2,000 个 scaffold–ligand pose 进入序列设计。
+
+完整复现可使用 Set 2 和 Set 3 全集。
+
+---
+
+## 8. LigandMPNN 序列设计
+
+对通过 docking 初筛的复合物运行 LigandMPNN。
+
+论文参考设置：
+
+* 每个输入生成 **8 条序列**；
+* sampling temperature：**T = 0.2**；
+* LigandMPNN 读取：
+
+  * protein backbone；
+  * apixaban 原子坐标；
+* 第一轮不施加原 scaffold sequence constraint；
+* 共执行三轮 LigandMPNN–Rosetta 交替优化。
+
+三轮优化：
+
+1. LigandMPNN → RosettaPackMin；
+2. LigandMPNN → RosettaPackMin；
+3. LigandMPNN → Rosetta FastRelax。
+
+对每轮保存：
+
+* sequence；
+* LigandMPNN score；
+* per-residue probability；
+* total Rosetta score；
+* protein–ligand ddG；
+* CMS；
+* nHb；
+* ligand RMSD；
+* backbone RMSD；
+* pocket side-chain RMSD；
+* buried unsatisfied polar atoms；
+* exposed hydrophobic surface。
+
+---
+
+## 9. 配体位置约束
+
+选择 apixaban 中不包含 rotatable bond 的中央刚性基团。
+
+对该刚性基团的 ligand atoms，与距离其 10 Å 内的 protein Cα 建立距离约束。
+
+使用：
+
+* harmonic potential；
+* 标准差：**0.5 Å**。
+
+保存：
+
+* 被约束的 ligand atom；
+* 对应 protein residue；
+* 初始距离；
+* 优化后距离；
+* restraint energy。
+
+进行一组消融：
+
+* 有 ligand restraints；
+* 无 ligand restraints。
+
+比较：
+
+* ligand pose drift；
+* ligand strain；
+* Rosetta ddG；
+* CMS；
+* nHb；
+* GALigandDock pose recovery。
+
+---
+
+## 10. Rosetta 与 AlphaFold2 筛选
+
+### 10.1 第一轮设计参考阈值
+
+论文 Supplementary Table 1 对 APX round 1 使用：
+
+* Rosetta CMS > 250；
+* Rosetta ddG < −40；
+* protein–ligand nHb ≥ 2；
+* AlphaFold2 pLDDT > 80；
+* AlphaFold2 Cα RMSD < 1 Å；
+* binding-site side-chain RMSD < 2 Å。
+
+### 10.2 Resampling 后参考阈值
+
+论文对 APX resampling 使用：
+
+* Rosetta CMS > 280；
+* Rosetta ddG < −45；
+* protein–ligand nHb ≥ 1；
+* AlphaFold2 pLDDT > 80；
+* AlphaFold2 Cα RMSD < 1 Å；
+* binding-site side-chain RMSD < 2 Å。
+
+这些阈值只能作为 paper-like filter。
+
+同时建立连续多目标 ranking，避免将略微越过单一阈值、但整体较好的设计全部删除。
+
+---
+
+## 11. GALigandDock 迭代
+
+对通过 AlphaFold2 筛选的候选：
+
+1. 使用 AlphaFold2 预测结构替代原 backbone；
+2. 在预测 pocket 中重新运行 GALigandDock；
+3. 同时采样：
+
+   * apixaban conformer；
+   * ligand rigid-body translation；
+   * ligand rigid-body rotation；
+   * pocket side-chain rotamer；
+4. 保留 ligand all-atom RMSD < 2 Å 的 docking solution；
+5. 对这些 solution 再进行一轮：
+
+   * LigandMPNN；
+   * Rosetta Relax；
+   * AlphaFold2；
+   * GALigandDock。
+
+检查设计是否能在不依赖固定 backbone 的情况下重建 ligand pose。
+
+---
+
+## 12. 最终候选选择
+
+选择最终 20 个候选。
+
+综合指标包括：
+
+* fold confidence；
+* backbone recapitulation；
+* binding-site side-chain recapitulation；
+* Rosetta ddG；
+* CMS；
+* shape complementarity；
+* nHb；
+* ligand burial；
+* ligand pose recovery；
+* ligand strain；
+* buried unsatisfied polar atoms；
+* monomer energy；
+* aggregation risk；
+* sequence diversity；
+* scaffold diversity；
+* pose diversity。
+
+最终集合至少包含：
+
+* 5 个 scaffold cluster；
+* 3 个 ligand-pose cluster；
+* 多种极性网络；
+* 多种芳香或疏水 packing pattern。
+
+---
+
+## 13. 解盲后的结构验证
+
+候选排名冻结后下载：
+
+* **PDB 8VFQ**
+* **PDB 8VEZ**
+
+两者均为 apx1049–apixaban 实验结构；其 ligand component ID 为 GG2。
+
+比较你的 top candidates 与实验结构：
+
+* global Cα RMSD；
+* pocket backbone RMSD；
+* pocket side-chain RMSD；
+* ligand heavy-atom RMSD；
+* ligand orientation；
+* pocket volume；
+* ligand burial；
+* contact recovery；
+* hydrogen-bond recovery；
+* aromatic-interaction recovery；
+* interface fingerprint similarity。
+
+不得只用全局 TM-score 判断设计成功，因为小分子口袋的局部几何比全局折叠相似性更关键。
+
+---
+
+## 14. 论文结果基准
+
+论文中可用于校验任务难度的基准包括：
+
+### 设计漏斗
+
+* Set 2：3,230 个 scaffold；
+* Set 3：6,838 个 scaffold；
+* 最终订购：9,024 个 APX designs；
+* yeast screening 后识别：8 个 unique APX hits。
+
+### 计算质量
+
+全部已识别小分子 hits 的总体范围为：
+
+* AlphaFold2 pLDDT：86–95；
+* Cα RMSD：<2 Å；
+* 各靶标 hit 的 median Rosetta ddG：<−30；
+* median CMS：>240。
+
+### Apixaban 实验结果
+
+* apx1049 的 ITC KD：**0.679 μM**；
+* apx1493：9.67 μM；
+* apx1501：5.5 μM；
+* apx2592：3.16 μM。
+
+### 实验结构
+
+* apx1049–apixaban 晶体分辨率：约 **2.1 Å**；
+* design model 与晶体结构：
+
+  * Cα RMSD：**0.6 Å**
+  * 对齐残基数：113；
+* 实验结构重现了设计中的关键极性和芳香作用；
+* PDB：8VFQ、8VEZ。
+
+这些数据只能在结果完成后作为 benchmark，不得作为候选选择标签。
+
+---
+
+## 15. 需要复现或生成的图表
+
+### 对应论文图表
+
+1. **Main Fig. 1B**
+   NTF2 scaffold generation、ligand docking、sequence design 和筛选流程。
+
+2. **Main Fig. 2A**
+   Apixaban 化学结构。
+
+3. **Main Fig. 2B**
+   design model 与 AlphaFold model 的叠合以及配体结合模式。
+
+4. **Main Fig. 2D–E**
+   APX binders 的 SEC 和亲和力表征。
+
+5. **Main Fig. 3C–D**
+   apx1049 design model、晶体结构和 binding pocket 的叠合。
+
+6. **Supplementary Fig. 1**
+   三套 NTF2 scaffold 的生成与筛选漏斗。
+
+7. **Supplementary Fig. 2**
+   Rosetta CMS、ddG、nHb，以及 AF2 pLDDT、Cα RMSD、SC-RMSD 分布。
+
+8. **Supplementary Fig. 4**
+   实验 hits 与全部 ordered designs 的指标对比。
+
+9. **Supplementary Fig. 6**
+   apx1049 的 site-saturation mutagenesis conservation pattern。
+
+10. **Supplementary Fig. 8**
+    apx1049 晶体结构和 electron-density validation。
+
+11. **Supplementary Fig. 9**
+    designed NTF2 与天然 KSI 的结构空间。
+
+12. **Supplementary Tables 1–5**
+    过滤阈值、亲和力、晶体学统计、结构相似性和 ligand chemical similarity。
+
+### 本 case 必须新增
+
+1. APX conformer clustering；
+2. docking funnel；
+3. scaffold pocket-volume 分布；
+4. CMS–ddG scatter；
+5. ligand RMSD–pocket RMSD scatter；
+6. 有无 restraint 的消融；
+7. Set 2 与 Set 3 成功率比较；
+8. top-20 candidate contact map；
+9. 解盲后候选与 8VFQ/8VEZ 的局部口袋叠合；
+10. 成功与失败设计的结构对照。
+
+---
+
+## 16. 交付物
+
+提供：
+
+* 完整研究报告；
+* scaffold manifest；
+* conformer SDF；
+* Rosetta params；
+* 全部候选 CSV/Parquet；
+* docking pose PDB；
+* AlphaFold2 models；
+* GALigandDock models；
+* top-20 structures；
+* 所有图表及绘图代码；
+* environment/container；
+* 软件版本；
+* checkpoint ID；
+* random seeds；
+* job logs；
+* failed-job list；
+* CPU/GPU hour 汇总；
+* 一键复现脚本。
+
+最终结论必须从以下选项中选择：
+
+* 成功生成可信 APX binding pockets；
+* 获得有希望但证据不足的候选；
+* protein fold 稳定但 ligand pose 不稳定；
+* ligand pose 稳定但 protein sequence 不可设计；
+* 结果高度依赖 restraints；
+* 当前 pilot 未达到论文级设计质量；
+* 因采样量或技术失败无法判断。

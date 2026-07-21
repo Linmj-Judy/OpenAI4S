@@ -1,0 +1,6 @@
+pdb_id,resolution,organism,num_residues,description,max_pocket_volume,max_druggability
+1GY6,1.6,various,125,,3907,1.5
+4FCJ,1.62,various,128,,3766,1.5
+3MG1,1.649,various,302,,15549,1.5
+2QIY,1.69,various,134,,4396,1.3
+2A15,1.68,various,133,,4258,1.5
