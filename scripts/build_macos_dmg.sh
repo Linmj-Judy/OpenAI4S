@@ -11,8 +11,11 @@
 # worker.py) then resolves correctly wherever the .app lives, and all writable
 # state goes to ~/.openai4s (outside the read-only bundle).
 #
-# No Apple Developer credentials are used: the app is ad-hoc signed only (free),
-# which is still required so Apple Silicon does not kill an unsigned binary.
+# Signing follows the release environment: use a configured Developer ID
+# identity when one is supplied, otherwise fall back to an ad-hoc signature so
+# Apple Silicon does not kill an unsigned binary. This builder does not submit
+# to Apple's notary service or staple a ticket; the release gate verifies those
+# facts separately and refuses an un-notarized public DMG.
 set -euo pipefail
 
 APP_NAME="OpenAI4S"
@@ -104,14 +107,15 @@ echo "   runtime python: $("$RUNPY" -c 'import sys;print(sys.version.split()[0])
 # 3) pre-bake the science stack into the runtime so the app runs the default
 #    kernel env's workflows offline with no task-time install. The package set
 #    is the pip-installable superset of envs/python.yml, kept in one manifest
-#    (scripts/dmg_bundled_packages.txt) that the bundle verifier reads too, so
+#    (scripts/bundled_packages.txt) that the bundle verifier — and the Linux
+#    builder, which pre-bakes the same set — read too, so
 #    "what we install" and "what we check" cannot drift.
 # --------------------------------------------------------------------------- #
 echo "-- [3/10] installing the science stack into the runtime (this is the slow step) --"
 # python-build-standalone ships a PEP 668 marker; drop it on our private copy so
 # pip may install into the bundled interpreter's own site-packages.
 rm -f "$RUNTIME"/lib/python*/EXTERNALLY-MANAGED 2>/dev/null || true
-MANIFEST="$REPO_ROOT/scripts/dmg_bundled_packages.txt"
+MANIFEST="$REPO_ROOT/scripts/bundled_packages.txt"
 if [ ! -f "$MANIFEST" ]; then
   echo "error: missing package manifest $MANIFEST" >&2
   exit 1
@@ -149,7 +153,8 @@ rsync -a \
   --exclude '.claude' \
   "$REPO_ROOT/openai4s" "$REPO_ROOT/openai4s_compute_provider" \
   "$REPO_ROOT/openai4s_worker_runtime" \
-  "$REPO_ROOT/envs" "$REPO_ROOT/skills" "$REPO_ROOT/scripts" "$REPO_ROOT/docs" \
+  "$REPO_ROOT/envs" "$REPO_ROOT/skills" "$REPO_ROOT/workflows" \
+  "$REPO_ROOT/scripts" "$REPO_ROOT/docs" \
   "$SRC/"
 cp "$REPO_ROOT/README.md" "$REPO_ROOT/README_zh.md" "$REPO_ROOT/LICENSE" \
    "$REPO_ROOT/.env.example" "$REPO_ROOT/pyproject.toml" "$SRC/" 2>/dev/null || true
@@ -333,11 +338,26 @@ echo "-- [8/10] precompiling bytecode (sealed into the signature) --"
 echo "   compiled: $(find "$APP" -name '*.pyc' | wc -l | tr -d ' ') .pyc files"
 
 # --------------------------------------------------------------------------- #
-# 9) ad-hoc codesign (no Apple Developer credentials; required on Apple Silicon)
+# 9) codesign (Developer ID when configured, otherwise ad-hoc)
 # --------------------------------------------------------------------------- #
-echo "-- [9/10] ad-hoc codesigning --"
-codesign --force --deep --sign - --timestamp=none "$APP" 2>&1 | tail -2 || true
-codesign --verify --deep "$APP" && echo "   codesign verify: OK" || echo "   codesign verify: WARN (ad-hoc)"
+SIGNING_IDENTITY="${OPENAI4S_MACOS_SIGNING_IDENTITY:-}"
+if [ -n "$SIGNING_IDENTITY" ]; then
+  # A configured identity must actually be *used*. It used to be read only by
+  # the release gate, which marked the image signed without inspecting it — so
+  # setting the secret changed nothing about the image and everything about
+  # what the pipeline believed.
+  echo "-- [9/10] codesigning with Developer ID --"
+  codesign --force --deep --options runtime --timestamp \
+    --sign "$SIGNING_IDENTITY" "$APP"
+  codesign --verify --deep --strict "$APP"
+  echo "   codesign verify: OK (Developer ID)"
+  SIGNING_KIND="Developer ID signed"
+else
+  echo "-- [9/10] ad-hoc codesigning (no OPENAI4S_MACOS_SIGNING_IDENTITY) --"
+  codesign --force --deep --sign - --timestamp=none "$APP" 2>&1 | tail -2 || true
+  codesign --verify --deep "$APP" && echo "   codesign verify: OK" || echo "   codesign verify: WARN (ad-hoc)"
+  SIGNING_KIND="ad-hoc signed"
+fi
 
 # --------------------------------------------------------------------------- #
 # 10) build the DMG
@@ -352,8 +372,8 @@ OpenAI4S $VERSION — first launch on macOS
 
 1. Drag OpenAI4S.app onto the Applications folder (shown here).
 
-2. This build is ad-hoc signed but NOT notarized (no Apple Developer account),
-   so Gatekeeper will refuse it on first launch. To open it:
+2. This build is $SIGNING_KIND but NOT notarized by this builder, so Gatekeeper
+   may refuse it on first launch. To open it:
      • macOS 15 (Sequoia) and newer: double-click, dismiss the warning, then go
        to System Settings → Privacy & Security and press "Open Anyway".
      • macOS 12-14: right-click (or Control-click) OpenAI4S.app → Open → Open.

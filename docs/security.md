@@ -31,7 +31,7 @@ untrusted multi-tenant sandbox.
 | **Biosecurity screener** | `OPENAI4S_BIOSECURITY` (on) | trajectory screener (ALLOW / ESCALATE / BLOCK) on biosecurity-relevant content |
 | **Injection detector** | `OPENAI4S_INJECTION_SCAN` (on) | annotates tool-returned content (web / PDF / MCP) so the model treats it as **data, not instructions** |
 | **Egress allowlist** | `OPENAI4S_EGRESS` (`off`) | application policy for `web_fetch` / `web_search` and authorized `host.bash`; the OS sandbox is the separate raw-network boundary |
-| **Remote-compute confinement** | `OPENAI4S_COMPUTE_CONFINEMENT` (`auto`) | `enforce` refuses `byoc:*` ops because no host-side boundary exists for the provider helper yet (see [`docs/compute.md`](compute.md)); `auto` runs unconfined and reports the posture rather than implying one |
+| **Remote-compute confinement** | `OPENAI4S_COMPUTE_CONFINEMENT` (`auto`) | the provider helper runs inside a real OS boundary — Seatbelt on macOS, bubblewrap on Linux — that puts the user's home out of reach — a `tmpfs` over it on Linux; on macOS a denial of `file-read-data` *and* `file-read-xattr`, since an xattr on macOS routinely holds the file's own bytes and `getxattr` was serving what `open` refused — confines writes to the job's stage directory, and (macOS) denies the keychain services, because the credential is read *by securityd* and no file rule covers that. `available()` proves it by establishing a boundary and probing it, not by `which`; the helper re-checks from inside before reading a credential and exits 71 without acting if it does not hold. **The network is deliberately not isolated** (`network_isolated: false`) — calling a provider's REST API is the helper's whole job, so outbound egress is a separate capability and is not enabled. `enforce` refuses `byoc:*` ops only where no boundary can be established: no `bwrap`/`sandbox-exec` on `PATH`, a host that fails the self-test (e.g. unprivileged user namespaces disabled), or a platform with no backend — and it refuses on *every* op, not just submit. `auto` degrades visibly in those same cases; `off` skips the wrapping entirely (see [`docs/compute.md`](compute.md)) |
 | **Secret store** | `OPENAI4S_SECRET_STORE` (`auto`) | credentials behind an opaque reference in the system keychain (after a real round-trip self-test) or the process environment; `auto` **fails closed** when neither is available. Plaintext is reachable only by asking for it by name, and no obfuscated-file fallback exists |
 | **Data-dir permissions** | always on | the data dir is `0700` and the database (plus any `-wal`/`-shm`) is `0600`; POSIX only — Windows needs an ACL, and the posture reports `supported: false` there rather than claiming a boundary |
 | **Browser response headers** | always on | a hash-based CSP with no `'unsafe-inline'` in `script-src` and a same-origin `connect-src`, plus `nosniff` / `X-Frame-Options` / `Referrer-Policy` on every response including streamed artifact bytes |
@@ -164,16 +164,104 @@ right for a field and wrong for a log line where a token sits mid-sentence. An
 earlier version of the bundle passed the structured lines and leaked the plain
 one.
 
+The log tail it collects is `logs/app.out` — the file every packaged launcher
+redirects the daemon's stdout and stderr into, and therefore where structured
+events land, since they are written to stderr. An earlier version globbed
+`*.log*`, which matches no file the product writes, so a bundle from a real
+install carried postures and versions and *no logs at all*, with a manifest
+that listed what it did include and so read as complete.
+
+A credential inside a **URL** needs its own pass. `redact_text` scans word by
+word and a URL has no spaces, so the whole thing arrives as one word — and
+`_looks_opaque` deliberately answers "not a credential" for anything starting
+`http://`, because fingerprinting every URL would gut the log. The secret is
+*inside*, in a query value or a path segment, so URL-shaped words go through
+`observability.redact_url`, which keeps the parameter name as provenance and
+fingerprints the value. The daemon's own startup banner is exactly this shape —
+`listening at http://127.0.0.1:8760/?token=…`, printed to stdout, which the
+launchers redirect into `app.out`, which the bundle collects.
+
+What leaves in the bundle is decided **deny-by-default**, and that is a
+different layer from the redaction above. `redact`/`redact_text`/
+`redact_identities`/`redact_url` make the *local* operator log safer to read,
+and the log keeps its richness on disk. The archive is narrower, because it is
+the thing standing between a user's disk and a public issue tracker:
+
+- a **structured** line survives only as an allowlist of known keys, and every
+  key is checked against a **closed set written down in source** — not against
+  a pattern. That distinction took three attempts to get right, and each wrong
+  answer was the same mistake at a smaller scale. First one shared "short
+  enough" regex, which admitted spaces, `/` and `.`: prose in `detail`, a path
+  in `surface`, a command in `status`. Then per-field *patterns*, which
+  admitted `PRIVATE_COHORT_ALPHA_SEVEN` — a legal identifier with no digits, so
+  it satisfies every identifier rule and never reads as opaque. **Syntax is not
+  provenance.** Now `event` and `surface` are the vocabularies this repository
+  emits, `exception` is a category from a named set of exception types, `level`
+  and `status` are enums, `detail` is one fixed sentence, and a variable id
+  (`request_id`, `correlation_id`) is *always* fingerprinted — even though the
+  daemon generates those, because the archive reads them out of `app.out` and a
+  line in a file can carry any 16- or 32-hex string. Support loses nothing: the
+  fingerprint of the id a user quotes matches the one in the archive.
+- a **file name** is not metadata either. Log members are numbered by the
+  archive (`logs/log-0001.json`) and the MANIFEST lists only those generated
+  names, because a log named after a token puts it in two places no content
+  scrubber looks: the ZIP member name and the listing.
+- an **unstructured** line is never shared verbatim at all. `app.out` is the
+  daemon's whole stdout and stderr — every `print`, every `traceback.print_exc`,
+  every dependency's chatter — and no pattern set makes arbitrary text safe. The
+  archive carries a count, a classification and a fingerprint instead.
+- `report.json` is built to a **declared schema** whose leaves are closed sets,
+  numbers, or reductions — never patterns. `machine` is the real architecture
+  set, `platform` and `backend` are enums, a version keeps only its parsed
+  numeric components (`6.5.0-15-generic` → `6.5`, `3.privatecohortalpha` → `3`)
+  and a migration name is fingerprinted rather than enumerated, because an
+  enumerated set of names would go stale *silently* the day someone adds one.
+  `json.dumps(..., default=str)` is gone, unknown keys are counted rather than
+  rendered, and nothing calls `str()` or `repr()` on a value **or a key**: a
+  mapping key can be an object whose `__str__` raises or returns 50 MB.
+
+`record_diagnostic` is the source, and it no longer renders the exception.
+There is no redacted rendering of `str(exc)` on the record, because a rendering
+is the one operation an unknown exception influences and it can be arbitrary,
+enormous, or itself raise. The record carries the surface, the exception's
+class **category** — the nearest ancestor in a set of exception types this
+repository names, so `type("PRIVATE_COHORT_ALPHA_SEVEN", (RuntimeError,), {})`
+reports `RuntimeError` and the caller's own string never appears — and an
+`error_class` fingerprint derived from the *type*, so two
+occurrences of the same failure remain recognisably the same failure and a
+support ticket quoting a `request_id` still leads somewhere. The same rule
+applies to the agent's observation when an environment switch fails, and to the
+two posture probes in `security_posture`, which report an `error_type` rather
+than an exception message.
+
+An earlier version of this section said a shell command quoted inside a failure
+was "deliberately not removed" because the bundle is operator-facing. That was
+wrong on its own evidence: the same change made `app.out` the file the bundle
+collects, and once an artifact leaves the machine "operator-facing" is not a
+property it still has.
+
 ### Credentials at rest
 
 Model and search credentials are held by a **SecretBroker**
 ([`security/secret_broker.py`](../openai4s/security/secret_broker.py)): the row
-stores an opaque reference such as `secret://v1/llm/llm_api_key` and the value
-lives in the system keychain. The reference is not derived from the value, so it
-is safe to log and safe to sit in a row. Covered today: `llm_api_key`,
-`tavily_api_key`, the per-profile `api_key` of every saved model profile
-(`secret://v1/model_profile/<id>`), and every connector `env` value
-(`secret://v1/connector_env/<id>.<VAR>`).
+stores an opaque reference and the value lives in the system keychain. New
+references use
+`secret://v2/<store-namespace>/<scope>/<name>`; the namespace is a
+domain-separated digest of the canonical database path, not the path or any
+credential. Thus two data directories cannot overwrite the same physical
+Keychain or Secret Service slot, and copying a database does not copy authority
+to its credentials. The reference is not derived from the value, so it is safe
+to log and safe to sit in a row. Covered today: `llm_api_key`,
+`tavily_api_key`, the shared `agent_plan_key` used by DataPro and Doubao Search,
+the per-profile `api_key` of every saved model profile, and every connector
+`env` value.
+
+Legacy v1 system-keychain references contain no Store ownership evidence. They
+are never read, claimed, or deleted automatically; the UI reports the
+credential absent and the user saves it again into the v2 Store namespace.
+This deliberately leaves the ambiguous legacy slot untouched because another
+data directory may still use it. DB-local plaintext v1 slots remain readable,
+as do explicitly process-global environment variables.
 
 Connector env brokers **every** value, not only the credential-shaped ones.
 Choosing by variable name would mean a regex over names — the same name-based
@@ -204,14 +292,45 @@ was exactly the one that silently got none, while a laptop that needed it least
 got the keychain. A warning printed at boot is not a control; it scrolls away
 and the credential stays in the clear.
 
-**Servers supply credentials through the environment.** Set
-`OPENAI4S_SECRET_<SCOPE>_<NAME>` (e.g. `OPENAI4S_SECRET_LLM_LLM_API_KEY`) from
-systemd's `EnvironmentFile`, a Kubernetes Secret, or whatever the config
-management already owns; set `OPENAI4S_SECRET_ENV=1` to opt in before any are
-configured. **Nothing is written to disk** — stronger than the keychain case,
-not a fallback from it. It is read-only on purpose: if the environment owns the
-secret, the app must not overwrite it behind the operator's back, so a write
-attempt fails with the exact variable name to set.
+**Servers supply credentials through the environment.** The preferred variable
+is `OPENAI4S_SECRET_V2_<STORE_NAMESPACE>_<SCOPE>_<NAME>`. Existing
+`OPENAI4S_SECRET_<SCOPE>_<NAME>` variables (for example,
+`OPENAI4S_SECRET_LLM_LLM_API_KEY`) remain an explicit process-global fallback,
+so an upgrade does not silently change an operator's deployment contract. Set
+either from systemd's `EnvironmentFile`, a Kubernetes Secret, or whatever the
+config management already owns; set `OPENAI4S_SECRET_ENV=1` to opt in before any
+are configured. **Nothing is written to disk** — stronger than the keychain
+case, not a fallback from it. It is read-only on purpose: if the environment
+owns the secret, the app must not overwrite it behind the operator's back, so a
+write attempt fails with the exact preferred variable name to set.
+
+An injected credential resolves **with no settings row at all**, which is the
+only state a fresh server can be in: nothing can put the reference row there,
+because `put` refuses by design and migration has no plaintext to move. A
+resolver that stopped at an empty row made the variable dead on any data
+directory that had never had a key saved through a writable backend — and
+nothing raised, so the symptom was only that the UI reported the model as
+unconfigured. `resolve_setting` therefore asks a **read-only** backend for
+`<scope>/<key>` when the row is absent, the scope coming from the same
+`SETTINGS_SECRETS` table migration uses. Read-only specifically: behind a
+writable backend an empty row is the app's own answer, and since clearing a key
+swallows a failed delete, going to the backend anyway would let a revoked
+credential come back to life.
+
+The reference it builds carries this Store's **namespace**, i.e. the same v2
+reference `put` would have written. That is not a detail: a v1 reference
+reaches only the plain `OPENAI4S_SECRET_<SCOPE>_<NAME>`, while the refusal an
+operator sees when the UI declines to save a key names the namespaced
+`OPENAI4S_SECRET_V2_<NS>_<SCOPE>_<NAME>`. Built the v1 way, following that
+instruction exactly still resolved to nothing — the same dead end one spelling
+over. The v2 path tries the namespaced variable and falls back to the plain
+one, so both work; the plain form is the portable one, since a namespace is
+derived from the data directory's real path and a Secret written against one
+data directory would not resolve after the volume moved.
+
+The corollary is that clearing an injected key from the UI does not unset it —
+the environment owns that value, and the settings route reports the
+`has_api_key` it re-reads afterwards rather than claiming the clear took.
 
 Backends are driven through the system CLIs, because the core is stdlib-only and
 cannot depend on `keyring`: `security` on macOS, `secret-tool` (Secret Service)
@@ -237,7 +356,9 @@ working, reported on stderr.
 
 Still outstanding, and stated plainly rather than left implied:
 
-- **Windows has no backend**, so it resolves to plaintext under `auto`.
+- **Windows has no system-keychain backend**, so `auto` fails closed unless
+  environment injection is configured. Plaintext remains available only when
+  the operator explicitly selects `OPENAI4S_SECRET_STORE=plaintext`.
   `security` and `secret-tool` cover macOS and Linux desktops; DPAPI would need
   a `ctypes` shim.
 - **The file mode is the only barrier for what is not yet migrated.** The data
@@ -270,7 +391,32 @@ The daemon binds `127.0.0.1` by default. Reach the UI over an SSH tunnel — **n
 ssh -L 8760:127.0.0.1:8760 user@your-host
 ```
 
-If you must bind a non-loopback address (`OPENAI4S_HOST=0.0.0.0`) or set `OPENAI4S_REQUIRE_TOKEN=1`, the server prints a one-time access token at startup and rejects any request without `?token=…` (`401`).
+One documented exception: when a WSL2 user has explicitly set
+`localhostForwarding=false` in `.wslconfig`, the Windows launcher binds the
+daemon to the WSL NAT (`eth0`) address instead, because loopback is then
+unreachable from the Windows browser. That address is routable only from the
+Windows host across Microsoft's virtual switch — not from the LAN — and the
+token gate below still applies to it. Details:
+[Windows / WSL2 guide](windows-wsl.md).
+
+The server requires an access token by default, on loopback too. It is minted
+once under the data dir (`access-token`, mode 0600), survives restarts, and is
+printed at startup as a URL you open once to set the cookie. Scripts send it as
+`Authorization: Bearer <token>` or `X-OpenAI4S-Token`.
+
+The `?token=` form in that startup URL works for one thing only: opening the
+app at `/`. Every other path refuses it — including `/preview/<id>`, which
+answers with artifact bytes and used to be bootstrappable because the rule was
+written as "not `/api/v1/*` and not `/static/*`" rather than as an allowlist. A
+mutation carrying `?token=` is refused outright, cookie or no cookie: a URL
+with a credential in it is a credential you can paste into chat, and one that
+still works is one nobody notices they leaked.
+
+`OPENAI4S_REQUIRE_TOKEN=0` turns the gate off on loopback, until the version
+named by `gateway.LEGACY_TOKEN_OPT_OUT_REMOVED_IN`. Weigh it against what the daemon exposes: `kernel/execute`,
+`compute/jobs` and `host.bash` all execute code, and "local" includes every
+other process on the machine. The Host and Origin guards stop a malicious web
+page; they do nothing about a local process.
 
 ## Web sharing
 

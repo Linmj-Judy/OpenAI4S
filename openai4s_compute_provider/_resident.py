@@ -17,6 +17,7 @@ environment. run_oneshot self-enforces confinement
 (exit 71) before touching stdin; run_repl reports it via {ready, confined} for
 the host to gate.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -65,8 +66,12 @@ def scrub_secret_env(extra_prefixes: tuple[str, ...] = ()) -> None:
     ``*_TOKEN``, ``*_SECRET`` …) OR starts with a baseline / provider secret
     prefix. This is a name-based heuristic: a secret stored under a name that
     matches neither rule is NOT scrubbed. Everything else survives — e.g.
-    ``OPENAI4S_HOST_NETNS_INO`` (the confinement probe's anchor) and
-    ``HTTP_PROXY``/``HTTPS_PROXY``. Note ``NVIDIA_VISIBLE_DEVICES`` IS removed
+    ``OPENAI4S_HOST_HOME_DEV`` (the confinement probe's live anchor; the older
+    ``OPENAI4S_HOST_NETNS_INO`` is now only a fallback for a host a release
+    behind) and ``HTTP_PROXY``/``HTTPS_PROXY``. Both anchors must keep
+    surviving: scrubbing one is not a broken variable but a probe that cannot
+    verify the boundary, which ``_probe_confined`` answers by failing closed.
+    Note ``NVIDIA_VISIBLE_DEVICES`` IS removed
     (the ``NVIDIA_`` prefix catches it, deliberately — the confined helper
     does no GPU work of its own).
     """
@@ -188,21 +193,62 @@ class ByocResident:
                 return True
             except Exception:
                 return False
-        # Linux: confined <=> a network-namespace unshare put us in a fresh
-        # netns. Compare against the host's netns inode (passed via env at
-        # spawn); comparing against PID 1's fails under a pid-namespace
-        # unshare, and iface enumeration is brittle.
+        # Linux: the invariant is the *filesystem* one, matching macOS. A
+        # network-namespace check was the original design, and a helper whose
+        # whole job is calling a provider's REST API cannot live in an empty
+        # netns without a host egress proxy in front of it — so it could never
+        # pass, and Linux stayed unconfined waiting for a decision. Network
+        # isolation is now a separate capability that the host reports on
+        # explicitly; this asks only whether the user's home has been replaced.
+        #
+        # `$HOME` under bwrap's `--tmpfs` is readable and *empty*, not EPERM, so
+        # emptiness cannot be the test — an empty home is a legitimate home.
+        # The host passes the device id of the real home and a differing one in
+        # here means the tmpfs is mounted. Same shape as the netns-inode anchor
+        # this replaces: the value has to come from outside, because a confined
+        # process cannot obtain it.
+        home = os.path.expanduser("~")
+        host_dev = os.environ.get("OPENAI4S_HOST_HOME_DEV")
+        if host_dev:
+            try:
+                return os.stat(home).st_dev != int(host_dev)
+            except (OSError, ValueError):
+                return False
+        # No anchor supplied: fall back to the netns comparison a host a
+        # release behind may still be establishing.
+        #
+        # Every failure below is fail-*closed*, and that is a correction. Each
+        # of these paths reports on a check that could not be performed, and
+        # they used to answer "I could not verify the boundary" with `True` —
+        # the boundary is there. `run_oneshot` only asks when the caller passed
+        # `expect_confined`, so a `True` here lets an unconfined helper go on to
+        # read the credential and call the provider having proven nothing:
+        # exactly the confinement theatre the anchor exists to prevent, arrived
+        # at by the one route that never trips a test.
+        #
+        # Neither OSError is evidence of confinement. Under the real bwrap
+        # boundary `/proc` is mounted (`--proc /proc`), so a *missing* `/proc`
+        # says the process is somewhere unexpected, not somewhere confined. And
+        # `/proc/1/ns/net` is routinely unreadable to an unprivileged process
+        # whose PID 1 is root's — the most reachable way into this branch, and
+        # the one where "assume confined" is least defensible.
         try:
             mine = os.stat("/proc/self/ns/net").st_ino
         except OSError:
-            return True
+            return False
         host = os.environ.get("OPENAI4S_HOST_NETNS_INO")
         if host:
-            return mine != int(host)
+            # A malformed anchor is a host that cannot answer the question
+            # either; it must not crash the helper *or* pass it. The
+            # `OPENAI4S_HOST_HOME_DEV` branch above already catches ValueError.
+            try:
+                return mine != int(host)
+            except ValueError:
+                return False
         try:
             return mine != os.stat("/proc/1/ns/net").st_ino
         except OSError:
-            return True
+            return False
 
     def _handshake(self) -> None:
         write_ready(confined=self._probe_confined())
@@ -309,23 +355,40 @@ class ByocResident:
         try:
             owner = self._p.read_owner(sid)
         except Exception:
-            self._best_effort_terminate(sid)
+            self._best_effort_terminate(sid, stage=self._stage(req))
             raise
         if owner != req["install_id"]:
-            self._best_effort_terminate(sid)
+            gone = self._best_effort_terminate(sid, stage=self._stage(req))
             raise ByocError(
                 "ownership_mismatch",
                 f"created sandbox {sid} but its owner tag read back as "
                 f"{owner!r}, not this openai4s install — refusing to "
-                f"proceed (sandbox has been best-effort terminated).",
+                f"proceed (sandbox has been "
+                + ("terminated" if gone else "left running — terminate it by hand")
+                + ").",
             )
         return {"ok": True, "sandbox_id": sid}
 
-    def _best_effort_terminate(self, sid: str) -> None:
+    def _best_effort_terminate(self, sid: str, stage: str | None = None) -> bool:
+        """Terminate, and report whether it was *confirmed*.
+
+        The host reads ``stage/sandbox_id`` to learn about a sandbox a dying
+        helper never got to mention. Clearing that file on a confirmed
+        terminate is what keeps the signal honest in both directions: present
+        means "may still exist and may still bill", absent means "nothing was
+        left behind". Swallowing the terminate failure and clearing anyway
+        would recreate the orphan the file exists to prevent.
+        """
         try:
             self._p.terminate(sid)
         except Exception:
-            pass
+            return False
+        if stage:
+            try:
+                os.unlink(os.path.join(stage, "sandbox_id"))
+            except OSError:
+                pass
+        return True
 
     @staticmethod
     def _drain_wait(r) -> int:

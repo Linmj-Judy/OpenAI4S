@@ -17,6 +17,7 @@ background cells) and any nested/delegated dispatcher all gate uniformly and
 their prompts surface in the one conversation the user is watching — without the
 delegation subsystem needing to know anything about the gate.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -266,6 +267,7 @@ class PermissionBroker:
         tool_call_id: str | None = None,
         side_effect_class: str | None = None,
         resource_keys: list[str] | tuple[str, ...] | None = None,
+        dangerous: bool = False,
         timeout: float | None = None,
     ) -> dict:
         # Resolve the conversation identity + project from the dispatcher's frame
@@ -343,6 +345,12 @@ class PermissionBroker:
             "tool_call_id": tool_call_id,
             "side_effect_class": side_effect_class,
             "resource_keys": list(resource_keys or ()),
+            # The tool's own risk declaration, so the card can ask for a
+            # dangerous capability differently than for a file read. Carried in
+            # the payload rather than a new column: the payload is stored with
+            # the request, so the durable record and any replay of it keep the
+            # fact without a migration.
+            "dangerous": bool(dangerous),
         }
         wait_seconds = timeout if timeout is not None else self.DEFAULT_TIMEOUT
         try:
@@ -543,16 +551,28 @@ class PermissionBroker:
         """
 
         if not decision_id:
-            return {"ok": False, "error": "decision_id is required"}
+            return {
+                "ok": False,
+                "error": "decision_id is required",
+                "code": "decision_id_required",
+            }
         normalized_scope = _scope(scope)
         with self._lock:
             pend = self._pending.get(decision_id)
             if pend is not None:
                 pending_root = str(pend.payload.get("frame_id") or "")
                 if root_frame_id and pending_root != root_frame_id:
-                    return {"ok": False, "error": "decision does not belong to frame"}
+                    return {
+                        "ok": False,
+                        "error": "decision does not belong to frame",
+                        "code": "decision_not_found",
+                    }
                 if pend.event.is_set():
-                    return {"ok": False, "error": "decision is already resolving"}
+                    return {
+                        "ok": False,
+                        "error": "decision is already resolving",
+                        "code": "decision_in_flight",
+                    }
                 pend.allow = bool(allow)
                 pend.scope = normalized_scope
                 pend.pattern = pattern
@@ -586,7 +606,11 @@ class PermissionBroker:
                     continue
                 request_root = str(request.get("root_frame_id") or "")
                 if root_frame_id and request_root != root_frame_id:
-                    return {"ok": False, "error": "decision does not belong to frame"}
+                    return {
+                        "ok": False,
+                        "error": "decision does not belong to frame",
+                        "code": "decision_not_found",
+                    }
                 state = str(request.get("state") or "")
                 if state == "pending":
                     expires_at = request.get("expires_at")
@@ -607,7 +631,11 @@ class PermissionBroker:
                             )
                         except Exception:  # noqa: BLE001 - best-effort cleanup
                             pass
-                        return {"ok": False, "error": "approval request expired"}
+                        return {
+                            "ok": False,
+                            "error": "approval request expired",
+                            "code": "decision_expired",
+                        }
                     request = durable_store.resolve_permission_request(
                         decision_id,
                         state=terminal,
@@ -625,6 +653,7 @@ class PermissionBroker:
                     return {
                         "ok": False,
                         "error": f"decision is already {state or 'resolved'}",
+                        "code": "decision_already_resolved",
                     }
                 if _scope(request.get("scope")) != normalized_scope or (
                     request.get("pattern") or None
@@ -632,6 +661,7 @@ class PermissionBroker:
                     return {
                         "ok": False,
                         "error": "resolved decision scope or pattern cannot be changed",
+                        "code": "decision_immutable",
                     }
 
                 if not _restart_resolution_marker(
@@ -641,6 +671,11 @@ class PermissionBroker:
                         "ok": False,
                         "decision_recorded": True,
                         "error": "approval was recorded but its continuation marker failed",
+                        # The approval IS written. P0-4's `output_committed`
+                        # exists for exactly this: the UI must not offer a
+                        # retry that would submit a decision twice.
+                        "code": "decision_continuation_failed",
+                        "output_committed": True,
                         "requires_continue": False,
                         "original_action_executed": False,
                     }
@@ -698,15 +733,17 @@ class PermissionBroker:
                     ),
                     "continuation_authorization": (
                         (
-                            "consumed"
-                            if once_consumed
-                            else ("expired" if once_expired else "once")
+                            (
+                                "consumed"
+                                if once_consumed
+                                else ("expired" if once_expired else "once")
+                            )
+                            if allow and normalized_scope == "once"
+                            else "standing_rule"
                         )
-                        if allow and normalized_scope == "once"
-                        else "standing_rule"
-                    )
-                    if allow
-                    else None,
+                        if allow
+                        else None
+                    ),
                 }
             except Exception:  # noqa: BLE001 — try another registered store
                 continue

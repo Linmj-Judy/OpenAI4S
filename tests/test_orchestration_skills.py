@@ -13,6 +13,7 @@ A regression from this suite caught a real bug: endpoints.register allocated a
 fresh random port on every call, so a byte-identical re-registration wrongly
 tripped the approval card (port is the name's mutex and must be reused).
 """
+
 import json
 import shutil
 import sqlite3
@@ -70,6 +71,37 @@ def test_kernel_boots_with_host_facade(session):
     assert _emit(kernel, "hasattr(host, 'skills') and hasattr(host, 'query')") is True
 
 
+def test_kernel_loads_bundled_skill_guidance_through_sdk(session):
+    _cfg, _disp, kernel = session
+    loaded = _emit(kernel, "host.load_skill('example_stats')")
+
+    assert loaded["name"] == "example_stats"
+    assert "from example_stats.kernel import" in loaded["content"]
+
+
+def test_kernel_loads_narrow_datapro_skill_for_the_managed_connector(session):
+    _cfg, _disp, kernel = session
+    loaded = _emit(kernel, "host.load_skill('volcengine-datapro')")
+
+    assert loaded["name"] == "volcengine-datapro"
+    content = loaded["content"]
+    assert 'host.mcp.tools("volcengine-datapro")' in content
+    assert '"dataPro_search"' in content
+    assert "host.mcp.call(" in content
+    assert '{"query": query}' in content
+    assert "type(code) is int and code == 0" in content
+    assert 'result.get("index")' in content
+    assert 'index.get("complete") is True' in content
+    assert (
+        'index.get("source_leaf_count") == index.get("indexed_leaf_count")' in content
+    )
+    assert 'index.get("source_digest") == index.get("indexed_digest")' in content
+    assert "Key 无效、额度不足，或者专业数据集 Harness 未开启。" in content
+    assert "datapro.hqd.cn-beijing.volces.com" not in content
+    assert "X-Agent-Plan-Key" not in content
+    assert "X-Hqd-Extra-Info" not in content
+
+
 # --- customize -----------------------------------------------------------
 
 
@@ -119,13 +151,24 @@ def test_self_awareness_query(session):
     schema = _emit(kernel, "host.query.schema()")
     assert "frames" in schema
 
-    rows = _emit(
-        kernel,
-        'host.query("SELECT name FROM sqlite_master '
-        "WHERE type='table' ORDER BY name\", limit=100)",
+    # Schema discovery goes through the sanctioned accessor, which lists
+    # tables *and* their columns and honours the denylist.
+    assert {"frames", "execution_log", "artifacts"} <= set(schema)
+
+    # The raw catalogue is not a second route to it. The denylist protects the
+    # contents of `permission_rules`, `settings`, `host_call_log` and two dozen
+    # others; `sqlite_master` handed back their full DDL and enumerated every
+    # one of them by name, which is strictly more than `schema()` will say and
+    # was reachable from the one surface the model actually has.
+    kernel.execute(
+        "def _q_catalogue():\n"
+        "    try:\n"
+        "        host.query('SELECT name FROM sqlite_master', limit=1)\n"
+        "        return 'ALLOWED'\n"
+        "    except Exception as e:\n"
+        "        return type(e).__name__\n"
     )
-    tbls = {r["name"] for r in rows}
-    assert {"frames", "execution_log", "artifacts"} <= tbls
+    assert _emit(kernel, "_q_catalogue()") != "ALLOWED"
 
     kernel.execute(
         "def _q_denied():\n"

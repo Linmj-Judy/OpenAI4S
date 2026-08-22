@@ -70,7 +70,11 @@ class CellExecutionPorts:
     kernel_id: Callable[[CellSession, str], str]
     snapshot: Callable[[Path], Any]
     protect_versions: Callable[[CellSession], None]
-    safety_refusal: Callable[[str, str], str | None]
+    # Takes the session as well as the cell. The biosecurity screener judges a
+    # *trajectory* -- what the user asked for across the conversation against
+    # what the agent has been doing -- so a port that only sees one cell can
+    # only ever run the static classifier, which is what the Web path did.
+    safety_refusal: Callable[[Any, str, str], str | None]
     run: Callable[
         [CellSession, CellRequest, str, ChunkSink | None, KernelLease | None],
         dict[str, Any],
@@ -81,13 +85,45 @@ class CellExecutionPorts:
     allocate_attempt: Callable[
         [CellSession, CellRequest, str, str | None], str | None
     ] = _no_attempt_allocate
-    bind_attempt_generation: Callable[
-        [str, CellSession, str], None
-    ] = _no_attempt_generation
+    bind_attempt_generation: Callable[[str, CellSession, str], None] = (
+        _no_attempt_generation
+    )
     mark_attempt_started: Callable[[str], None] = _no_attempt_milestone
     mark_attempt_response: Callable[[str], None] = _no_attempt_milestone
     mark_attempt_capture: Callable[[str], None] = _no_attempt_milestone
     finish_attempt: Callable[[str, str, Any], None] = _no_attempt_finish
+
+
+#: Author-written, never a rendering of an exception. The timeout wording keeps
+#: the actionable half of what the watchdog knows -- that the kernel was reset,
+#: so earlier variables are gone -- without quoting it.
+KERNEL_FAILURE_MESSAGE = "the kernel did not finish this cell"
+CELL_TIMEOUT_MESSAGE = (
+    "the cell exceeded its time limit and was stopped; the kernel was reset, so "
+    "variables from earlier cells were cleared"
+)
+
+
+def _worker_failure_text(exc: BaseException, public: dict) -> str:
+    """What a failed cell may say, by exception type -- never by `str(exc)`.
+
+    A `GatewayError` is the one message with known provenance: `public_exception`
+    passes it through because someone wrote it for a client to read. Everything
+    else is a sentence from this module plus the stable code and request id the
+    projector assigned, so the failure stays correlatable without being quoted.
+    """
+    from openai4s.server.errors import GatewayError
+
+    if isinstance(exc, GatewayError):
+        base = str(public.get("error") or KERNEL_FAILURE_MESSAGE)
+    elif isinstance(exc, TimeoutError):
+        base = CELL_TIMEOUT_MESSAGE
+    else:
+        base = KERNEL_FAILURE_MESSAGE
+    code = str(public.get("code") or "")
+    request_id = str(public.get("request_id") or "")
+    suffix = " ".join(part for part in (code, request_id) if part)
+    return f"{base} ({suffix})" if suffix else base
 
 
 class CellExecutionService:
@@ -170,7 +206,7 @@ class CellExecutionService:
         try:
             before = self.ports.snapshot(session.workspace)
             self.ports.protect_versions(session)
-            refusal = self.ports.safety_refusal(request.code, request.origin)
+            refusal = self.ports.safety_refusal(session, request.code, request.origin)
         except BaseException as exc:
             self._finish_attempt(attempt_id, "prepare_failed", exc)
             raise
@@ -210,7 +246,24 @@ class CellExecutionService:
             # watchdog recovery may already have advanced the generation.
             if lease is not None:
                 session.kernels.shutdown_if_current(lease)
-            failed_result = _error_result(cell_id, str(exc))
+            # `str(exc)` for a worker death is
+            # `kernel worker exited unexpectedly: <drained stderr tail>` --
+            # the worker's uncaught traceback, an R `system()`'s output, or
+            # anything any child wrote to fd2, with the absolute paths and argv
+            # that come with it. It landed in the persisted cell row, the
+            # `notebook_cell_finished` frame and `GET /frames/{id}/execution-log`,
+            # so one crash published it on three surfaces and kept it.
+            from openai4s.server.errors import public_exception
+
+            code = (
+                "cell_timeout"
+                if isinstance(exc, TimeoutError)
+                else "kernel_execution_failed"
+            )
+            public, _status = public_exception(
+                exc, surface="cell:worker", error_code=code
+            )
+            failed_result = _error_result(cell_id, _worker_failure_text(exc, public))
             try:
                 # A worker/protocol failure is still an immutable Cell
                 # transaction.  Persist its source and terminal observation so
@@ -476,6 +529,10 @@ class CellExecutionService:
             capture,
             state_revision=index,
             generation_id=generation_id,
+            # No kernel touched this cell: the refusal/unavailability result
+            # is synthesized.  The agent loop's evidence ledger must not count
+            # it as an executed cell.
+            executed=False,
         )
 
     def _finish_attempt(
@@ -488,9 +545,36 @@ class CellExecutionService:
             return
         payload = None
         if error not in (None, ""):
+            # Generic, not redacted. This row is projected into the Action
+            # Timeline the UI renders (`action_timeline._attempt` sends `error`
+            # straight through) *and* written into the exported Session
+            # package, which the user shares. Plan item 16 puts credential,
+            # absolute-path and shell-command canaries on exactly those
+            # surfaces, and redaction is the wrong instrument for them:
+            # `redact_text` fingerprints credential-shaped tokens and collapses
+            # only *this* account's home, so a path under another user, a
+            # `/srv/...` path, or the argv of a failed spawn all survive it
+            # intact. Nothing here is safe to keep, so nothing is kept.
+            #
+            # `kind` stays. It is the exception class's name -- `PermissionError`,
+            # `EOFError` -- which is a fact about the failure's shape and carries
+            # no argument, path or credential from the raised instance. It is
+            # also what makes the row useful at all once the message is gone.
+            #
+            # The failure goes to `record_diagnostic`, which pairs it with a
+            # request id a support ticket can quote. Not "the original": that
+            # claim was true when written and stopped being true twice over --
+            # `record_diagnostic` reaches `logs/app.out`, which the support
+            # bundle now collects, and it no longer renders the exception at
+            # all. What it records is the surface, the class and a fingerprint.
+            from openai4s.server.errors import record_diagnostic
+
+            if isinstance(error, BaseException):
+                record_diagnostic(error, surface="cell:attempt")
             payload = {
                 "kind": type(error).__name__,
-                "message": str(error),
+                "message": "the execution attempt failed",
+                "code": "attempt_failed",
             }
         self.ports.finish_attempt(attempt_id, terminal_state, payload)
 

@@ -22,22 +22,35 @@ as turns/cells/artifacts/compactions happen. Schema and write paths:
   host_call_log     RPC audit (DERIVABLE_HOST_CALLS are NOT logged; the args of
                     SECRET_ARG_HOST_CALLS are redacted before write)
 
+Agent SQL (`host.query`) runs under a real SQLite authorizer installed for the
+duration of each statement, not behind a substring filter on the statement text.
 Secret-bearing tables (`settings` holds the LLM API key + model profiles,
-`connectors` holds MCP server env/command) plus the internal audit/memory tables
-are on QUERY_DENYLIST, so `host.query` refuses to read them and `host.query`'s
-schema view hides them.
+`connectors` holds MCP server env/command) and the internal audit/memory tables
+are refused outright; the SQLite catalog and the `pragma_*` table-valued
+functions are refused by prefix. The artifact family -- `artifacts`,
+`artifact_versions`, `lineage_edges`, `env_snapshots` -- is reachable only through
+the session-scoped `my_*` views, because a bundled Skill has a real reason to read
+`artifact_versions.source` and no reason to read another project's. `frames` stays
+directly readable: cross-session frame enumeration is a real leak, but closing it
+is a separate decision (see `_VIEW_ONLY_TABLES`).
+An authorizer sees resolved table names, so identifier quoting, a schema
+qualifier, an alias, a CTE and a name arriving in a bound parameter are all the
+same thing to it; a text filter had to enumerate spellings and could not see the
+last of those at all.
 
 All timestamps are epoch-ms. Booleans are 0/1. One DB per data_dir.
 """
+
 from __future__ import annotations
 
 import json
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from openai4s.capabilities import CapabilityStateService, SpecialistProfileService
 from openai4s.execution.dependencies import (
@@ -63,6 +76,10 @@ from openai4s.storage.connectors import (
     forget_connector_env,
     resolve_connector_env,
 )
+from openai4s.storage.datapro_index import (
+    DataProIndexRepository,
+    create_datapro_index_schema,
+)
 from openai4s.storage.delegation import DelegationProjectionRepository
 from openai4s.storage.frames import FrameRepository
 from openai4s.storage.kernels import KernelGenerationRepository
@@ -87,7 +104,9 @@ from openai4s.storage.migrations import (
 from openai4s.storage.permissions import (
     DEFAULT_PERMISSION_RULES as _DEFAULT_PERMISSION_RULES,
 )
-from openai4s.storage.permissions import PermissionRuleRepository
+from openai4s.storage.permissions import (
+    PermissionRuleRepository,
+)
 from openai4s.storage.permissions import perm_match as _perm_match
 from openai4s.storage.plans import PlanRepository
 from openai4s.storage.recovery import RecoveryJournalRepository
@@ -205,23 +224,53 @@ CREATE TABLE IF NOT EXISTS artifact_versions (
     snapshot_path TEXT,
     producing_cell_id TEXT,
     frame_id      TEXT,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    -- Where the data came from, when a version was derived from retrieved
+    -- data rather than computed from nothing. JSON: the retrieval provenance
+    -- envelope (database, source, retrieved_at, request_url, query,
+    -- normalization_version, per-response hashes). This is a property of the
+    -- VERSION, not the artifact: rerunning the same analysis a month later
+    -- produces the same file from a different retrieval.
+    source        TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_ver_artifact ON artifact_versions(artifact_id);
 
 -- De-duplicated environment snapshots (one row per distinct kernel env). An
 -- artifact_version references one via env_snapshot_id so a figure records the
--- package set that PRODUCED it (see gateway._environment_snapshot).
+-- environment that PRODUCED it -- taken from that cell's kernel generation,
+-- not from the daemon (see ArtifactManager.capture_environment).
 CREATE TABLE IF NOT EXISTS env_snapshots (
     snapshot_id    TEXT PRIMARY KEY,
     created_at     INTEGER NOT NULL,
-    kind           TEXT,
-    python_version TEXT,
+    kind           TEXT,              -- the RUNTIME: "python" | "r"
+    python_version TEXT,              -- NULL unless the kernel was this interpreter
     implementation TEXT,
     platform       TEXT,
     package_count  INTEGER,
     packages_json  TEXT,
-    remote_json    TEXT               -- JSON list of remote-GPU job provenance
+    remote_json    TEXT,              -- JSON list of remote-GPU job provenance
+    -- Which kernel this actually describes. Without these two, an R kernel and
+    -- a Python one in a conda env are indistinguishable rows, and the identity
+    -- of the environment is exactly what provenance is for.
+    interpreter    TEXT,
+    environment_name TEXT,
+    -- The generation that produced the artifact, and why a package list may be
+    -- absent (an R kernel has no Python distributions; a foreign interpreter
+    -- may refuse to be read). Absence with a reason beats a borrowed list.
+    generation_id  TEXT,
+    -- How far the generation above can be trusted. `verified` means the row's
+    -- own address includes it, so it cannot have been shared by a second
+    -- kernel; `legacy_unverified` means it was written before that was true --
+    -- the named generation did produce this environment, but it may not be the
+    -- only one that did. Kept and labelled rather than cleared: a missing
+    -- attribution is not more honest than a qualified one, it is just emptier.
+    generation_confidence TEXT,
+    packages_unavailable TEXT,
+    -- Whether this row was measured from a kernel generation or assumed from
+    -- the daemon. The fallback path has always set this and it was dropped at
+    -- the INSERT, so the one marker separating a measured environment from a
+    -- guessed one never reached the record a reader actually sees.
+    provenance     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS compaction_archives (
@@ -307,7 +356,8 @@ CREATE TABLE IF NOT EXISTS memories (
     project_id    TEXT NOT NULL DEFAULT 'default',
     block         TEXT,               -- memory block name
     content       TEXT,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER             -- last edit; NULL means never edited
 );
 
 CREATE TABLE IF NOT EXISTS managed_endpoints (
@@ -395,25 +445,48 @@ CREATE TABLE IF NOT EXISTS compute_jobs (
     -- accepted" and "we recorded it" cannot become a double-charge.
     idempotency_key TEXT,
     provider        TEXT NOT NULL,     -- "ssh:<alias>" | "byoc:<id>"
-    status          TEXT NOT NULL,     -- see compute/manager.py's state machine
+    status          TEXT NOT NULL,     -- see compute/states.py; enforced on write
     alias           TEXT,              -- ssh
     workdir         TEXT,              -- ssh
     pid             TEXT,              -- ssh
+    -- The remote process GROUP, read back from the host at submit rather than
+    -- assumed from `$!`. Cancellation signals this; a NULL means we never
+    -- confirmed one and must not guess (see migration 6).
+    pgid            TEXT,              -- ssh
     sandbox_id      TEXT,              -- byoc
     -- The provider's own acknowledgement of the submit. Evidence the job
     -- exists remotely, independent of anything we chose to believe.
     receipt         TEXT,
     outputs         TEXT,              -- JSON: declared output globs
+    -- Which session/workspace submitted this job. `_rehydrate` filters on it so
+    -- a restart does not hand one session's live jobs — and their harvested
+    -- outputs — to whichever session happens to build a manager first. NULL is
+    -- the CLI / global context (see migration 9).
+    owner_key       TEXT,
     exit_code       INTEGER,
-    reason          TEXT,              -- why a terminal state was reached
+    reason          TEXT,              -- free-text detail, provider-supplied
+    -- Coded cause, from compute/states.py. `failed` because outputs could not
+    -- be verified is a different fact from `failed` because the command
+    -- exited non-zero, and the status alone cannot carry that.
+    termination_reason TEXT,
+    -- What the harvest actually produced: JSON [{path,size,sha256}] and one
+    -- digest over the whole record. A job that declared `outputs` and
+    -- produced none of them used to report success; these are what make that
+    -- checkable, and the only way to see a transfer truncated at rc==0.
+    artifact_manifest TEXT,
+    integrity_sha256  TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     submitted_at    INTEGER,
     terminal_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_compute_jobs_status ON compute_jobs(status);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_compute_jobs_idem
-    ON compute_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- The per-owner idempotency index is deliberately NOT here. It references
+-- `owner_key`, which migration 9 adds -- and this script runs on every open,
+-- *before* migrations, so on a pre-9 database `CREATE INDEX` would fail on a
+-- column that does not exist yet and take startup with it. Migration 11 creates
+-- it (and drops the old installation-wide one) for new and upgraded databases
+-- alike, which is the one place both paths pass through.
 -- Append-only, monotonically sequenced per job. A status column alone says
 -- where a job is; this says how it got there, which is what a restart needs to
 -- tell "we never submitted" from "we submitted and lost the response".
@@ -447,12 +520,46 @@ CREATE TABLE IF NOT EXISTS annotations (
     artifact_name  TEXT,
     rel_x          REAL NOT NULL,      -- 0..1 fraction of image width
     rel_y          REAL NOT NULL,      -- 0..1 fraction of image height
+    -- The artifact VERSION the pin was taken against, and the sha256 of that
+    -- version's bytes. A pin means "this point on the picture I am looking at";
+    -- without these the send path resolved the artifact's latest version, so
+    -- re-plotting between the pin and the send silently sent a different image
+    -- under the old coordinates. NULL on rows created before this existed.
+    version_id     TEXT,
+    checksum       TEXT,
     number         INTEGER NOT NULL,   -- pin ordinal within (frame,artifact)
     body           TEXT NOT NULL,      -- the comment
-    status         TEXT NOT NULL DEFAULT 'open',   -- open|sent|resolved
+    -- Which in-flight request holds this pin. Admission is exactly-once: a
+    -- request claims `open` rows atomically into `reserved` under its own id,
+    -- and only what it claimed is quoted into the prompt. NULL whenever the
+    -- row is not held.
+    reservation_id TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',   -- open|reserved|sent|resolved|dismissed
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL
 );
+-- One row per attempt to admit pinned comments into a message.
+--
+-- A 202 can be lost: a dropped connection, a closed tab, a reload. The client
+-- then knows only that it sent something, and without a durable record tying
+-- the reservation to the request, the job and the frame there is nothing to
+-- reconcile against -- leaving only "resend" (double work) or "give up"
+-- (silent loss of the user's comments).
+CREATE TABLE IF NOT EXISTS annotation_admissions (
+    reservation_id TEXT PRIMARY KEY,
+    root_frame_id  TEXT NOT NULL,
+    annotation_ids TEXT NOT NULL,      -- JSON array, the exact claimed set
+    request_id     TEXT,
+    job_id         TEXT,
+    message_id     TEXT,
+    state          TEXT NOT NULL,      -- reserved|sent|pending|released
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_admission_frame
+    ON annotation_admissions(root_frame_id);
+CREATE INDEX IF NOT EXISTS ix_admission_state
+    ON annotation_admissions(state);
 CREATE INDEX IF NOT EXISTS ix_annot_frame    ON annotations(root_frame_id);
 CREATE INDEX IF NOT EXISTS ix_annot_artifact ON annotations(artifact_id);
 
@@ -464,7 +571,7 @@ CREATE TABLE IF NOT EXISTS plans (
     rationale     TEXT,
     confidence    TEXT,               -- 'high'|'medium'|'low' (or a 0..1 string)
     steps         TEXT NOT NULL,      -- JSON [{id,title,detail,deliverables:[...]}]
-    status        TEXT NOT NULL DEFAULT 'draft',   -- draft|executing|completed|failed|discarded
+    status        TEXT NOT NULL DEFAULT 'draft',   -- see storage/plans.py PLAN_STATUSES
     step_status   TEXT,               -- JSON {step_id: {status, note, updated_at}}
     artifact_id   TEXT,               -- the plan_*.json artifact (so revises re-version it)
     created_at    INTEGER NOT NULL,
@@ -577,6 +684,17 @@ QUERY_DENYLIST = frozenset(
         "checkpoint_state_snapshots",
         "snapshot_operations",
         "recovery_journal",
+        # SQLite's own catalogue. The denylist above protects the *contents* of
+        # these tables and this one handed back their entire definition:
+        # `SELECT sql FROM sqlite_master WHERE name='permission_rules'` returned
+        # the full DDL of a denied table, and `SELECT name FROM sqlite_master`
+        # enumerated every one of them by name. `schema()` has always excluded
+        # the `sqlite_` prefix; `query()` never did, so the one surface actually
+        # exposed to the model was the one that leaked.
+        "sqlite_master",
+        "sqlite_schema",
+        "sqlite_temp_master",
+        "sqlite_temp_schema",
     }
 )
 
@@ -609,6 +727,150 @@ def _now_ms() -> int:
 # multi-process case (openai4s run / init alongside a live daemon) one place to
 # tune.
 _BUSY_TIMEOUT_S = 5.0
+
+
+def _sql_quote(value: str) -> str:
+    """Single-quote a literal for interpolation into DDL."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+#: The views `host.query` may read the artifact family through. Reads of the base
+#: tables are permitted only when SQLite reports one of these as the view
+#: responsible for the access -- which is what the authorizer's fifth argument is
+#: for. A direct `SELECT * FROM artifacts` names no view and is refused.
+_SCOPED_VIEWS = frozenset(
+    {
+        "my_artifacts",
+        "my_artifact_versions",
+        "my_lineage_edges",
+        "my_frames",
+        "my_env_snapshots",
+    }
+)
+
+#: Base tables reachable only through `_SCOPED_VIEWS`. These were readable
+#: directly and were not on `QUERY_DENYLIST` at all, so one `SELECT` returned
+#: every project's artifacts with their filenames, checksums and absolute
+#: snapshot paths -- the exact information the scoped host helpers refuse one
+#: version id at a time.
+_VIEW_ONLY_TABLES = frozenset(
+    {
+        "artifacts",
+        "artifact_versions",
+        "lineage_edges",
+        # Interpreter, prefix and the complete installed-package manifest of
+        # every kernel generation in the database.
+        "env_snapshots",
+        "datapro_index_batches",
+        "datapro_index_entries",
+        # `frames` is deliberately NOT here. Cross-session frame enumeration is a
+        # real leak, but the plan does not list it and `tests/test_store.py`
+        # documents direct `SELECT * FROM frames` as allowed -- so closing it is a
+        # separate decision with its own migration for anything reading it, not a
+        # side effect of this change. `my_frames` exists for callers that want the
+        # scoped form.
+    }
+)
+
+
+class _QueryAuthorizer:
+    """SQLite's own answer to "may this statement touch that table?".
+
+    An authorizer is called after parsing with *resolved* names, so quoting, a
+    schema qualifier, an alias, a CTE wrapper and a table name arriving in a bound
+    parameter are all the same thing to it. That is the whole reason for replacing
+    the substring filter: the filter had to enumerate spellings and could not see
+    a name that never appeared in the text.
+
+    Deny rather than ignore. `SQLITE_IGNORE` on a read substitutes NULL and the
+    query succeeds looking like an empty result, which is a worse answer than a
+    refusal -- an agent would conclude the artifact does not exist.
+
+    What was refused is recorded on the instance rather than recovered from
+    SQLite's error text. The message differs by operation ("access to X.Y is
+    prohibited" for a read, "not authorized" for others) and is not a documented
+    interface, so matching on it would work until it did not.
+    """
+
+    def __init__(self) -> None:
+        self.denied: list[str] = []
+
+    def _deny(self, what: str) -> int:
+        if what not in self.denied:
+            self.denied.append(what)
+        return sqlite3.SQLITE_DENY
+
+    def __call__(
+        self,
+        action: int,
+        arg1: str | None,
+        arg2: str | None,
+        dbname: str | None,
+        source: str | None,
+    ) -> int:
+        # Anything that is not a read or a plain SELECT is refused outright.
+        # This runs on the daemon's read-write connection, so it is the *only*
+        # thing standing between agent SQL and an UPDATE -- and it refuses by
+        # action code rather than by keyword, which is what makes a statement
+        # like `SELECT 1; DROP TABLE artifacts` or a temp-table write, an ATTACH,
+        # or a function-driven side effect unreachable rather than merely unspelled.
+        if action not in (sqlite3.SQLITE_READ, sqlite3.SQLITE_SELECT):
+            if action == sqlite3.SQLITE_FUNCTION:
+                # Scalar/aggregate functions are fine; the table-valued pragma
+                # functions arrive as reads of a `pragma_*` table below.
+                return sqlite3.SQLITE_OK
+            return self._deny(f"operation {action}")
+
+        table = (arg1 or "").lower()
+        if not table:
+            return sqlite3.SQLITE_OK
+
+        # The catalog, in all its spellings: sqlite_master, sqlite_schema,
+        # sqlite_temp_master, sqlite_sequence, sqlite_stat1. Denying four names
+        # by hand left the others open.
+        if table.startswith("sqlite_"):
+            return self._deny(table)
+        # Table-valued pragma functions answer the same questions as the catalog
+        # and slipped the ` pragma ` keyword check, which required spaces.
+        if table.startswith("pragma_"):
+            return self._deny(table)
+        if table in QUERY_DENYLIST:
+            return self._deny(table)
+        if table in _VIEW_ONLY_TABLES:
+            # Permitted only as the underlying read of a trusted scoped view.
+            if (source or "").lower() in _SCOPED_VIEWS:
+                return sqlite3.SQLITE_OK
+            return self._deny(table)
+        return sqlite3.SQLITE_OK
+
+
+#: `Connection.set_authorizer(None)` removes the authorizer from Python 3.11
+#: onwards. On 3.10 -- this project's declared floor -- it does not. The C
+#: trampoline stays installed with no Python callable behind it, and SQLite
+#: reads a failed callback as `SQLITE_DENY`, so "take the guard off" silently
+#: became "deny everything".
+#:
+#: That is not a test-only difference. `Store.query` clears the guard twice:
+#: once to create the scoped views, which is a privileged setup step, and once
+#: in its `finally` to hand the connection back. On 3.10 the first clear made
+#: the view creation fail, and the second left the daemon's ONE connection
+#: deny-all for the rest of the process -- measured: after a single
+#: `host.query`, an ordinary `new_frame` raises `not authorized`. One agent SQL
+#: statement bricked the Store.
+#:
+#: A permissive callback is the portable way to say "no restrictions", and it
+#: costs nothing measurable: 11.4 us/query against 12.5 us with no authorizer
+#: at all, because SQLite only consults it while preparing a statement.
+_AUTHORIZER_ACCEPTS_NONE = sys.version_info >= (3, 11)
+
+
+def _allow_everything(*_event: object) -> int:
+    return sqlite3.SQLITE_OK
+
+
+def _clear_authorizer(conn: sqlite3.Connection) -> None:
+    """Take the guard off, on every interpreter this project supports."""
+    conn.set_authorizer(None if _AUTHORIZER_ACCEPTS_NONE else _allow_everything)
 
 
 class Store:
@@ -749,6 +1011,11 @@ class Store:
             ),
             get_project=lambda project_id: self.get_project(project_id),
         )
+        self._datapro_index = DataProIndexRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
         self._artifacts = ArtifactRepository(
             self._conn,
             self._lock,
@@ -765,6 +1032,7 @@ class Store:
             get_env_snapshot=lambda snapshot_id: self.get_env_snapshot(snapshot_id),
             identify_file=lambda path: _file_identity(path),
             paths_match=lambda left, right: _same_file_path(left, right),
+            delete_related=self._datapro_index.delete_for_artifact,
         )
         self._notes = NotesRepository(
             self._conn,
@@ -795,6 +1063,9 @@ class Store:
     # --- migration (add columns missing from a pre-existing DB) -----------
     _MIGRATIONS = {
         "messages": [("branch_id", "TEXT")],
+        # Which in-flight request holds this pin. A reservation is what
+        # makes admission exactly-once rather than at-most-once.
+        "annotations": [("reservation_id", "TEXT")],
         "shares": [("expires_at", "INTEGER")],
         "frames": [
             ("task_summary", "TEXT"),
@@ -867,10 +1138,572 @@ class Store:
             report = run_migrations(
                 self._conn,
                 self.db_path,
-                {1: ("legacy_baseline", self._apply_legacy_baseline)},
+                {
+                    1: ("legacy_baseline", self._apply_legacy_baseline),
+                    2: ("compute_job_states", self._apply_compute_job_states),
+                    3: ("compute_job_manifest", self._apply_compute_job_manifest),
+                    4: ("artifact_env_identity", self._apply_artifact_env_identity),
+                    5: ("artifact_source", self._apply_artifact_source),
+                    6: ("compute_job_pgid", self._apply_compute_job_pgid),
+                    7: (
+                        "env_snapshot_generation",
+                        self._apply_env_snapshot_generation,
+                    ),
+                    8: (
+                        "env_snapshot_provenance",
+                        self._apply_env_snapshot_provenance,
+                    ),
+                    9: ("compute_job_owner", self._apply_compute_job_owner),
+                    10: ("frame_model_binding", self._apply_frame_model_binding),
+                    11: (
+                        "compute_job_idem_owner",
+                        self._apply_compute_job_idem_owner,
+                    ),
+                    12: (
+                        "annotation_version_binding",
+                        self._apply_annotation_version_binding,
+                    ),
+                    13: ("memory_updated_at", self._apply_memory_updated_at),
+                    14: (
+                        "annotation_reservation",
+                        self._apply_annotation_reservation,
+                    ),
+                    15: (
+                        "annotation_admission_ledger",
+                        self._apply_annotation_admission_ledger,
+                    ),
+                    16: ("datapro_content_index", self._apply_datapro_content_index),
+                    17: (
+                        "datapro_content_index_repair",
+                        self._apply_datapro_content_index_repair,
+                    ),
+                },
             )
             if report["migrated"]:
                 harden_db(self.db_path)
+
+    def _apply_datapro_content_index(self, conn: sqlite3.Connection) -> None:
+        """Version 16: lossless local indexing for DataPro responses."""
+
+        create_datapro_index_schema(conn)
+
+    def _apply_datapro_content_index_repair(self, conn: sqlite3.Connection) -> None:
+        """Version 17: repair an early v16 database stamped without its tables.
+
+        During development the v16 DDL briefly ran outside the numbered
+        migration and was later moved into its correct transaction. A local
+        database opened between those revisions can therefore carry the v16
+        marker while missing one or both tables. Reapplying idempotent DDL under
+        v17 makes that state recoverable without deleting user data.
+        """
+
+        create_datapro_index_schema(conn)
+
+    def _apply_annotation_admission_ledger(self, conn: sqlite3.Connection) -> None:
+        """Version 15: a durable record of each admission attempt.
+
+        The reservation column says a pin is held; it cannot say by which
+        request, for which job, or whether the answer reached the client. After
+        a lost response that is the only question worth asking, so it needs a
+        row of its own rather than an inference from status.
+        """
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS annotation_admissions ("
+            "reservation_id TEXT PRIMARY KEY,"
+            "root_frame_id TEXT NOT NULL,"
+            "annotation_ids TEXT NOT NULL,"
+            "request_id TEXT,"
+            "job_id TEXT,"
+            "message_id TEXT,"
+            "state TEXT NOT NULL,"
+            "created_at INTEGER NOT NULL,"
+            "updated_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_admission_frame "
+            "ON annotation_admissions(root_frame_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_admission_state "
+            "ON annotation_admissions(state)"
+        )
+        # The v14 rows this table cannot account for.
+        #
+        # Migration 14 added `reservation_id`, so a v14 install that crashed
+        # mid-send has pins sitting at `reserved` with a holder. This migration
+        # created the ledger *empty*, and every recovery path looks for a
+        # ledger row -- so those pins upgraded into a state where nothing could
+        # find them and nothing could free them: invisible in the composer, not
+        # on any turn, permanently. The upgrade itself is the moment no request
+        # is in flight, which is exactly when they are safe to release.
+        #
+        # No ledger row is fabricated for them. The request that held them left
+        # no record of its id, its job or its outcome, and inventing one would
+        # publish a correlation that never existed -- worse than the absence,
+        # because a reconcile would believe it. They are simply given back.
+        # Two statements, because they are two different claims. Only a pin
+        # that is *held* goes back to `open`; a `sent`, `resolved` or
+        # `dismissed` pin keeps its status, and a single `SET status='open'`
+        # over `status='reserved' OR reservation_id IS NOT NULL` resurrected
+        # every one of them that still carried a historical holder -- undoing
+        # the user's review work and re-offering comments the model already
+        # answered.
+        conn.execute(
+            "UPDATE annotations SET status='open', reservation_id=NULL "
+            "WHERE status='reserved'"
+        )
+        # The leftover holder on a pin that has already moved on is stale
+        # bookkeeping: no live request answers for it, and `reservation_id` is
+        # what every recovery and reconcile path matches on. Cleared without
+        # touching the status.
+        conn.execute(
+            "UPDATE annotations SET reservation_id=NULL "
+            "WHERE reservation_id IS NOT NULL"
+        )
+
+    def _apply_annotation_reservation(self, conn: sqlite3.Connection) -> None:
+        """Version 14: which in-flight request holds a pin.
+
+        Added first to the ad-hoc add-column pass alone, which is why this
+        exists. A *fresh* database gets the column from `CREATE TABLE`, so
+        every test passed -- while an existing v13 install, meaning every
+        install that already has data in it, would reach an
+        `UPDATE annotations SET ... reservation_id=?` naming a column its table
+        does not have. The blind spot is always the same one: fresh and
+        upgraded are two different schemas, and only the fresh one is what
+        tests build by default.
+        """
+        try:
+            conn.execute("ALTER TABLE annotations ADD COLUMN reservation_id TEXT")
+        except sqlite3.OperationalError as exc:
+            if not _is_duplicate_column(exc):
+                raise
+        # Unique per live reservation, so two requests cannot share an id and a
+        # release cannot free somebody else's claim. Partial, because NULL is
+        # the resting state of nearly every row.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_annot_reservation_row "
+            "ON annotations(reservation_id, annotation_id) "
+            "WHERE reservation_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_annot_reservation "
+            "ON annotations(reservation_id) WHERE reservation_id IS NOT NULL"
+        )
+
+    def _apply_memory_updated_at(self, conn: sqlite3.Connection) -> None:
+        """Version 13: record when a memory was last edited.
+
+        A memory could be written and deleted but never corrected, so fixing a
+        typo in standing context meant deleting it and writing it again -- which
+        loses its place in the newest-first order the pane and the injection
+        both use, and which is a two-step round trip through a scope that may be
+        at its cap.
+
+        The column exists because retention needs it. `RETENTION_DAYS` withholds
+        a memory that "has not been touched in a year", and with only
+        `created_at` an edit was not a touch: correcting a stale instruction
+        left it expiring on the original clock. Existing rows stay NULL, which
+        reads as "never edited" and falls back to `created_at` -- no backfill,
+        because when those rows were last edited is not recorded anywhere and
+        writing today's date down would turn a guess into a fact. Runs inside
+        the transaction owned by ``run_migrations``.
+        """
+        try:
+            conn.execute("ALTER TABLE memories ADD COLUMN updated_at INTEGER")
+        except sqlite3.OperationalError as e:
+            if not _is_duplicate_column(e):
+                raise MigrationError(
+                    f"memories.updated_at could not be added: {e}"
+                ) from e
+
+    def _apply_annotation_version_binding(self, conn: sqlite3.Connection) -> None:
+        """Version 12: bind an image annotation to the version it was pinned on.
+
+        An annotation recorded only `artifact_id`, and the send path resolved
+        that to the artifact's LATEST version -- so an agent re-plotting between
+        the pin and the send handed the model a different picture while the pin
+        coordinates still described the old one.
+
+        Existing rows stay NULL rather than being backfilled with today's
+        version: which version they were taken against is not recorded anywhere,
+        and writing the current one down would turn a guess into a fact. The
+        send path reads NULL as "unbound" and keeps the old behaviour for those
+        rows only. Runs inside the transaction owned by ``run_migrations``.
+        """
+        for column in ("version_id", "checksum"):
+            try:
+                conn.execute(f"ALTER TABLE annotations ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"annotations.{column} could not be added: {e}"
+                    ) from e
+
+    def _apply_compute_job_idem_owner(self, conn: sqlite3.Connection) -> None:
+        """Version 11: make the idempotency namespace per-owner.
+
+        The old index was `UNIQUE(idempotency_key)` — installation-wide, while
+        every other view of `compute_jobs` is per-owner. One session's key
+        therefore blocked every other session's, and the duplicate refusal handed
+        back the other session's `job_id` and status.
+
+        Replacing an index is not additive, so it needs a real step rather than
+        the idempotent catch-up pass. Order matters: build the new index first, so
+        a database that already contains a cross-owner duplicate fails here — with
+        the old index still in place — rather than losing the constraint and then
+        failing. `COALESCE(owner_key,'')` because SQLite treats NULLs as distinct
+        in a UNIQUE index, and NULL is exactly the CLI context this must keep
+        protecting. Runs inside the transaction owned by ``run_migrations``.
+        """
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_compute_jobs_idem_owner "
+                "ON compute_jobs(COALESCE(owner_key,''), idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL"
+            )
+        except sqlite3.IntegrityError as e:
+            raise MigrationError(
+                "compute_jobs holds rows that would violate a per-owner "
+                f"idempotency index: {e}. Two jobs for one owner share a key; "
+                "reconcile or remove one before upgrading."
+            ) from e
+        except sqlite3.OperationalError as e:
+            raise MigrationError(
+                f"the per-owner idempotency index could not be created: {e}"
+            ) from e
+        conn.execute("DROP INDEX IF EXISTS ix_compute_jobs_idem")
+
+    def _apply_compute_job_states(self, conn: sqlite3.Connection) -> None:
+        """Version 2: one enforced compute-job state vocabulary.
+
+        Adds ``termination_reason`` and folds the two historical states that
+        the new vocabulary does not have onto states that it does, preserving
+        what each of them meant:
+
+          * ``done`` -> ``succeeded`` (a rename, nothing else)
+          * ``incomplete`` -> ``failed`` + ``outputs_unverified``. It meant the
+            job exited 0 but its outputs could not be verified, which is not a
+            success and must not keep a name that reads like one.
+          * ``closed`` -> ``cancelled`` + ``handle_closed``. The user released
+            the handle while the job was live.
+
+        Idempotent: the ALTER is guarded, and every UPDATE selects only rows
+        still carrying a legacy value, so a re-run after a partial apply
+        converges rather than double-writing. Runs inside the transaction owned
+        by ``run_migrations``; it must not commit.
+        """
+        from openai4s.compute.states import LEGACY_STATUS_MAP
+
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(compute_jobs)").fetchall()
+        }
+        if "termination_reason" not in have:
+            try:
+                conn.execute(
+                    "ALTER TABLE compute_jobs ADD COLUMN termination_reason TEXT"
+                )
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"compute_jobs.termination_reason could not be added: {e}"
+                    ) from e
+        for legacy, (status, reason) in LEGACY_STATUS_MAP.items():
+            conn.execute(
+                "UPDATE compute_jobs SET status=?, termination_reason=? "
+                "WHERE status=?",
+                (status, reason, legacy),
+            )
+
+    def _apply_artifact_source(self, conn: sqlite3.Connection) -> None:
+        """Version 5: where a version's data came from.
+
+        The Evidence scorecard asks every release-grade artifact to carry a
+        source. There was no column at all, so the clause was structurally
+        unmeetable rather than sparsely met.
+
+        Historical rows keep NULL. A version written before retrieval was
+        recorded has no recoverable source, and inventing one would be the same
+        mistake as backfilling an environment: an unattributed record turned
+        into a confidently wrong one.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(artifact_versions)").fetchall()
+        }
+        if "source" in have:
+            return
+        try:
+            conn.execute("ALTER TABLE artifact_versions ADD COLUMN source TEXT")
+        except sqlite3.OperationalError as e:
+            if not _is_duplicate_column(e):
+                raise MigrationError(
+                    f"artifact_versions.source could not be added: {e}"
+                ) from e
+
+    def _apply_artifact_env_identity(self, conn: sqlite3.Connection) -> None:
+        """Version 4: say WHICH kernel an artifact's environment describes.
+
+        Historical rows keep NULL. They were written by a snapshot that could
+        only ever describe the daemon, so backfilling them with the daemon's
+        identity would turn an unattributed record into a confidently wrong
+        one -- the very failure this migration exists to stop.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(env_snapshots)").fetchall()
+        }
+        for column in (
+            "interpreter",
+            "environment_name",
+            "generation_id",
+            "packages_unavailable",
+        ):
+            if column in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE env_snapshots ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"env_snapshots.{column} could not be added: {e}"
+                    ) from e
+
+    def _apply_compute_job_pgid(self, conn: sqlite3.Connection) -> None:
+        """Version 6: the remote process group, recorded rather than guessed.
+
+        Cancellation signalled ``-$!``. In an interactive shell that is the
+        pgid; in the non-interactive login shell an ``ssh host cmd`` actually
+        gets — dash, ash, or bash without job control — ``set -m`` does not
+        enable job control, so ``$!`` is the child's pid and its group is the
+        login shell's. ``kill -- -<pid>`` then found no such group, exited 0
+        anyway on some hosts, and the caller was told the allocation was freed
+        while the whole command tree kept running.
+
+        Historical rows keep NULL: the group a finished submit landed in is not
+        recoverable after the fact, and ``cancel`` treats a missing pgid as
+        "cannot signal safely" rather than guessing one.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(compute_jobs)").fetchall()
+        }
+        if "pgid" in have:
+            return
+        try:
+            conn.execute("ALTER TABLE compute_jobs ADD COLUMN pgid TEXT")
+        except sqlite3.OperationalError as e:
+            if not _is_duplicate_column(e):
+                raise MigrationError(
+                    f"compute_jobs.pgid could not be added: {e}"
+                ) from e
+
+    def _apply_frame_model_binding(self, conn: sqlite3.Connection) -> None:
+        """Version 10: record which model configuration a session actually used.
+
+        A frame stored a model *string*. That answers "which model name" and
+        not "which configuration", and the two differ in exactly the case that
+        matters: two profiles can name the same model against different
+        providers or endpoints, and editing a profile rewrote it in place, so a
+        replayed session reported whatever the profile happened to say today.
+        D2's rule is that a session binds `profile_id + revision` and never
+        silently follows the latest.
+
+        Historical rows keep NULL for both, which reads as *unbound* -- not as
+        "used the default". That distinction is the point: an unbound session
+        stays fully readable, and only sending a new message asks the user to
+        rebind. Backfill happens at read time and only on a unique
+        `(provider, endpoint, model)` match, because an ambiguous one is a
+        guess and a guess here is the thing being removed.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(frames)").fetchall()}
+        for column, decl in (
+            ("model_profile_id", "TEXT"),
+            ("model_profile_revision", "INTEGER"),
+        ):
+            if column in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE frames ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"frames.{column} could not be added: {e}"
+                    ) from e
+
+    def _apply_compute_job_owner(self, conn: sqlite3.Connection) -> None:
+        """Version 9: record which session/workspace owns each compute job.
+
+        Without it, ``_rehydrate`` loaded every installation-wide live row into
+        whichever session built a manager first, so a restart could hand one
+        session's job — and publish its harvested outputs — into a *different*
+        session's workspace. The column lets recovery filter to the owning
+        session.
+
+        Historical rows keep NULL, which is the CLI / global context: only a
+        NULL-owner (CLI) manager rehydrates them, never a Web session, so no
+        session inherits another's pre-upgrade jobs. Runs inside the transaction
+        owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(compute_jobs)").fetchall()
+        }
+        if "owner_key" in have:
+            return
+        try:
+            conn.execute("ALTER TABLE compute_jobs ADD COLUMN owner_key TEXT")
+        except sqlite3.OperationalError as e:
+            if not _is_duplicate_column(e):
+                raise MigrationError(
+                    f"compute_jobs.owner_key could not be added: {e}"
+                ) from e
+
+    def _apply_env_snapshot_generation(self, conn: sqlite3.Connection) -> None:
+        """Version 7: qualify generation attributions instead of destroying them.
+
+        ``env_snapshots`` rows are content-addressed, and until now the address
+        did not include ``generation_id`` while ``upsert_env_snapshot`` never
+        updated an existing row. A kernel restarted into an unchanged
+        environment therefore resolved to the row already on disk — which kept
+        naming the *first* generation. Every artifact produced by the second
+        generation pointed at a snapshot recorded as the first, and no other
+        column on the artifact carries a generation, so nothing could catch it.
+
+        Which historical rows were actually shared is not recoverable: sharing
+        leaves no trace. The first version of this migration answered that by
+        clearing ``generation_id`` on every row written before the fix — which
+        trades one wrong answer for a *missing* one and silently discards
+        provenance that is right far more often than not.
+
+        So the value is kept and **labelled**. ``generation_confidence`` says
+        which reading applies:
+
+          * ``verified`` — the row's address includes its generation, so it
+            cannot have been shared;
+          * ``legacy_unverified`` — written before the fix. The named
+            generation produced this environment; it may not be the only one
+            that did.
+
+        A reader that needs certainty filters on the label. Nothing is lost,
+        and nothing claims more than it can support.
+
+        Idempotent: the label is derived from the row's own address, so a
+        re-run recomputes the same answer.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        from openai4s.storage.artifacts import env_snapshot_id
+
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(env_snapshots)").fetchall()
+        }
+        if "generation_confidence" not in have:
+            try:
+                conn.execute(
+                    "ALTER TABLE env_snapshots ADD COLUMN generation_confidence TEXT"
+                )
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"env_snapshots.generation_confidence could not be "
+                        f"added: {e}"
+                    ) from e
+        rows = conn.execute(
+            "SELECT snapshot_id,kind,python_version,implementation,platform,"
+            "interpreter,environment_name,generation_id,packages_json,remote_json "
+            "FROM env_snapshots WHERE generation_id IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            expected = env_snapshot_id(
+                kind=row["kind"],
+                python_version=row["python_version"],
+                implementation=row["implementation"],
+                platform=row["platform"],
+                interpreter=row["interpreter"],
+                environment_name=row["environment_name"],
+                generation_id=row["generation_id"],
+                # NULL is how an empty remote list is stored; the basis has
+                # always used "[]" for it.
+                packages_json=row["packages_json"] or "[]",
+                remote_json=row["remote_json"] or "[]",
+            )
+            conn.execute(
+                "UPDATE env_snapshots SET generation_confidence=? "
+                "WHERE snapshot_id=?",
+                (
+                    (
+                        "verified"
+                        if expected == row["snapshot_id"]
+                        else "legacy_unverified"
+                    ),
+                    row["snapshot_id"],
+                ),
+            )
+
+    def _apply_env_snapshot_provenance(self, conn: sqlite3.Connection) -> None:
+        """Version 8: room for the assumed-vs-measured marker.
+
+        ``_snapshot_for`` has always stamped ``provenance: "assumed: no kernel
+        generation on record"`` on the fallback path, and the INSERT never had
+        a column for it — so the single field that tells a reader whether an
+        environment was *observed* or *guessed from the daemon* was computed
+        and thrown away on every write.
+
+        Historical rows keep NULL. Whether a given old row was measured is not
+        recoverable, and asserting either answer would be the same mistake the
+        marker exists to prevent.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(env_snapshots)").fetchall()
+        }
+        if "provenance" in have:
+            return
+        try:
+            conn.execute("ALTER TABLE env_snapshots ADD COLUMN provenance TEXT")
+        except sqlite3.OperationalError as e:
+            if not _is_duplicate_column(e):
+                raise MigrationError(
+                    f"env_snapshots.provenance could not be added: {e}"
+                ) from e
+
+    def _apply_compute_job_manifest(self, conn: sqlite3.Connection) -> None:
+        """Version 3: room to record what a job actually produced.
+
+        Historical rows keep NULL — we cannot reconstruct a manifest for a
+        harvest that happened before anything hashed it, and inventing one
+        would be worse than admitting it is unknown. Only jobs harvested from
+        here on carry the record.
+
+        Runs inside the transaction owned by ``run_migrations``.
+        """
+        have = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(compute_jobs)").fetchall()
+        }
+        for column in ("artifact_manifest", "integrity_sha256"):
+            if column in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE compute_jobs ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise MigrationError(
+                        f"compute_jobs.{column} could not be added: {e}"
+                    ) from e
 
     def _apply_legacy_baseline(self, conn: sqlite3.Connection) -> None:
         """Version 1: the historical catch-up pass, run once and then stamped.
@@ -1006,14 +1839,11 @@ class Store:
         ledger. Not a trade to make silently.
         """
         with self._lock:
-            # No-op today: the schema declares zero REFERENCES/FOREIGN KEY
-            # clauses, so there is nothing to enforce. Set anyway, and by
-            # policy rather than by accident: the pragma is per-connection and
-            # OFF by default, so the day someone adds a foreign key it would
-            # otherwise be silently unenforced — the constraint would read as
-            # documentation. Adding real constraints to these tables needs a
-            # rebuild (SQLite has no ALTER TABLE ADD CONSTRAINT) and orphan
-            # cleanup first; this only ensures they would bite once they exist.
+            # DataPro entries reference their batch with ON DELETE CASCADE. The
+            # pragma is per-connection and OFF by default, so set it by policy
+            # rather than leaving the first real foreign key as documentation.
+            # Lifecycle repositories still delete both rows explicitly: that
+            # keeps upgraded/externally-opened databases correct too.
             self._conn.execute("PRAGMA foreign_keys = ON")
 
     # --- secrets ---------------------------------------------------------
@@ -1034,16 +1864,23 @@ class Store:
                 self._secret_broker = broker
             return broker
 
-    def get_secret_setting(self, key: str) -> str:
+    def get_secret_setting(self, key: str, *, scope: str | None = None) -> str:
         """Read a credential setting, whether it is a reference or legacy plaintext.
 
         Both shapes have to work: an install that has not migrated, one that
         has, and one where migration failed for a single key must all keep
         running. Callers do not need to know which they are looking at.
+
+        Nor does a caller need a row: a credential the operator injected into
+        the daemon's environment resolves with no row at all, which is the only
+        way a deployment that takes its credentials from the environment can
+        ever have one. `scope` is optional because the known settings
+        credentials are already mapped in `SETTINGS_SECRETS`; pass it for a key
+        that is not.
         """
         from openai4s.security.secret_migration import resolve_setting
 
-        return resolve_setting(self, self.secrets, key)
+        return resolve_setting(self, self.secrets, key, scope=scope)
 
     def set_secret_setting(self, key: str, value: str, *, scope: str) -> str:
         """Store a credential through the broker, recording only its reference.
@@ -1051,6 +1888,13 @@ class Store:
         Returns the reference. An empty value clears both the reference and the
         stored secret — a cleared key must not linger in the keychain where the
         UI reports it as gone.
+
+        One thing a clear cannot do is unset an operator-injected credential:
+        the environment owns that value, `delete` on that backend is a no-op by
+        design, and `get_secret_setting` keeps resolving it afterwards. That is
+        the same boundary `put` states outright, so it is reported rather than
+        hidden — the settings route answers with the `has_api_key` it re-reads
+        after the write, which stays true.
         """
         from openai4s.security.secret_broker import is_ref
 
@@ -1105,6 +1949,19 @@ class Store:
             self._conn.close()
             self._closed = True
         _discard_store(self)
+        # A managed DataPro HTTP connection retains a just-in-time header
+        # provider closed over this Store and a bounded set of sent secrets for
+        # reflection redaction.  Once the Store generation ends, neither may
+        # remain in the process-wide MCP cache.  Resolve the scope from object
+        # identity (never credential material), and crucially do not create an
+        # MCP manager for the many Stores that never used a connector.
+        from openai4s import datapro
+        from openai4s.mcp_client import disconnect_if_initialized
+
+        disconnect_if_initialized(
+            datapro.CONNECTOR_ID,
+            cache_scope=datapro.runtime_cache_scope(self),
+        )
 
     # --- frames ----------------------------------------------------------
     def new_frame(
@@ -1138,6 +1995,12 @@ class Store:
             frame_id,
             fallback_project=fallback_project,
         )
+
+    def unpin_model(self, frame_id: str) -> None:
+        self._frames.unpin_model(frame_id)
+
+    def release_model_binding(self, profile_id: str) -> int:
+        return self._frames.release_model_binding(profile_id)
 
     def update_frame(self, frame_id: str, **fields: Any) -> None:
         self._frames.update_frame(frame_id, **fields)
@@ -1212,6 +2075,9 @@ class Store:
             created_at=created_at,
         )
 
+    def update_message_metadata(self, message_id: str, patch: dict) -> dict | None:
+        return self._frames.update_message_metadata(message_id, patch)
+
     def list_messages(
         self,
         root_frame_id: str,
@@ -1219,12 +2085,16 @@ class Store:
         branch_id: str | None = None,
         start: int = 0,
         limit: int | None = 300,
+        before_seq: int | None = None,
+        newest_first: bool = False,
     ) -> list[dict]:
         return self._frames.list_messages(
             root_frame_id,
             branch_id=branch_id,
             start=start,
             limit=limit,
+            before_seq=before_seq,
+            newest_first=newest_first,
         )
 
     def list_message_boundaries(
@@ -1249,6 +2119,8 @@ class Store:
         branch_id: str | None = None,
         start: int = 0,
         limit: int | None = 300,
+        before_seq: int | None = None,
+        newest_first: bool = False,
         boundaries: bool = False,
     ) -> list[dict]:
         """Project one branch's visible conversation without deleting rows."""
@@ -1271,6 +2143,30 @@ class Store:
             cursor_key="message_cursor",
             normalize_cursor=count_cursor,
         )
+        if newest_first or before_seq is not None:
+            # Latest-first, walking backwards by `seq`. Opening a 640-message
+            # session used to return messages 0-299 -- the *oldest* page, with
+            # the newest 340 absent -- because the only order was ascending and
+            # the only bound was a limit. A reader arriving at a long session
+            # wants its end.
+            #
+            # Honest about what this does NOT do: the branch projection above
+            # is whole-history by construction (it walks branch cursors to
+            # decide what is visible at all), so this pages the projected list
+            # rather than pushing a cursor into SQL. The user-visible defect --
+            # seeing the wrong end of the conversation -- is fixed; the read is
+            # still O(branch). Making the projection incremental is a larger
+            # change and is not claimed here.
+            ordered = sorted(
+                projected, key=lambda m: int(m.get("seq") or 0), reverse=True
+            )
+            if before_seq is not None:
+                ordered = [
+                    m for m in ordered if int(m.get("seq") or 0) < int(before_seq)
+                ]
+            if limit is None:
+                return ordered
+            return ordered[: max(0, int(limit))]
         start = max(0, int(start))
         if limit is None:
             return projected[start:]
@@ -1283,12 +2179,16 @@ class Store:
         branch_id: str | None = None,
         start: int = 0,
         limit: int | None = 300,
+        before_seq: int | None = None,
+        newest_first: bool = False,
     ) -> list[dict]:
         return self.list_branch_messages(
             root_frame_id,
             branch_id=branch_id,
             start=start,
             limit=limit,
+            before_seq=before_seq,
+            newest_first=newest_first,
             boundaries=True,
         )
 
@@ -1430,6 +2330,9 @@ class Store:
         self, root_frame_id: str, *, branch_id: str | None = None
     ) -> list[dict]:
         return self._frames.list_cells(root_frame_id, branch_id=branch_id)
+
+    def list_cell_outputs(self, root_frame_id: str) -> list[dict]:
+        return self._frames.list_cell_outputs(root_frame_id)
 
     def cell_detail(self, producing_cell_id: str) -> dict | None:
         return self._frames.cell_detail(producing_cell_id)
@@ -1954,6 +2857,10 @@ class Store:
     def rename_artifact(self, artifact_id: str, filename: str) -> None:
         self._artifacts.rename_artifact(artifact_id, filename)
 
+    def artifact_by_unique_filename(self, filename: str) -> dict | None:
+        """A filename resolves only when it names exactly one artifact."""
+        return self._artifacts.artifact_by_unique_filename(filename)
+
     def artifact_by_filename(
         self, filename: str, root_frame_id: str | None = None, *, strict: bool = False
     ) -> dict | None:
@@ -1994,8 +2901,10 @@ class Store:
         priority: int = 0,
         env_snapshot_id: str | None = None,
         snapshot_path: str | None = None,
+        source: Any = None,
     ) -> dict:
         return self._artifacts.save_artifact(
+            source=source,
             path=path,
             filename=filename,
             content_type=content_type,
@@ -2026,6 +2935,7 @@ class Store:
         project_id: str | None = None,
         env_snapshot_id: str | None = None,
         snapshot_path: str | None = None,
+        source: Any = None,
         input_version_ids: list[str] | tuple[str, ...] | None = None,
         preserve_filename: bool = False,
         preserve_content_type: bool = False,
@@ -2043,6 +2953,7 @@ class Store:
             project_id=project_id,
             env_snapshot_id=env_snapshot_id,
             snapshot_path=snapshot_path,
+            source=source,
             input_version_ids=input_version_ids,
             preserve_filename=preserve_filename,
             preserve_content_type=preserve_content_type,
@@ -2078,6 +2989,33 @@ class Store:
             project_id=project_id,
         )
 
+    def materialise_artifact_version(
+        self,
+        *,
+        source_version_id: str,
+        artifact_id: str,
+        version_id: str,
+        filename: str,
+        path: str,
+        snapshot_path: str,
+        frame_id: str | None,
+        root_frame_id: str,
+        project_id: str,
+        producing_cell_id: str | None = None,
+    ) -> dict:
+        return self._artifacts.materialise_artifact_version(
+            source_version_id=source_version_id,
+            artifact_id=artifact_id,
+            version_id=version_id,
+            filename=filename,
+            path=path,
+            snapshot_path=snapshot_path,
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+            producing_cell_id=producing_cell_id,
+        )
+
     def upsert_env_snapshot(self, snapshot: dict) -> str:
         return self._artifacts.upsert_env_snapshot(snapshot)
 
@@ -2098,11 +3036,18 @@ class Store:
     def list_artifacts(self, filters: dict | None = None) -> list[dict]:
         return self._artifacts.list_artifacts(filters)
 
+    def list_artifact_names(self) -> list[dict]:
+        return self._artifacts.list_artifact_names()
+
     def resolve_artifact_path(self, ident: str) -> str | None:
         return self._artifacts.resolve_artifact_path(ident)
 
-    def version_for_path(self, path: str) -> str | None:
-        return self._artifacts.version_for_path(path)
+    def version_for_path(
+        self, path: str, *, root_frame_id: str | None, project_id: str
+    ) -> str | None:
+        return self._artifacts.version_for_path(
+            path, root_frame_id=root_frame_id, project_id=project_id
+        )
 
     def version_meta(self, version_id: str) -> dict | None:
         return self._artifacts.version_meta(version_id)
@@ -2415,6 +3360,10 @@ class Store:
         """The most recent (non-discarded) plan for a frame, else the newest."""
         return self._plans.get_by_frame(frame_id)
 
+    def pause_orphaned_executing_plans(self) -> int:
+        """Startup reconciliation: no turn survives the process that ran it."""
+        return self._plans.pause_orphaned_executing()
+
     def list_plans(self, frame_id: str, *, limit: int = 50) -> list[dict]:
         return self._plans.list_for_frame(frame_id, limit=limit)
 
@@ -2441,11 +3390,34 @@ class Store:
             artifact_id=artifact_id,
         )
 
+    def compare_and_set_plan_status(
+        self, plan_id: str, *, expected: str, new_status: str
+    ) -> bool:
+        """Claim a plan transition: True for the one caller that performed it.
+
+        ``update_plan(status=...)`` writes whatever it is given, so a caller
+        that checks the status first has already let go of the row by the time
+        it writes. Anything that must happen once -- resuming a paused plan --
+        goes through here instead.
+        """
+        return self._plans.compare_and_set_status(
+            plan_id, expected=expected, new_status=new_status
+        )
+
     def set_plan_step_status(
         self, plan_id: str, step_id: str, status: str, note: str | None = None
     ) -> dict | None:
-        """Merge one step's status into the plan's step_status JSON. Returns the
-        updated plan (with steps[] status folded in)."""
+        """Merge one step's status into the plan's ``step_status`` JSON.
+
+        Returns the updated plan **row**, not a folded view: ``steps[]`` still
+        carries whatever the plan was created with, and each step's live status
+        lives in the separate ``step_status`` map keyed by step id. The folding
+        is done by ``server/plans.py::public_plan`` on the way to the client.
+
+        This said "with steps[] status folded in", which is a description of a
+        different function. A caller that believed it would read `steps[i]
+        ["status"]`, find nothing, and conclude no step had progressed.
+        """
         return self._plans.set_step_status(plan_id, step_id, status, note)
 
     def delete_plans_for_frame(self, frame_id: str) -> None:
@@ -2477,13 +3449,36 @@ class Store:
             project_id=project_id,
         )
 
+    def update_memory(
+        self,
+        memory_id: str,
+        *,
+        content: str | None = None,
+        block: str | None = None,
+        project_id: str | None = None,
+    ) -> dict | None:
+        return self._memories.update(
+            memory_id,
+            content=content,
+            block=block,
+            project_id=project_id,
+        )
+
     def list_memories(
         self, project_id: str | None = None, block: str | None = None
     ) -> list[dict]:
         return self._memories.list(project_id=project_id, block=block)
 
-    def delete_memory(self, memory_id: str) -> None:
-        self._memories.delete(memory_id)
+    def resolve_memories(
+        self, project_id: str | None = None, block: str | None = None
+    ) -> dict:
+        """`list_memories` plus how many items inheritance added or hid."""
+        return self._memories.resolve(project_id=project_id, block=block)
+
+    def delete_memory(self, memory_id: str, project_id: str | None = None) -> bool:
+        """Delete within one scope; True when a row went. The scope is required
+        because an id-only delete crosses project boundaries silently."""
+        return self._memories.delete(memory_id, project_id=project_id)
 
     def memory_blocks(self, project_id: str | None = None) -> list[dict]:
         return self._memories.blocks(project_id)
@@ -2505,6 +3500,8 @@ class Store:
         rel_x: float,
         rel_y: float,
         body: str,
+        version_id: str | None = None,
+        checksum: str | None = None,
     ) -> dict:
         return self._annotations.add(
             root_frame_id=root_frame_id,
@@ -2513,6 +3510,8 @@ class Store:
             rel_x=rel_x,
             rel_y=rel_y,
             body=body,
+            version_id=version_id,
+            checksum=checksum,
         )
 
     def get_annotation(self, annotation_id: str) -> dict | None:
@@ -2532,24 +3531,486 @@ class Store:
         )
 
     def update_annotation(
-        self, annotation_id: str, *, body: str | None = None, status: str | None = None
+        self,
+        annotation_id: str,
+        *,
+        body: str | None = None,
+        status: str | None = None,
+        expect_status: str | None = None,
     ) -> dict | None:
         return self._annotations.update(
             annotation_id,
             body=body,
             status=status,
+            expect_status=expect_status,
         )
 
     def mark_annotations_sent(self, annotation_ids: list[str]) -> None:
         self._annotations.mark_sent(annotation_ids)
 
+    # --- admission ledger -------------------------------------------------
+    def reserve_with_admission(
+        self,
+        *,
+        reservation_id: str,
+        root_frame_id: str,
+        annotation_ids: list[str],
+    ) -> tuple[bool, list[dict]]:
+        """Claim the id and the pins in ONE transaction.
+
+        Two commits is two outcomes. Reserving and then recording separately
+        means a ledger insert that fails leaves pins `reserved` with nothing to
+        reconcile them against -- held forever, invisible in the composer, and
+        with no row that a recovery pass could even find. So the ledger insert
+        and the status change are one `BEGIN IMMEDIATE`, and either both happen
+        or neither does.
+
+        The ledger's PRIMARY KEY is what makes an id globally unique: a second
+        request naming an existing id loses on the insert and gets nothing --
+        it does not coexist in another frame, and it does not overwrite the
+        first request's row. `annotations(reservation_id, annotation_id)` could
+        never have provided that, because `annotation_id` is already the
+        primary key and the pair is unique for free.
+        """
+        ids: list[str] = []
+        seen: set[str] = set()
+        for annotation_id in annotation_ids or []:
+            if (
+                type(annotation_id) is str
+                and annotation_id
+                and annotation_id not in seen
+            ):
+                seen.add(annotation_id)
+                ids.append(annotation_id)
+        now = _now_ms()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO annotation_admissions(reservation_id,"
+                    "root_frame_id,annotation_ids,request_id,job_id,message_id,"
+                    "state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        reservation_id,
+                        root_frame_id,
+                        json.dumps(ids),
+                        None,
+                        None,
+                        None,
+                        "reserved",
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                return False, []
+            except BaseException:
+                self._conn.rollback()
+                raise
+            try:
+                claimed: list[dict] = []
+                if ids:
+                    placeholders = ",".join("?" * len(ids))
+                    self._conn.execute(
+                        f"UPDATE annotations SET status='reserved', "
+                        f"reservation_id=?, updated_at={now} "
+                        f"WHERE root_frame_id=? AND status='open' "
+                        f"AND annotation_id IN ({placeholders})",
+                        (reservation_id, root_frame_id, *ids),
+                    )
+                    claimed = [
+                        dict(row)
+                        for row in self._conn.execute(
+                            "SELECT * FROM annotations WHERE reservation_id=? "
+                            "AND root_frame_id=? ORDER BY number",
+                            (reservation_id, root_frame_id),
+                        ).fetchall()
+                    ]
+                    # A claim that got nothing is not a live reservation. Left
+                    # `reserved`, it is a permanent row that recovery keeps
+                    # finding and a reconcile keeps reporting as in-flight --
+                    # for pins this request never held. The concurrent loser is
+                    # the ordinary way to reach this.
+                    self._conn.execute(
+                        "UPDATE annotation_admissions SET annotation_ids=?, "
+                        "state=? WHERE reservation_id=?",
+                        (
+                            json.dumps([r["annotation_id"] for r in claimed]),
+                            "reserved" if claimed else "released",
+                            reservation_id,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE annotation_admissions SET state='released' "
+                        "WHERE reservation_id=?",
+                        (reservation_id,),
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return True, claimed
+
+    def update_admission(
+        self,
+        reservation_id: str,
+        *,
+        root_frame_id: str,
+        state: str | None = None,
+        request_id: str | None = None,
+        job_id: str | None = None,
+    ) -> bool:
+        """Advance an admission this frame owns. Scoped, so an id alone is not
+        authority over somebody else's row."""
+        sets = ["updated_at=?"]
+        params: list[Any] = [_now_ms()]
+        for column, value in (
+            ("state", state),
+            ("request_id", request_id),
+            ("job_id", job_id),
+        ):
+            if value is not None:
+                sets.append(f"{column}=?")
+                params.append(value)
+        params.extend([reservation_id, root_frame_id])
+        # A state change is a CAS on the non-terminal states; a
+        # correlation-only write is not. `sent` and `released` are what the
+        # turn did and no later caller gets to rewrite them -- but recording
+        # *which* request and job an already-terminal admission belonged to is
+        # exactly the correlation a lost 202 needs, so it stays unconditional.
+        guard = " AND state IN ('reserved','pending')" if state is not None else ""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE annotation_admissions SET {','.join(sets)} "
+                f"WHERE reservation_id=? AND root_frame_id=?{guard}",
+                tuple(params),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
+    def abandon_admission(
+        self, reservation_id: str, *, root_frame_id: str, job_id: str
+    ) -> bool:
+        """Undo an admission whose turn was correlated and then never started.
+
+        Correlation is written before `Thread.start`, so that a client whose
+        202 was lost can tell an accepted turn from a refusal. That ordering
+        opens its own hole at the other end: if the start then fails, plain
+        release leaves `released` *with* a request and a job id -- the exact
+        signature of accepted work, for a turn that never ran. A reconcile
+        would report it as accepted and the client would not resend.
+
+        A CAS on the job id, so this can only ever retract the turn it was
+        called for: a start that succeeded owns its row and nothing here
+        matches it. Pins and ledger move in one transaction, for the same
+        reason every other terminal transition does.
+        """
+        now = _now_ms()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self._conn.execute(
+                    "UPDATE annotation_admissions SET state='released', "
+                    "request_id=NULL, job_id=NULL, updated_at=? "
+                    "WHERE reservation_id=? AND root_frame_id=? AND job_id=? "
+                    "AND state IN ('reserved','pending','released')",
+                    (now, reservation_id, root_frame_id, job_id),
+                ).rowcount
+                if not changed:
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    "UPDATE annotations SET status='open', reservation_id=NULL, "
+                    "updated_at=? WHERE reservation_id=? AND root_frame_id=? "
+                    "AND status='reserved'",
+                    (now, reservation_id, root_frame_id),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return True
+
+    def record_admission(
+        self,
+        *,
+        reservation_id: str,
+        root_frame_id: str,
+        annotation_ids: list[str],
+        request_id: str | None = None,
+        job_id: str | None = None,
+        message_id: str | None = None,
+        state: str = "reserved",
+    ) -> None:
+        now = _now_ms()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO annotation_admissions(reservation_id,root_frame_id,"
+                "annotation_ids,request_id,job_id,message_id,state,created_at,"
+                "updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(reservation_id) DO UPDATE SET "
+                "request_id=excluded.request_id, job_id=excluded.job_id, "
+                "message_id=excluded.message_id, state=excluded.state, "
+                "updated_at=excluded.updated_at",
+                (
+                    reservation_id,
+                    root_frame_id,
+                    json.dumps(list(annotation_ids)),
+                    request_id,
+                    job_id,
+                    message_id,
+                    state,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    def set_admission_state(self, reservation_id: str, state: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE annotation_admissions SET state=?, updated_at=? "
+                "WHERE reservation_id=?",
+                (state, _now_ms(), reservation_id),
+            )
+            self._conn.commit()
+
+    def get_admission(
+        self, reservation_id: str, *, root_frame_id: str | None = None
+    ) -> dict | None:
+        sql = "SELECT * FROM annotation_admissions WHERE reservation_id=?"
+        params: list[Any] = [reservation_id]
+        if root_frame_id:
+            sql += " AND root_frame_id=?"
+            params.append(root_frame_id)
+        with self._lock:
+            row = self._conn.execute(sql, tuple(params)).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["annotation_ids"] = json.loads(record["annotation_ids"] or "[]")
+        return record
+
+    def list_admissions(self, root_frame_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM annotation_admissions WHERE root_frame_id=? "
+                "ORDER BY created_at",
+                (root_frame_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            record = dict(row)
+            record["annotation_ids"] = json.loads(record["annotation_ids"] or "[]")
+            out.append(record)
+        return out
+
+    def recover_stranded_admissions(self) -> int:
+        """Release reservations no live request can still be holding.
+
+        A process that dies between reserve and finalize leaves `reserved` rows
+        that nothing will ever release: they are neither sent nor available,
+        and the comments are invisible in the composer forever. At startup no
+        request is in flight by definition, so anything still `reserved` is
+        stranded.
+        """
+        recovered = 0
+        with self._lock:
+            # Read, release and stamp under ONE write transaction, per row.
+            #
+            # This used to read every candidate, drop the lock, and then for
+            # each one call `release` (its own transaction) followed by an
+            # unconditional `set_admission_state(..., "released")`. Both halves
+            # were wrong in the same direction. A live request can finalize
+            # between the read and the release -- the read says `reserved`, the
+            # turn sends, and the late recovery pass then stamps `released`
+            # over `sent`. That is terminal evidence going backwards: the
+            # message carried the comments and the ledger now says it did not,
+            # so a client reconciling after a lost 202 is told to send them
+            # again.
+            #
+            # `BEGIN IMMEDIATE` takes the write lock before the read, so the
+            # candidate cannot move underneath it, and the stamp is a CAS on
+            # the non-terminal states rather than an assignment.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    "SELECT reservation_id, root_frame_id, annotation_ids FROM "
+                    "annotation_admissions WHERE state IN ('reserved','pending')"
+                ).fetchall()
+                for row in rows:
+                    reservation_id = row["reservation_id"]
+                    root = row["root_frame_id"]
+                    try:
+                        expected = set(json.loads(row["annotation_ids"] or "[]"))
+                    except ValueError:
+                        expected = set()
+                    held = {
+                        held_row["annotation_id"]
+                        for held_row in self._conn.execute(
+                            "SELECT annotation_id FROM annotations WHERE "
+                            "reservation_id=? AND status='reserved' "
+                            "AND root_frame_id=?",
+                            (reservation_id, root),
+                        ).fetchall()
+                    }
+                    # The ledger moves only when the exact set it names really
+                    # goes back. Anything else -- nothing held because a live
+                    # turn finalised them first, or a partial set because
+                    # something moved underneath -- is not this pass's news to
+                    # report, and stamping `released` over it would overwrite
+                    # the `sent` that turn just wrote. Terminal evidence that
+                    # can go backwards is not evidence.
+                    if not held or held != expected:
+                        continue
+                    freed = self._conn.execute(
+                        "UPDATE annotations SET status='open', "
+                        "reservation_id=NULL, updated_at=? "
+                        "WHERE reservation_id=? AND status='reserved' "
+                        "AND root_frame_id=?",
+                        (_now_ms(), reservation_id, root),
+                    ).rowcount
+                    if freed != len(held):
+                        continue
+                    self._conn.execute(
+                        "UPDATE annotation_admissions SET state='released', "
+                        "updated_at=? WHERE reservation_id=? "
+                        "AND state IN ('reserved','pending')",
+                        (_now_ms(), reservation_id),
+                    )
+                    recovered += 1
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return recovered
+
+    def reserve_annotations(
+        self, *, root_frame_id: str, annotation_ids: list[str], reservation_id: str
+    ) -> list[dict]:
+        return self._annotations.reserve(
+            root_frame_id=root_frame_id,
+            annotation_ids=annotation_ids,
+            reservation_id=reservation_id,
+        )
+
+    def release_annotations(
+        self, reservation_id: str, *, root_frame_id: str | None = None
+    ) -> int:
+        return self._annotations.release(reservation_id, root_frame_id=root_frame_id)
+
+    def finalize_annotations_sent(
+        self,
+        reservation_id: str,
+        *,
+        expected_ids: list[str] | None = None,
+        root_frame_id: str | None = None,
+        request_id: str | None = None,
+        job_id: str | None = None,
+    ) -> bool:
+        return self._annotations.finalize_sent(
+            reservation_id,
+            expected_ids=expected_ids,
+            root_frame_id=root_frame_id,
+            request_id=request_id,
+            job_id=job_id,
+        )
+
+    def annotation_is_reserved(self, annotation_id: str) -> bool:
+        return self._annotations.is_reserved(annotation_id)
+
     def delete_annotation(self, annotation_id: str) -> None:
         self._annotations.delete(annotation_id)
 
+    def delete_unreserved_annotation(self, annotation_id: str) -> bool:
+        return self._annotations.delete_unreserved(annotation_id)
+
+    # --- complete DataPro content index -------------------------------
+    def index_datapro_result(
+        self,
+        query: str,
+        structured_content: Mapping[str, Any],
+        frame_id: str | None = None,
+        artifact_id: str | None = None,
+        occurrence_id: str | None = None,
+        source_content: Any | None = None,
+    ) -> dict[str, Any]:
+        """Atomically index every field returned by one successful search."""
+
+        scope = self.resolve_frame_scope(frame_id)
+        return self._datapro_index.ingest(
+            query=str(query),
+            structured_content=structured_content,
+            project_id=str(scope["project_id"] or "default"),
+            root_frame_id=(
+                str(scope["root_frame_id"]) if scope.get("root_frame_id") else None
+            ),
+            artifact_id=artifact_id,
+            occurrence_id=occurrence_id,
+            source_content=source_content,
+        )
+
+    def link_datapro_index_artifact(
+        self, batch_id: str, artifact_id: str | None
+    ) -> dict[str, Any]:
+        """Bind a batch to its saved result, refusing a dead Artifact.
+
+        `ingest` commits the batch with `artifact_id` NULL, and the Artifact is
+        created and linked afterwards. A delete landing in that window matched
+        nothing -- the batch was not yet attributed to the Artifact -- and this
+        UPDATE then pointed it at an id that no longer exists, resurrecting
+        state the delete was supposed to remove. Nothing would collect it
+        again, because `delete_for_artifact` only ever runs once per Artifact,
+        so the batch stayed palette-visible forever.
+
+        Linking to a missing Artifact therefore drops the batch instead: its
+        owner is gone, so the index content has no lifecycle left to share.
+        """
+
+        if artifact_id is not None and self.get_artifact(artifact_id) is None:
+            self._datapro_index.delete_batch(batch_id)
+            raise KeyError(f"no such artifact {artifact_id!r}")
+        return self._datapro_index.link_artifact(batch_id, artifact_id)
+
+    def search_datapro_index(
+        self,
+        query: str,
+        limit: int = 20,
+        frame_id: str | None = None,
+        project_id: str | None = None,
+        include_context: bool = False,
+    ) -> dict[str, Any]:
+        """Search literal DataPro text globally or within an explicit scope."""
+
+        root_frame_id: str | None = None
+        resolved_project = project_id
+        if frame_id is not None:
+            scope = self.resolve_frame_scope(
+                frame_id, fallback_project=project_id or "default"
+            )
+            root_frame_id = (
+                str(scope["root_frame_id"]) if scope.get("root_frame_id") else None
+            )
+            resolved_project = str(scope["project_id"] or "default")
+        return self._datapro_index.search(
+            query,
+            limit=limit,
+            project_id=resolved_project,
+            root_frame_id=root_frame_id,
+            include_context=include_context,
+        )
+
+    def get_datapro_index_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self._datapro_index.get_batch(batch_id)
+
+    def delete_datapro_index_batch(self, batch_id: str) -> None:
+        self._datapro_index.delete_batch(batch_id)
+
     # --- global search (command palette) --------------------------------
     def search(self, query: str, limit: int = 20) -> dict:
-        """Search sessions (name/task_summary) + artifacts (filename) for the
-        ⌘K command palette."""
+        """Search sessions, artifacts, and indexed DataPro content for ⌘K."""
         q = f"%{query.strip()}%"
         with self._lock:
             frames = self._conn.execute(
@@ -2584,6 +4045,11 @@ class Store:
                 }
                 for r in arts
             ],
+            # Command-palette hits need the child record and Artifact link, not
+            # a potentially-megabyte wrapper copied onto every matching child.
+            "datapro": self.search_datapro_index(
+                query, limit=limit, include_context=False
+            )["items"],
         }
 
     # --- agents / specialists -------------------------------------------
@@ -2705,6 +4171,11 @@ class Store:
             unrestricted=unrestricted,
         )
 
+    def update_agent(self, name: str, **fields: Any) -> dict | None:
+        """Partial update: only the supplied columns change. Returns None if
+        the specialist does not exist."""
+        return self._agents.update(name, **fields)
+
     def delete_agent(self, name: str) -> None:
         self._agents.delete(name)
 
@@ -2753,14 +4224,43 @@ class Store:
     def get_compute_job(self, job_id: str) -> dict | None:
         return self._compute_jobs.get(job_id)
 
-    def compute_job_by_idempotency_key(self, key: str) -> dict | None:
-        return self._compute_jobs.by_idempotency_key(key)
+    def artifact_write_scope(
+        self,
+        *,
+        frame_id: str | None = None,
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
+    ) -> tuple[bool, str | None, str]:
+        """The scope a write *would* land in, resolved without writing.
 
-    def live_compute_jobs(self) -> list[dict]:
-        return self._compute_jobs.live()
+        The repository has always had this and `save_artifact` calls it -- but by
+        the time `save_artifact` runs, `ArtifactManager.upload` has already
+        rewritten the live file, so a conflicting `project_id` refused *after* the
+        previous version's bytes were gone. Nothing needed to be built; the
+        resolution needed to be asked for first. Public so the upload path can.
+        """
+        return self._artifacts.artifact_write_scope(
+            frame_id=frame_id, root_frame_id=root_frame_id, project_id=project_id
+        )
+
+    def compute_job_by_idempotency_key(
+        self, key: str, owner_key: str | None = None, *, scoped: bool = True
+    ) -> dict | None:
+        return self._compute_jobs.by_idempotency_key(key, owner_key, scoped=scoped)
+
+    def live_compute_jobs(
+        self, owner_key: str | None = None, scoped: bool = False
+    ) -> list[dict]:
+        return self._compute_jobs.live(owner_key=owner_key, scoped=scoped)
 
     def list_compute_jobs(self, limit: int = 200) -> list[dict]:
         return self._compute_jobs.list(limit)
+
+    def compute_jobs_for_owner(
+        self, owner_key: str | None, limit: int = 200
+    ) -> list[dict]:
+        """One owner's remote jobs, live and finished. Never installation-wide."""
+        return self._compute_jobs.for_owner(owner_key, limit)
 
     def append_compute_job_event(self, job_id: str, kind: str, payload=None) -> int:
         return self._compute_jobs.append_event(job_id, kind, payload)
@@ -2839,18 +4339,96 @@ class Store:
         )
 
     # --- generic read-only query (host.query backing) -------------------
+    def _refresh_scoped_views(
+        self, conn: sqlite3.Connection, scope: Mapping[str, Any]
+    ) -> None:
+        """Publish the `my_*` views for one caller's scope, at most once per scope.
+
+        The internal artifact tables cannot simply be denied: a bundled Skill
+        legitimately reads `artifact_versions.source` to confirm the retrieval
+        provenance it just attached. So the base tables are closed to direct
+        access and reachable only through these views, which carry the caller's
+        `root_frame_id`/`project_id` baked in as literals.
+
+        Two things here are load-bearing, and the first version of this method got
+        both wrong.
+
+        `executescript` is not used, and this is a correctness point rather than a
+        performance one: it issues an implicit COMMIT before running its script, so
+        every `host.query` ended whatever transaction the caller had open. On a
+        database that holds an audit ledger, a read that commits someone else's
+        half-finished write is not a read. `test_agent_sql_does_not_commit_the_
+        callers_transaction` is the check.
+
+        The definitions are also cached against the scope that produced them,
+        rather than rebuilt per query. Measured on this machine that is 0.090 ms
+        -> 0.005 ms per query, 17x on this path -- worth having and not more than
+        that. It is recorded because the number is small: an earlier note here
+        blamed a slow test suite on it, which was wrong, and 0.09 ms per query
+        could not have done that.
+
+        The scope values are internal ids the caller never supplies -- they come
+        from `resolve_frame_scope` -- and they are quoted anyway, because a value
+        interpolated into DDL is worth quoting whatever its provenance.
+        """
+        root = str(scope.get("root_frame_id") or "")
+        project = str(scope.get("project_id") or "")
+        if getattr(self, "_view_scope", None) == (root, project):
+            return
+        root_sql = _sql_quote(root)
+        project_sql = _sql_quote(project)
+        statements = (
+            f"""CREATE TEMP VIEW my_artifacts AS
+                SELECT * FROM main.artifacts
+                 WHERE root_frame_id = {root_sql} AND project_id = {project_sql}""",
+            f"""CREATE TEMP VIEW my_artifact_versions AS
+                SELECT v.* FROM main.artifact_versions v
+                  JOIN main.artifacts a ON a.artifact_id = v.artifact_id
+                 WHERE a.root_frame_id = {root_sql}
+                   AND a.project_id = {project_sql}""",
+            f"""CREATE TEMP VIEW my_lineage_edges AS
+                SELECT e.* FROM main.lineage_edges e
+                  JOIN main.artifact_versions v
+                    ON v.version_id = e.output_version_id
+                  JOIN main.artifacts a ON a.artifact_id = v.artifact_id
+                 WHERE a.root_frame_id = {root_sql}
+                   AND a.project_id = {project_sql}""",
+            f"""CREATE TEMP VIEW my_frames AS
+                SELECT * FROM main.frames
+                 WHERE frame_id = {root_sql} OR root_frame_id = {root_sql}""",
+            f"""CREATE TEMP VIEW my_env_snapshots AS
+                SELECT s.* FROM main.env_snapshots s
+                  JOIN main.frames f ON f.frame_id = s.frame_id
+                 WHERE f.frame_id = {root_sql} OR f.root_frame_id = {root_sql}""",
+        )
+        for name in _SCOPED_VIEWS:
+            conn.execute(f"DROP VIEW IF EXISTS temp.{name}")
+        for statement in statements:
+            conn.execute(statement)
+        self._view_scope = (root, project)
+
     def query(
         self,
         sql: str,
         params: list | None = None,
         limit: int | None = None,
         timeout_s: float = 5.0,
+        scope: Mapping[str, Any] | None = None,
     ) -> list[dict]:
-        """Run a read-only SELECT/CTE. Enforces denylist + timeout."""
+        """Run a read-only SELECT/CTE under a real SQLite authorizer.
+
+        The authorizer is the enforcement; the text checks below are kept as a
+        cheap first refusal with a clearer message. That ordering matters: the
+        text checks were previously the *only* enforcement, and they cannot see a
+        table named in a bound parameter, spelled `"artifacts"`, `[artifacts]` or
+        `main.artifacts`, or reached through `pragma_table_list`. SQLite hands the
+        authorizer the resolved table name after parsing, so none of those
+        spellings are different to it.
+
+        `scope`, when supplied, publishes the `my_*` views for that caller. It
+        used to be accepted by the SDK and dropped on the floor here.
+        """
         lowered = sql.lower()
-        # Denylist check runs against a literal-stripped copy so a denied name
-        # inside a string literal/comment is not a false positive, while a real
-        # (possibly identifier-quoted) table reference still trips it.
         deny_scan = _strip_sql_literals(lowered)
         for bad in QUERY_DENYLIST:
             if bad in deny_scan:
@@ -2858,26 +4436,42 @@ class Store:
         stripped = lowered.lstrip()
         if not (stripped.startswith("select") or stripped.startswith("with")):
             raise ValueError("host.query only allows read-only SELECT/CTE")
-        for kw in (
-            " insert ",
-            " update ",
-            " delete ",
-            " drop ",
-            " alter ",
-            " create ",
-            " attach ",
-            " pragma ",
-        ):
-            if kw in f" {lowered} ":
-                raise ValueError(f"host.query: forbidden keyword {kw.strip()!r}")
-        # per-statement timeout via a busy interrupt handler
+
+        # The daemon's one connection, with the authorizer installed for exactly
+        # the duration of this statement and removed in `finally` -- the same
+        # shape as the existing `set_progress_handler` bracket directly below.
+        #
+        # A separate `mode=ro` connection was tried first and reverted: it would
+        # add a second connection lifetime, a second lock discipline and
+        # multi-process interaction to a compatibility facade, for defence in
+        # depth the authorizer already provides. The authorizer denies every
+        # action code that is not a read or a plain SELECT, so writes are refused
+        # by rule and not by keyword.
+        conn = self._conn
         with self._lock:
-            self._conn.set_progress_handler(_TimeoutGuard(timeout_s), 10000)
+            guard = _QueryAuthorizer()
             try:
-                cur = self._conn.execute(sql, tuple(params or ()))
+                # Views first, with the guard off: creating them is a privileged
+                # setup step, not part of the caller's statement.
+                _clear_authorizer(conn)
+                if scope:
+                    self._refresh_scoped_views(conn, scope)
+                conn.set_authorizer(guard)
+                conn.set_progress_handler(_TimeoutGuard(timeout_s), 10000)
+                cur = conn.execute(sql, tuple(params or ()))
                 rows = cur.fetchmany(limit) if limit else cur.fetchall()
+            except sqlite3.DatabaseError as error:
+                if guard.denied:
+                    raise PermissionError(
+                        f"host.query: {', '.join(guard.denied)} is not readable "
+                        f"from agent SQL. Scoped rows are available through "
+                        f"my_artifacts, my_artifact_versions and "
+                        f"my_lineage_edges."
+                    ) from error
+                raise
             finally:
-                self._conn.set_progress_handler(None, 10000)
+                conn.set_progress_handler(None, 10000)
+                _clear_authorizer(conn)
         return [dict(r) for r in rows]
 
     def schema(self) -> dict[str, list[str]]:
@@ -2888,7 +4482,11 @@ class Store:
             out: dict[str, list[str]] = {}
             for t in tables:
                 name = t["name"]
-                if name in QUERY_DENYLIST or name.startswith("sqlite_"):
+                if (
+                    name in QUERY_DENYLIST
+                    or name.startswith("sqlite_")
+                    or name in {"datapro_index_batches", "datapro_index_entries"}
+                ):
                     continue
                 cols = self._conn.execute(f"PRAGMA table_info({name})").fetchall()
                 out[name] = [c["name"] for c in cols]

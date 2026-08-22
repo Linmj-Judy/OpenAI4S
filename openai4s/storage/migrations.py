@@ -46,6 +46,7 @@ The invariant this buys: a database is either fully at version N or still fully
 at version N-1. There is no in-between state to recognise, which is what makes
 an interrupted upgrade recoverable by simply running again.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -55,7 +56,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 # Bump when adding a numbered migration below.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 17
 
 _MIGRATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (

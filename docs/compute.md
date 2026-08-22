@@ -14,7 +14,7 @@ Model-weight-bound work runs its heavy step on a remote GPU, not the local kerne
 
 ## 1 · `host.compute` — general BYOC / SSH job dispatcher
 
-A job is dispatched non-blocking (`create → submit_job → wait → result`): the daemon stages inputs, runs the job on the remote provider, and harvests `out.tar.gz` back into the workspace under `hpc/<job_id>/`. The harvest is bounded — the archive is rejected outright on path traversal, absolute paths, symlink/hardlink or device members, or a decompression bomb, because remote bytes are untrusted input even on the happy path. Two provider families are built in:
+A job is dispatched non-blocking (`create → submit_job → poll result()`): the daemon stages inputs, runs the job on the remote provider, and harvests `out.tar.gz` back into the workspace under `hpc/<job_id>/`. `result()` is what drives that forward — it probes the remote and harvests once the work is terminal; there is no background poller, so a job nobody polls is never harvested. The harvest is bounded — the archive is rejected outright on path traversal, absolute paths, symlink/hardlink or device members, or a decompression bomb, because remote bytes are untrusted input even on the happy path. Two provider families are built in:
 
 - **`ssh:<alias>`** — run jobs over an SSH connection to a machine you already have ([`skills/remote-compute-ssh`](../skills/remote-compute-ssh)).
 - **`byoc:<id>`** — a bring-your-own-compute provider discovered from `skills/remote-compute-<id>/` (`provider.json` + `provider.py`).
@@ -30,10 +30,44 @@ The bundled **NVIDIA NIM** provider ([`skills/remote-compute-nvidia`](../skills/
 c   = host.compute.create("byoc:nvidia", provider_params={"nvidia": {"mode": "hosted"}})
 job = c.submit_job(intent="run esmfold2 on 1 seq", command="python run_esmfold.py ./seq.fasta",
                    inputs=[{"src": "seq.fasta"}], outputs=["*.pdb"], timeout_seconds=3600)
-result = job.result()   # non-blocking once the compute_done notification arrives
+result = job.result()   # one non-blocking poll — call it again from a later cell
+                        # until result['status'] is terminal
 ```
 
 The daemon forwards **only** the keys a provider declares in its `provider.json` `secret_env` into the job (over the helper's stdin) — never your whole environment.
+
+`outputs` is a promise, not a hint: a pattern that matches nothing when the
+harvest is reconciled makes the job `failed` even if it exited 0. Every harvest
+records `{path, size, sha256}` per file plus a digest over the set, which is
+also what makes a transfer truncated at rc==0 visible. A path alone is not
+evidence — a harvested file that could not be read carries no hash, is never
+counted as discharging the pattern that named it, and comes back in
+`unverified_files`.
+
+Both transports harvest the same way. On `ssh:*` the job's work directory is
+staged into one archive on the host and pulled back through the same
+hostile-input-safe extractor the `byoc:*` archive goes through; files over
+~100 MB, and any output declared `{glob, residency:'remote'}`, stay on the
+cluster and come back named in `left_on_remote_files` with a URI the next job
+can chain from.
+
+On `byoc:*`, `provider_params[<id>]["timeout"]` is the **container's**
+lifetime, which is a different clock from the job's. The host stamps when the
+sandbox was created and sends the resulting absolute deadline with each
+submit, so the wrapper's watchdog stops the job with a harvest margin to spare
+rather than letting the container be reclaimed mid-run and take the outputs
+with it. A reused warm container therefore inherits the time it has already
+spent — the second job into a one-hour sandbox created forty minutes ago gets
+twenty minutes, not another hour. Declare no lifetime and the watchdog stays
+unarmed, because a guessed deadline would kill jobs early.
+
+`timeout_seconds` is enforced on the remote, by wrapping the job body in
+`timeout(1)` (or `gtimeout`). A host with neither refuses the submit rather
+than running an unbounded job while you believe a limit applies. On expiry the
+job reports `timed_out` with exit code 124. On the `ssh:*` path the job also
+runs under job control, so it owns a process group and `cancel` signals the
+whole tree — `run.sh` and everything it started — then escalates to SIGKILL
+and confirms the group is gone before reporting the cancellation.
 
 ### Job states
 
@@ -41,12 +75,21 @@ Terminal states are mutually exclusive and never optimistic:
 
 | state | meaning |
 |---|---|
-| `done` | the job's exit code was read and was 0, and its outputs were harvested and verified |
-| `failed` | the job's exit code was read and was non-zero |
+| `succeeded` | the exit code was read and was 0, **and** every declared output was harvested and hashed |
+| `failed` | the exit code was read and was non-zero, or it was 0 but the outputs could not be accounted for — `termination_reason` says which |
 | `timed_out` | a deadline or per-job timeout sentinel fired |
-| `incomplete` | the job itself succeeded, but its outputs could not be verified (lost by the wrapper, a partial transfer, or a rejected archive) |
-| `cancelled` | a cancel was delivered and confirmed |
+| `cancelled` | a cancel was delivered and confirmed, or the handle was closed over live work (`termination_reason: handle_closed`) |
 | `unknown` | **the outcome could not be established** |
+
+`succeeded` is the only state that requires evidence on both halves. A job that
+exits 0 while a pattern it declared in `outputs` matched nothing is `failed`
+with `termination_reason: outputs_unverified` — the promise is part of the
+contract, not a hint. Every harvest records a manifest of `{path, size,
+sha256}` plus one digest over the whole set, which is also the only way to see
+a transfer that stopped halfway while its exit code stayed 0.
+
+`incomplete` and `done` were earlier spellings. Migration 2 renamed `done` to
+`succeeded` and folded `incomplete` into `failed` with the reason above.
 
 `unknown` is not a synonym for failure — the job may well have succeeded. It means there is no evidence either way (the host was unreachable, the remote process was killed without writing an exit code, a helper blew its deadline, or a `.phase` marker was unparseable). Reconcile it against the remote before re-submitting; a blind retry may duplicate work that already completed. Nothing resolves `unknown` to success by default.
 
@@ -86,13 +129,15 @@ survives a restart, which is precisely when a client retries.
 
 ### Confinement status (Prototype)
 
-`openai4s_compute_provider` ships a confinement probe and an `expect_confined` mode, but **nothing on the host currently wraps the helper in an OS sandbox** or supplies the probe's netns anchor — so confinement is a designed boundary, not a built one, and `host.compute` remains Prototype. Do not read "the helper ran" as "the helper was confined".
+`openai4s_compute_provider` ships a confinement probe and an `expect_confined` mode, and the host now supplies the boundary that probe looks for: [`security/byoc_confinement.py`](../openai4s/security/byoc_confinement.py) builds a Seatbelt profile on macOS and a bubblewrap invocation on Linux, and [`compute/manager.py`](../openai4s/compute/manager.py) wraps the helper in it. The two travel together — whenever the host wraps, it also passes `expect_confined=1` and the anchor the probe compares against (`OPENAI4S_HOST_HOME_DEV`, the real home's device id; the netns anchor this replaces is now only a fallback for a host a release behind). Still do not read "the helper ran" as "the helper was confined" — read `confinement_status()`, which answers from the same self-test every other surface uses.
+
+The boundary is the **filesystem** one: `$HOME` is replaced, writes are confined to the job's stage directory, and on macOS the keychain services are denied as well, since `security find-generic-password` asks securityd rather than reading a file. **Network isolation is a separate capability and is not enabled** (`network_isolated: false`): a helper whose job is calling a provider's REST API cannot live in an empty netns without a host egress proxy. `host.compute` remains **Prototype** — but for the reason in [`docs/v02-decisions.md`](v02-decisions.md), that no specific cloud GPU provider has been named production-grade, not because the boundary is unbuilt.
 
 `OPENAI4S_COMPUTE_CONFINEMENT` mirrors `OPENAI4S_KERNEL_SANDBOX`'s vocabulary:
 
-- `auto` (default) — run unconfined; the posture is reported, never implied.
-- `enforce` — refuse `byoc:*` ops outright, since a verified boundary cannot be established on this host. Fail closed rather than pretend.
-- `off` — same as `auto` today; reserved for when a real boundary exists.
+- `auto` (default) — wrap the helper wherever a boundary can be established; where none can, run unconfined and report that degradation rather than implying a boundary.
+- `enforce` — refuse `byoc:*` ops on a host that cannot establish a verified boundary (no `bwrap`/`sandbox-exec`, a failing self-test, or an unsupported platform), and refuse on every op rather than only at submit. Fail closed rather than pretend.
+- `off` — skip the wrapping entirely, by explicit configuration. This is **no longer the same as `auto`**: `auto` confines wherever it can.
 
 The confined helper that stages, runs, and harvests each job is the **worker runtime** package [`openai4s_compute_provider`](../openai4s_compute_provider) — shared by every `byoc:*` provider. Despite its name it is a worker runtime, not a provider registry; it is kept under that legacy name for import compatibility (see [`docs/package-architecture.md`](package-architecture.md)). Its import-time secret-scrubbing guarantees are documented in [`docs/security.md`](security.md).
 

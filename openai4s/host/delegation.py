@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Protocol
 
+from openai4s.host import resource_allowlist
+
 
 class AgentProfileStore(Protocol):
-    def get_agent(self, name: str, **kwargs) -> dict | None:
-        ...
+    def get_agent(self, name: str, **kwargs) -> dict | None: ...
 
 
 Delegate = Callable[[dict], Any]
@@ -44,6 +45,31 @@ Protocol:
    exact remote checks you ran. Never claim a model is configured until verified.
 """,
 }
+
+
+def _with_persona(request: Any, persona: str) -> Any:
+    """Prepend the specialist's persona to every request shape `delegate` takes.
+
+    `host.delegate` accepts a string, a dict, or a LIST of either -- the list
+    is fan-out, several children from one call. Only the first two shapes were
+    handled, so a fan-out to a named specialist silently produced generic
+    agents: the profile's system prompt was looked up, found, and then dropped
+    on the floor. The caller saw a successful delegation to `bioinfo` whose
+    children had never been told they were `bioinfo`.
+
+    Recursive rather than a third branch, because a list of dicts is a shape
+    the SDK allows and two flat branches would have missed it the same way.
+    """
+    if isinstance(request, str):
+        return persona + request
+    if isinstance(request, dict) and "request" in request:
+        return {
+            **request,
+            "request": _with_persona(request.get("request", ""), persona),
+        }
+    if isinstance(request, list):
+        return [_with_persona(item, persona) for item in request]
+    return request
 
 
 class DelegationService:
@@ -115,7 +141,9 @@ class DelegationService:
             if agent:
                 # Profiles may grow richer than the current SQLite form. Keep
                 # every supported per-agent execution override on the delegate
-                # envelope, while an explicit call-site value always wins.
+                # envelope. A call-site *setting* wins; a call-site
+                # *restriction* may only narrow the row's -- see
+                # `_with_profile_overrides`, where "always wins" was the defect.
                 spec = _with_profile_overrides(spec, agent)
             if system_prompt:
                 request = spec.get("request")
@@ -123,16 +151,7 @@ class DelegationService:
                     f"You are acting as the specialist **{name}**.\n"
                     f"{system_prompt}\n\n"
                 )
-                if isinstance(request, str):
-                    spec = {**spec, "request": persona + request}
-                elif isinstance(request, dict) and "request" in request:
-                    spec = {
-                        **spec,
-                        "request": {
-                            **request,
-                            "request": persona + str(request.get("request", "")),
-                        },
-                    }
+                spec = {**spec, "request": _with_persona(request, persona)}
         return delegate(spec)
 
     def children(self) -> Any:
@@ -167,6 +186,33 @@ class DelegationService:
 
 
 def _with_profile_overrides(spec: dict, profile: dict) -> dict:
+    """Merge a stored Specialist row into one `delegate` call's spec.
+
+    Two different merges, because two of these fields are restrictions and the
+    rest are settings.
+
+    A setting the caller named wins; the row is only a default. That is what
+    `if target not in merged` implements and it is right for model, provider,
+    steps and permissions.
+
+    A *restriction* must not work that way, and it did. `skill_names`,
+    `connectors` and `unrestricted` all took the call-site value verbatim
+    whenever the call named one, so the stored row was advisory: measured
+    against a row of `{skill_names: ["only-this"], connectors: [],
+    unrestricted: False}`, a call naming three skills got three, a call naming a
+    connector got it despite `[]` meaning *denied*, and a call passing
+    `unrestricted=True` got it. Both are reachable through the documented
+    `host.delegate(...)` signature and the `delegate_task` tool schema, so the
+    agent chose its own allowlist and the exit criterion -- "a child may only
+    narrow" -- was inverted.
+
+    `resource_allowlist.narrow` is the intersection this needed and it already
+    existed; its own docstring warns that treating the child's value as the
+    answer "would hand a restricted parent's delegate an unrestricted set, and
+    delegation would become the way out of every restriction". Nothing called
+    it here. `SkillService.set_allowed_skills` does narrow correctly -- it was
+    being handed a value that had already been widened.
+    """
     merged = dict(spec)
     for source, target in (
         ("model", "model"),
@@ -176,13 +222,34 @@ def _with_profile_overrides(spec: dict, profile: dict) -> dict:
         ("max_turns", "max_turns"),
         ("permissions", "permissions"),
         ("capabilities", "capabilities"),
-        ("skill_names", "skill_names"),
-        ("skills", "skill_names"),
-        ("connectors", "connectors"),
-        ("unrestricted", "unrestricted"),
     ):
         if target not in merged and profile.get(source) is not None:
             merged[target] = profile[source]
+
+    # The row is the parent, the call site is the child, and the result may
+    # only be tighter than the row. `skills` is the row's legacy spelling of
+    # `skill_names`; a row that sets both is intersected with itself, which is
+    # the row.
+    row_skills: object = profile.get("skill_names")
+    if profile.get("skills") is not None:
+        row_skills = resource_allowlist.narrow(row_skills, profile.get("skills"))
+    for target, row_value in (
+        ("skill_names", row_skills),
+        ("connectors", profile.get("connectors")),
+    ):
+        effective = resource_allowlist.narrow(row_value, merged.get(target))
+        if effective is not None:
+            merged[target] = sorted(effective)
+        else:
+            merged.pop(target, None)
+
+    # `unrestricted` is a floor, not a default: a row that says False cannot be
+    # raised to True by the call it restricts.
+    if profile.get("unrestricted") is not None:
+        if profile["unrestricted"]:
+            merged.setdefault("unrestricted", True)
+        else:
+            merged["unrestricted"] = False
     return merged
 
 

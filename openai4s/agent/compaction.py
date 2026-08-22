@@ -16,6 +16,7 @@ The V2 helpers make the policy's previously implicit contracts explicit:
 Only JSON-compatible values are archived.  This module deliberately has no
 Store, Gateway, provider, or kernel dependency.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -67,6 +68,13 @@ class ContextEstimate:
     tool_results: int = 0
     artifact_refs: int = 0
     wire_state: int = 0
+    #: The system prompt, kept apart from conversation text because the two
+    #: answer to different remedies. Standing context -- memory, skills,
+    #: specialists, connectors, environments -- is rebuilt from scratch every
+    #: turn and compaction never touches it. Counted inside ``text``, a large
+    #: system prompt read as "your conversation is long", and the user reached
+    #: for the one tool that cannot help.
+    system_prompt: int = 0
 
     @property
     def total(self) -> int:
@@ -78,6 +86,7 @@ class ContextEstimate:
             + self.tool_results
             + self.artifact_refs
             + self.wire_state
+            + self.system_prompt
         )
 
     def as_dict(self) -> dict[str, int]:
@@ -261,12 +270,16 @@ def estimate_context(
 ) -> ContextEstimate:
     """Estimate context by text/image/tool-call/provider-state components."""
     text = images = tool_calls = tool_results = artifact_refs = wire_state = 0
+    system_prompt = 0
     for message in messages:
         content_text, content_images = _content_estimate(message.get("content"))
         # Eight framing tokens preserves the old API's conservative per-message
         # overhead and is accounted as text rather than a fifth hidden bucket.
-        if message.get("role") == "tool":
+        role = message.get("role")
+        if role == "tool":
             tool_results += content_text + 8
+        elif role == "system":
+            system_prompt += content_text + 8
         else:
             text += content_text + 8
         images += content_images
@@ -286,6 +299,7 @@ def estimate_context(
         tool_results=tool_results,
         artifact_refs=artifact_refs,
         wire_state=wire_state,
+        system_prompt=system_prompt,
     )
 
 
@@ -314,7 +328,7 @@ def _has_code_action(message: Mapping[str, Any]) -> bool:
 
 
 def segment_messages(
-    messages: Sequence[Mapping[str, Any]]
+    messages: Sequence[Mapping[str, Any]],
 ) -> tuple[ContextSegment, ...]:
     """Partition messages into atomic replay/compaction segments.
 
@@ -450,10 +464,9 @@ def externalize_large_outputs(
     threshold_chars: int = DEFAULT_LARGE_OUTPUT_CHARS,
     preview_chars: int = DEFAULT_PREVIEW_CHARS,
     archive_metadata: Mapping[str, Any] | CompactionArchiveMetadata | None = None,
-    artifact_archiver: Callable[
-        [Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]
-    ]
-    | None = None,
+    artifact_archiver: (
+        Callable[[Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]] | None
+    ) = None,
 ) -> list[dict]:
     """Archive oversized outputs and return context-safe message copies.
 
@@ -628,10 +641,9 @@ def compact(
     archive_dir: Path | str | None = None,
     archive_metadata: Mapping[str, Any] | CompactionArchiveMetadata | None = None,
     large_output_chars: int = DEFAULT_LARGE_OUTPUT_CHARS,
-    artifact_archiver: Callable[
-        [Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]
-    ]
-    | None = None,
+    artifact_archiver: (
+        Callable[[Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]] | None
+    ) = None,
     archive_sink: Callable[[Mapping[str, Any]], Any] | None = None,
     tool_schemas: Iterable[Mapping[str, Any]] = (),
 ) -> list[dict]:

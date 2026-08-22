@@ -82,6 +82,31 @@ function setTitle(name) { const ct = $("#conv-title"); if (!ct) return; ct.value
 // bump is this one line plus a gateway prefix, not a sweep through the file.
 const API = "/api/v1";
 
+// Every failure body is {error, code, status, request_id}. This used to throw a
+// bare Error carrying only `error`, so the fields that make a failure
+// actionable were parsed and then dropped on the floor: `code`, the stable
+// machine-readable contract, left callers with nothing to branch on except the
+// prose -- which the backend documents as explicitly *not* an interface -- and
+// `request_id` never reached the user, so the one string that ties their
+// report to a server log line existed on both ends and was shown at neither.
+class ApiError extends Error {
+  constructor(body, httpStatus) {
+    super((body && (body.error || body.detail)) || ("HTTP " + httpStatus));
+    this.name = "ApiError";
+    this.code = (body && body.code) || "";
+    this.status = (body && body.status) || httpStatus;
+    this.requestId = (body && body.request_id) || "";
+    this.body = body;
+  }
+}
+// What a human should read. The id is appended rather than woven in so the
+// sentence still reads as a sentence, and omitted when there is none rather
+// than rendered as "(null)" -- an absent id means the failure never reached a
+// request, which is a different thing from a request without one.
+function apiErrorText(e) {
+  const msg = (e && e.message) ? String(e.message) : String(e);
+  return (e && e.requestId) ? `${msg} [${e.requestId}]` : msg;
+}
 const api = async (p, o = {}) => {
   // `p` must be an internal, same-origin API path: a single leading slash and no
   // scheme/host. Rejecting "//host" (protocol-relative) and non-string input keeps
@@ -89,17 +114,18 @@ const api = async (p, o = {}) => {
   if (typeof p !== "string" || p[0] !== "/" || p[1] === "/") throw new Error("invalid api path");
   const r = await fetch(API + p, { headers: { "content-type": "application/json" }, ...o });
   const t = await r.text(); let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = t; }
-  if (!r.ok) throw new Error((j && (j.error || j.detail)) || ("HTTP " + r.status)); return j;
+  if (!r.ok) throw new ApiError(j, r.status); return j;
 };
 const S = { projects: [], sessions: [], project: null, currentId: null, ws: null, stream: null, running: false, models: [], defaultModel: null, sandboxOrigin: "", planMode: false, exploreMode: false, planPending: false, planReady: null, planStatus: null, artifacts: [], dock: { open: false, tab: "notebook" }, openTabs: [], activeTab: "notebook", provMode: false, provSub: "code", cells: [], kernels: [], liveCells: [], _liveCell: null, dockArtifact: null, kernelFilter: null, _titleName: "", skillsCatalog: null, _menu: null, annotations: [], _annotDraft: null, filesScope: "frame", projectArtifacts: [], _projArtFor: null,
   rendererCatalog: null, _rendererCatalogPromise: null, rendererDescriptors: {},
   // The workbench surfaces are projections only. They deliberately keep no
   // provider wire payloads or raw tool arguments in browser state.
   actionTimeline: null, executionQueue: null, executionIdentity: null, recoveryState: null,
-  recoveryActions: null, branchState: null, branchUndo: null, contextState: null, securityState: null,
+  actionTimelineSelectedGroupId: null, actionTimelineSelectedBranchId: null,
+  recoveryActions: null, branchState: null, branchUndo: null, contextState: null, securityState: null, computeTasks: null,
   delegationState: null,
-  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null,
-  _recoveryActionLoading: null, _branchActionLoading: null,
+  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null, _timelineView: null,
+  _recoveryActionLoading: null, _branchActionLoading: null, _timelineRestoreFocusGroupId: null,
   variableInspector: { language: "python", results: {}, loading: null, error: "", request: 0 } };
 const ac = { open: false, items: [], idx: 0, trigger: "", start: 0 };
 const TOOL_LABELS = { run_python: "toolLabel.runPython", run_bash: "toolLabel.runBash", search_skills: "toolLabel.searchSkills", read_skill: "toolLabel.readSkill", write_file: "toolLabel.writeFile", read_file: "toolLabel.readFile", list_files: "toolLabel.listFiles", delegate: "toolLabel.delegate" };
@@ -114,6 +140,15 @@ let LANG = (() => {
   return "zh";
 })();
 // t("key", ...args) — current-language string with {0},{1}… positional interpolation; falls back to zh, then the key.
+// `t` falls back to the key itself, which is right for a missing translation
+// (a developer sees the key) and wrong for an optional label (a user would see
+// "context.omitted.images" rendered as text). This says "translate if you know
+// it" and lets the caller supply something a person can read otherwise.
+function tOptional(key) {
+  const d = I18N[LANG] || {}, z = I18N.zh || {};
+  const value = d[key] != null ? d[key] : z[key];
+  return value != null ? String(value) : null;
+}
 function t(key, ...args) {
   const d = I18N[LANG] || I18N.zh || {};
   let s = d[key]; if (s == null) { const z = (I18N.zh || {})[key]; s = z != null ? z : key; }
@@ -235,6 +270,8 @@ Object.assign(I18N.zh, {
   "annot.save.err": "标注保存失败：{0}",
   "annot.save.err404": "保存失败：后端未加载标注接口，请重启服务（python3 -m openai4s serve）",
   "annot.status.open": "待发送",
+  "annot.status.pending": "发送中",
+  "annot.status.unknown": "状态未知",
   "annot.status.resolved": "已处理",
   "annot.status.sent": "已发送",
   "app.title": "OpenAI4S",
@@ -285,6 +322,15 @@ Object.assign(I18N.zh, {
   "composer.option.specialist": "专家",
   "composer.model": "模型",
   "composer.placeholder": "输入任何内容 — @ 引用制品，# 引用会话，/ 使用技能，⌘K 搜索…",
+  "composer.placeholderQueue": "当前任务运行中 — 现在发送将排入队列…",
+  "queue.accepted": "已排入队列，将在当前任务之后运行",
+  "queue.waiting": "{0} 条排队中",
+  "queue.noPreview": "（无文本）",
+  "queue.underProfile": "配置 {0} · 版本 {1}",
+  "queue.onBranch": "分支 {0}",
+  "queue.cancelOne": "取消这一条（不影响正在运行的任务）",
+  "queue.cancelled": "已取消该排队消息",
+  "queue.cancelFailed": "取消排队消息失败：{0}",
   "composer.planMode": "计划模式",
   "composer.exploreMode": "自主探索",
   "composer.voice": "语音输入",
@@ -292,6 +338,9 @@ Object.assign(I18N.zh, {
   "conv.dockToggle": "侧栏面板",
   "conv.jumpLast": "跳到最后一条",
   "conv.jumpLastLabel": "最新",
+  "conv.loadEarlier": "加载更早的消息",
+  "conv.loadEarlierFailed": "加载更早的消息失败：{0}",
+  "conv.exportTruncated": "（导出被长度上限截断：更早的消息未包含在内）",
   "output.binaryElided": "已省略二进制输出（{0}）",
   "skill.invokeDirective": "请使用技能「{0}」：先调用 host.load_skill(\"{0}\") 载入其完整协议，然后严格按照该协议完成任务。",
   "skill.useInChat": "在对话中使用",
@@ -346,6 +395,62 @@ Object.assign(I18N.zh, {
   "cust.connectors.namePlaceholder": "名称",
   "cust.connectors.test": "测试",
   "cust.connectors.testing": "测试中…",
+  "cust.datapro.title": "火山方舟专业数据集 DataPro",
+  "cust.datapro.desc": "保存 Agent Plan Key 后直接调用 dataPro_search；已配置的 Ark API Key 会自动复用。",
+  "cust.datapro.connectorToggle": "启用/停用 DataPro 连接器",
+  "cust.datapro.connectorOn": "已启用 DataPro 连接器。",
+  "cust.datapro.connectorOff": "已停用 DataPro 连接器，智能体不再访问该服务。",
+  "cust.datapro.keyLabel": "Agent Plan Key",
+  "cust.datapro.keyPlaceholder": "输入 Agent Plan Key",
+  "cust.datapro.keyPlaceholderSet": "已保存；输入新 Key 可替换",
+  "cust.datapro.keyPlaceholderArk": "已复用 Ark API Key；输入新 Key 可替换",
+  "cust.datapro.keyConfigured": "凭证已保存",
+  "cust.datapro.keyArkReused": "已复用 Ark API Key",
+  "cust.datapro.keyMissing": "尚未配置 Agent Plan Key",
+  "cust.datapro.saveKey": "保存凭证",
+  "cust.datapro.keyRequired": "请输入 Agent Plan Key",
+  "cust.datapro.keySaved": "Agent Plan Key 已安全保存",
+  "cust.datapro.queryLabel": "查询专业数据集",
+  "cust.datapro.queryPlaceholder": "输入要检索的问题",
+  "cust.datapro.search": "调用专业数据集",
+  "cust.datapro.searching": "查询中…",
+  "cust.datapro.queryRequired": "请输入查询文本",
+  "cust.datapro.available": "专业数据集可用",
+  "cust.datapro.indexed": "已完整索引本次返回的 {0} 条记录（{1} 个内容叶节点）",
+  "cust.datapro.indexFailed": "本次返回内容索引失败，专业数据集暂不可用",
+  "cust.datapro.auth4011": "Key 无效、额度不足，或者专业数据集 Harness 未开启。",
+  "cust.datapro.unavailable": "专业数据集不可用（code {0}）",
+  "cust.datapro.requestFailed": "专业数据集查询失败：{0}",
+  "cust.datapro.result": "查询结果",
+  "cust.datapro.noResult": "尚未查询。",
+  "cust.datapro.enableSkill": "导入/启用 volcengine-datapro Skill",
+  "cust.datapro.enablingSkill": "启用中…",
+  "cust.datapro.skillEnabled": "volcengine-datapro Skill 已启用",
+  "cust.datapro.skillEnabledToast": "volcengine-datapro Skill 与 DataPro connector 已启用",
+  "cust.datapro.artifact": "已保存：{0}",
+  "cust.doubao.title": "豆包搜索 Custom 版",
+  "cust.doubao.primary": "主选",
+  "cust.doubao.desc": "联网搜索主选项；与 Ark 和 DataPro 共用同一个 Agent Plan Key。只有真实返回非空豆包结果才会标记可用。",
+  "cust.doubao.keyLabel": "Agent Plan Key（一次授权）",
+  "cust.doubao.keyPlaceholder": "输入 Agent Plan Key",
+  "cust.doubao.keyPlaceholderSet": "已保存；输入新 Key 可替换",
+  "cust.doubao.keyPlaceholderArk": "已复用 Ark API Key；输入新 Key 可替换",
+  "cust.doubao.keyConfigured": "凭证已保存",
+  "cust.doubao.keyArkReused": "已复用 Ark API Key",
+  "cust.doubao.keyMissing": "尚未配置 Agent Plan Key",
+  "cust.doubao.saveKey": "保存凭证",
+  "cust.doubao.keyRequired": "请输入 Agent Plan Key",
+  "cust.doubao.keySaved": "Agent Plan Key 已安全保存，可同时用于豆包搜索和 DataPro",
+  "cust.doubao.queryLabel": "查询豆包搜索",
+  "cust.doubao.queryPlaceholder": "输入要联网检索的问题（最多 100 个字符）",
+  "cust.doubao.search": "调用豆包搜索",
+  "cust.doubao.searching": "搜索中…",
+  "cust.doubao.queryRequired": "请输入查询文本",
+  "cust.doubao.available": "豆包搜索可用",
+  "cust.doubao.empty": "豆包搜索未返回可用结果",
+  "cust.doubao.requestFailed": "豆包搜索失败：{0}",
+  "cust.doubao.result": "搜索结果",
+  "cust.doubao.noResult": "尚未搜索。",
   "cust.general.apiKeyConfigured": "✅ 已配置",
   "cust.general.apiKeyMissing": "⚠️ 尚未配置 API Key — 发送消息会失败",
   "cust.general.configureBtn": "配置 →",
@@ -360,6 +465,7 @@ Object.assign(I18N.zh, {
   "cust.importing": "导入中…",
   "cust.jobs.cmdPlaceholder": "bash: 如 \"for i in 1 2 3; do echo $i; sleep 1; done\"；python: 一段脚本",
   "cust.jobs.desc": "把长命令/脚本作为后台任务运行，可查看输出、取消",
+  "cust.jobs.dropped": "· 已丢弃 {0} 字节",
   "cust.jobs.empty": "还没有任务。",
   "cust.jobs.runBtn": "运行",
   "cust.jobs.submitName": "提交任务",
@@ -373,6 +479,10 @@ Object.assign(I18N.zh, {
   "cust.memory.empty": "还没有记忆。添加后会在启用时注入每次会话。",
   "cust.memory.enableName": "启用记忆",
   "cust.memory.enabledDesc": "已启用 — 保存的记忆会注入每次会话",
+  "cust.memory.injectedCounts": "已注入 {0} 条 · 省略 {1} 条 · 继承自全局 {2} 条 · 被本项目同类记忆覆盖 {3} 条",
+  "cust.memory.injectedInto": "注入到 {0}",
+  "cust.memory.scope.global": "全局（所有项目）",
+  "cust.memory.scopeName": "范围",
   "cust.memory.title": "记忆",
   "cust.models.activePill": "当前",
   "cust.models.addBtn": "新增",
@@ -385,6 +495,10 @@ Object.assign(I18N.zh, {
   "cust.models.editHeading": "编辑：{0}",
   "cust.models.empty2": "还没有模型配置。用上面的表单新增一个。",
   "cust.models.hasKey": "🔑 已配置 Key",
+  "cust.models.reachable": "端点已响应一次最小请求",
+  "cust.models.test": "测试连接",
+  "cust.models.testing": "正在联系该端点…",
+  "cust.models.unreachable": "未能联系上该端点",
   "cust.models.key.configured": "✅ API Key 已配置",
   "cust.models.key.missing": "⚠️ 尚未配置 API Key — 发送消息会失败",
   "cust.models.key.placeholder.set": "API Key（已配置，留空则不改动）",
@@ -400,8 +514,9 @@ Object.assign(I18N.zh, {
   "cust.models.modelPlaceholder2": "模型 id（留空用该协议默认）",
   "cust.models.namePlaceholder": "名称（如 DeepSeek 生产 / 本地 vLLM）",
   "cust.models.local.title": "本地推理服务",
-  "cust.models.local.desc": "自动扫描本机固定端口上的 Ollama、LM Studio、vLLM 与 llama.cpp；扫描不会修改当前模型，未知能力默认走保守的 Code-as-Action。",
-  "cust.models.local.scan": "重新扫描",
+  "cust.models.local.desc": "点击下方按钮扫描本机固定端口上的 Ollama、LM Studio、vLLM 与 llama.cpp；扫描不会修改当前模型，未知能力默认走保守的 Code-as-Action。",
+  "cust.models.local.scan": "扫描本机",
+  "cust.models.local.idle": "尚未扫描。点击上方按钮检测本机的 Ollama、LM Studio、vLLM 与 llama.cpp。",
   "cust.models.local.scanning": "正在扫描本机…",
   "cust.models.local.none": "没有发现可用的本地 OpenAI-compatible endpoint。",
   "cust.models.local.models": "{0} 个模型",
@@ -414,8 +529,10 @@ Object.assign(I18N.zh, {
   "cust.models.protocol.openai": "OpenAI 兼容协议",
   "cust.models.protocol.anthropic": "Anthropic 兼容协议",
   "cust.models.protocol.ark": "ark 兼容协议",
-  "cust.search.name": "搜索 API Key（Tavily）",
-  "cust.search.desc": "用于联网搜索的 Tavily 密钥；接入点固定为 api.tavily.com。",
+  "cust.models.protocol.gemini": "Gemini 兼容协议",
+  "cust.models.protocol.openaiResponses": "OpenAI Responses 协议",
+  "cust.search.name": "备用搜索 API Key（Tavily）",
+  "cust.search.desc": "Tavily 是备用搜索选项；接入点固定为 api.tavily.com。豆包搜索的专用测试不会回退到这里。",
   "cust.search.set": "已配置",
   "cust.search.unset": "未配置",
   "cust.search.ph": "输入 Tavily API Key",
@@ -433,6 +550,10 @@ Object.assign(I18N.zh, {
   "cust.network.disabledDesc": "已禁用 — 智能体仅用本地知识与已有文件",
   "cust.network.enabledDesc": "已启用 — 智能体可实时检索文献、抓取数据库、下载数据包",
   "cust.network.title": "网络",
+  "cust.telemetry.name": "匿名用量统计",
+  "cust.telemetry.off": "已关闭 — 没有任何数据离开这台机器",
+  "cust.telemetry.on": "已开启 — 仅发送匿名计数（版本、系统、成功/失败），绝不含提示词、文件名或数据",
+  "cust.telemetry.envlock": "已被环境变量 OPENAI4S_TELEMETRY 关闭",
   "cust.perm.decision.ask": "询问",
   "cust.perm.desc": "控制哪些工具需要你的批准。优先级：越具体越优先；同等具体时 本对话 > 本项目 > 全局。默认安全优先：读取放行，写入 / 命令 / 联网 / 装包 需批准，.env 读取被拒。",
   "cust.perm.noRules": "（无规则）",
@@ -447,6 +568,10 @@ Object.assign(I18N.zh, {
   "cust.perm.scope.project": "本项目",
   "cust.perm.title": "权限",
   "cust.perm.toolPlaceholder": "工具（bash / write_file / *）",
+  "cust.skills.collection": "{0} 合集（{1} 个技能）",
+  "cust.skills.collectionDesc": "固定版本、只读的第三方配方，默认收起；展开后可逐个启用或停用。",
+  "cust.skills.collectionHide": "收起",
+  "cust.skills.collectionShow": "展开",
   "cust.skills.deleteConfirm": "删除技能 {0}？",
   "cust.skills.desc": "{0} 个科研技能；开关控制智能体是否可用，也可新建/导入自己的技能",
   "cust.skills.importBtn": "导入 SKILL.md",
@@ -472,6 +597,18 @@ Object.assign(I18N.zh, {
   "dash.running.activeNow": "活跃中",
   "dash.running.count": "{0} 个运行中",
   "dash.sessions.empty": "还没有会话。",
+  "ac.fromOtherSession": "来自其他会话，发送时会复制进来",
+  "refs.problemsTitle": "有 {0} 处引用没能解析（这一轮仍在继续）",
+  "refs.unresolvedChip": "这个引用现在解析不到任何文件；发送后这一轮会照常继续。",
+  "cust.memory.edited": "已修改",
+  "cust.memory.editPrompt": "修改这条记忆的内容：",
+  "versions.retrievalSource": "数据来源（只读）",
+  "versions.retrievalTruncated": "以下字段过长已截断：{0}",
+  "versions.retrievalWithheld": "另有 {0} 个字段未展示",
+  "dash.example.cta": "运行示例分析",
+  "dash.example.hint": "一次真实的 NIF3/DUF34 分析：调用 UniProt 与 RCSB PDB 接口、执行 6 个 Python Cell、产出图表与报告。启动时不会自动运行——只有你点它才跑。",
+  "dash.example.running": "正在运行示例分析……",
+  "dash.example.failed": "示例分析失败：",
   "dash.tag.example": "Example",
   "data.col.data": "数据",
   "data.column.plural": " 列",
@@ -536,6 +673,8 @@ Object.assign(I18N.zh, {
   "menu.versionHistory": "版本历史",
   "modal.title.preview": "预览",
   "model.delete.confirm": "删除模型配置「{0}」？",
+  "model.rebind.confirm": "该会话固定的模型配置已不存在。是否改绑到当前启用的配置以继续？",
+  "model.rebind.done": "已改绑到当前启用的模型配置",
   "models.none": "无模型",
   "mol.foot": "拖动旋转 • 滚动缩放 • Shift+拖动平移",
   "mol.style.cartoon": "卡通",
@@ -594,6 +733,8 @@ Object.assign(I18N.zh, {
   "nb.status.ready": "就绪 · {0}",
   "nb.revisions.summary": "共 {0} 次尝试 · 展开查看 {1} 个失败版本",
   "nb.table.rowsHidden": "… {0} 行未显示",
+  "nb.table.colsHidden": "… {0} 列未显示",
+  "nb.table.bothHidden": "… {0} 行、{1} 列未显示",
   "nb.action.copy": "复制",
   "nb.action.copied": "已复制代码",
   "nb.action.rerun": "作为新单元运行",
@@ -648,13 +789,12 @@ Object.assign(I18N.zh, {
   "runtime.trust": "信任",
   "runtime.quarantineHint": "这是未受信任的导入会话，当前仅供查看。请在恢复面板明确确认“全新重启”后再继续。",
   "timeline.title": "Action Timeline",
-  "timeline.subtitle": "来自持久 Action Ledger 的安全投影；不显示原始参数、wire state 或 token。",
+  "timeline.subtitle": "来自持久 Action Ledger 的安全投影；不显示原始参数或 wire state。",
   "timeline.refresh": "刷新",
   "timeline.loading": "正在读取行动记录…",
   "timeline.loadEarlier": "加载更早记录",
   "timeline.loadingEarlier": "正在加载更早记录…",
   "timeline.loadEarlierFailed": "无法加载更早记录：{0}",
-  "timeline.historyLimit": "已显示最近 {0} 条记录；为保持页面流畅，不能继续向前加载。",
   "timeline.empty": "还没有可显示的行动。Notebook 仅保留科研 cell，完整控制流程会出现在这里。",
   "timeline.owner": "Owner",
   "timeline.permission": "权限",
@@ -666,6 +806,46 @@ Object.assign(I18N.zh, {
   "timeline.tokens": "Tokens",
   "timeline.tokensValue": "{0} 输入 · {1} 输出",
   "timeline.cost": "成本",
+  "timeline.column.ordinal": "#",
+  "timeline.column.kind": "类型",
+  "timeline.column.action": "行动",
+  "timeline.turnBoundary": "Turn",
+  "timeline.inspector": "行动详情",
+  "timeline.inspector.close": "关闭详情",
+  "timeline.row.open": "查看行动 #{0} 的详情：{1}",
+  "timeline.search.label": "搜索已加载记录",
+  "timeline.search.placeholder": "搜索标题、类型、资源和产物",
+  "timeline.search.scope": "仅搜索当前已加载的 {0} 条记录；未加载的更早记录不在结果中。搜索时会暂时展开 Turn，清空后恢复折叠。",
+  "timeline.search.loaded": "已加载 {0} 条记录",
+  "timeline.search.matches": "{0} 条匹配（已加载 {1} 条）",
+  "timeline.search.matchesInSelection": "当前选区显示 {0} 条（搜索命中 {1} / 已加载 {2} 条）",
+  "timeline.search.clear": "清除搜索",
+  "timeline.search.empty": "当前已加载范围内没有匹配记录",
+  "timeline.search.emptySelection": "当前时间选区内没有搜索命中；已加载范围内共有 {0} 条命中。",
+  "timeline.turn.collapse": "收起 Turn {0}，{1} 条当前可见记录，总耗时 {2}",
+  "timeline.turn.expand": "展开 Turn {0}，{1} 条当前可见记录，总耗时 {2}",
+  "timeline.turn.summary": "Turn · {0} 条当前可见记录",
+  "timeline.ledger.keyboard": "键盘：在账本区域按 Enter、向下键或 Home 进入记录；用方向键、Page Up、Page Down、Home 和 End 浏览。",
+  "timeline.overview": "时间线概览",
+  "timeline.overview.help": "悬停查看精确时刻；拖选过滤；滚轮缩放；右键拖拽平移。",
+  "timeline.overview.keyboard": "键盘：上下键浏览行动，Enter 打开，Shift+Enter 按该行动的已知活动区间筛选。",
+  "timeline.overview.queue": "排队",
+  "timeline.overview.ttft": "首响应",
+  "timeline.overview.decode": "解码",
+  "timeline.overview.allocated": "分配",
+  "timeline.overview.started": "开始",
+  "timeline.overview.response": "首响应",
+  "timeline.overview.finished": "结束",
+  "timeline.overview.running": "运行中 · 仅显示真实起点",
+  "timeline.overview.omitted": "加载被省略的更早记录",
+  "timeline.overview.omittedLoading": "正在加载被省略的更早记录",
+  "timeline.overview.clear": "清除时间选区",
+  "timeline.overview.zoomIn": "放大时间域",
+  "timeline.overview.zoomOut": "缩小时间域",
+  "timeline.overview.panEarlier": "向较早时间平移",
+  "timeline.overview.panLater": "向较晚时间平移",
+  "timeline.overview.selection": "已选 {0} — {1}",
+  "timeline.overview.emptySelection": "选区内没有行动",
   "timeline.kind.native_tool": "Native Tool",
   "timeline.kind.python": "Python Cell",
   "timeline.kind.r": "R Cell",
@@ -680,6 +860,29 @@ Object.assign(I18N.zh, {
   "timeline.panel.context": "Context composition",
   "timeline.panel.security": "Sandbox · Permission",
   "timeline.panel.delegation": "子代理树",
+  "timeline.panel.compute": "远程计算任务",
+  "attach.problemsTitle": "有 {0} 张图没有随本轮发送",
+  "attach.tooLarge": "单张 {0}，超过上限 {1}；请缩小分辨率后重新钉图。",
+  "attach.budget": "本轮图片总量已达上限 {0}；请减少图钉数量或分几轮发送。",
+  "attach.tooMany": "本轮最多附带 {0} 张图。",
+  "attach.versionChanged": "图钉之后该图被重新绘制覆盖，你标注的那一版已不存在——请在新图上重新钉图。",
+  "attach.notFound": "该图文件已被删除或移动，无法随本轮发送。",
+  "attach.unsupported": "该文件的实际内容不是位图（按文件头判断），无法作为图片发送。",
+  "attach.decodeFailed": "该图无法解码（文件损坏，或服务端缺少 Pillow）。",
+  "delegation.stop": "停止这个子代理及其下级",
+  "delegation.steer": "在下一个回合边界给它一句话",
+  "delegation.steerPrompt": "要在下一个回合边界告诉这个子代理什么？",
+  "delegation.steerQueued": "已排队，将在该子代理的下一个回合边界送达。",
+  "delegation.stopFailed": "停止失败",
+  "delegation.steerFailed": "引导失败",
+  "compute.none": "本会话还没有远程计算任务。",
+  "compute.live": "进行中 {0}",
+  "compute.fromRecord": "来自本地记录，未联网核对",
+  "compute.checked": "刚刚向远端核对过",
+  "compute.refresh": "向远端核对并回收产物",
+  "compute.refreshFailed": "核对失败",
+  "compute.outputs": "产物 {0} 个 · {1}",
+  "compute.status.unknown": "未知（联系不上远端）",
   "timeline.noBranch": "尚无 branch/checkpoint 投影。",
   "timeline.noContext": "尚无 context composition 投影。",
   "timeline.noSecurity": "尚无 sandbox/permission 状态投影。",
@@ -730,6 +933,11 @@ Object.assign(I18N.zh, {
   "context.history": "压缩历史（{0}）",
   "context.compaction": "Compaction",
   "context.savings": "{0} → {1} tokens",
+  "context.omitted.memory": "记忆（未注入）",
+  "context.omittedCount": "略去 {0} 条",
+  "context.reason.too_long": "单条过长",
+  "context.reason.too_many": "超出条数",
+  "context.reason.budget_exhausted": "超出总量",
   "context.artifacts": "{0} 个 Artifact 引用",
   "security.sandbox": "Sandbox",
   "security.generation": "Generation",
@@ -749,10 +957,13 @@ Object.assign(I18N.zh, {
   "palette.empty": "没有匹配项",
   "palette.group.artifacts": "产物",
   "palette.group.commands": "命令",
+  "palette.group.datapro": "专业数据集",
   "palette.group.sessions": "会话",
   "palette.group.skills": "技能",
-  "palette.searchPlaceholder": "搜索会话、产物、技能，或执行命令…",
+  "palette.datapro.result": "DataPro 查询结果",
+  "palette.searchPlaceholder": "搜索会话、产物、专业数据集、技能，或执行命令…",
   "perm.badge.subAgent": "子智能体",
+  "perm.badge.dangerous": "高风险",
   "perm.btn.allow": "允许",
   "perm.btn.continueReplan": "继续并重新规划",
   "perm.btn.deny": "拒绝",
@@ -781,6 +992,11 @@ Object.assign(I18N.zh, {
   "plan.eyebrow.draft": "计划已就绪，等待您审阅",
   "plan.eyebrow.executing": "正在执行计划",
   "plan.eyebrow.failed": "计划已中断",
+  "plan.eyebrow.paused": "计划已暂停，还有步骤没跑完",
+  "plan.status.paused": "已暂停：{0}/{1} 步完成，还剩 {2} 步",
+  "plan.resume": "继续执行剩余步骤",
+  "plan.resumeFailed": "无法继续执行：{0}",
+  "plan.resuming": "正在继续执行剩余步骤…",
   "plan.legacy.approvedPrompt": "已批准。请严格按上面的计划执行：运行代码、使用相应技能，并产出结果文件。",
   "plan.legacy.intro": "以上是执行计划。批准后将按计划运行并产出结果文件。",
   "plan.prompt.intro": "[计划模式] 请先不要执行、不要调用任何工具。为下面的任务制定一个结构化执行计划，并只输出两部分：\n",
@@ -838,6 +1054,8 @@ Object.assign(I18N.zh, {
   "sessionPackage.export": "导出会话包",
   "sessionPackage.imported": "会话包已安全导入；Kernel 保持结束状态，需显式恢复",
   "sessionPackage.tooLarge": "会话包超过客户端 128 MiB 限制",
+  "sessionPackage.verified": "校验通过：{0} 个文件与包内清单一致，正在导入",
+  "sessionPackage.verifyFailed": "校验未通过，已拒绝导入：{0}",
   "projModal.create": "创建",
   "projModal.editTitle": "项目设置",
   "projModal.ctx.label": "智能体上下文",
@@ -854,6 +1072,7 @@ Object.assign(I18N.zh, {
   "prov.env.loadingSnapshot": "加载环境快照…",
   "prov.env.noPackages": "没有可报告的包。",
   "prov.env.recorded": "已记录于该产物生产时的内核环境",
+  "prov.env.recordedUnverified": "环境已记录，但无法确认它只属于这一次生产运行",
   "prov.env.remoteTitle": "远程 GPU 计算（可复现）",
   "prov.env.remoteHost": "主机",
   "prov.env.remoteEnv": "环境",
@@ -863,7 +1082,11 @@ Object.assign(I18N.zh, {
   "prov.env.remoteRun": "运行时间(UTC)",
   "prov.env.thPackage": "Package",
   "prov.env.thVersion": "Version",
-  "prov.exec.downloadNotebook": "下载 Notebook",
+  "prov.exec.downloadNotebook": "下载 Notebook（打包）",
+  "prov.exec.downloadPython": "只下载 Python Notebook (.ipynb)",
+  "prov.exec.downloadR": "只下载 R Notebook (.ipynb)",
+  "prov.exec.downloadMarkdown": "下载 Markdown 记录 (.md)",
+  "prov.exec.downloadMore": "其他导出格式",
   "prov.exec.noRecords": "暂无执行记录。",
   "prov.msg.loadFailed": "无法加载对话：{0}",
   "prov.msg.loading": "加载对话…",
@@ -887,6 +1110,8 @@ Object.assign(I18N.zh, {
   "session.badge.runningTip": "任务仍在后台运行 — 点击恢复",
   "session.duplicateSuffix": "（副本）",
   "session.empty.label": "还没有会话",
+  "session.loadMore": "加载更多会话",
+  "session.loadMoreLimit": "已达列表上限，更早的会话请用搜索查找",
   "session.menu.tip": "会话操作",
   "session.newFolder": "＋ 文件夹",
   "session.untitled": "未命名会话",
@@ -908,6 +1133,8 @@ Object.assign(I18N.zh, {
   "skill.label.name": "名称",
   "skill.namePlaceholder": "技能名（英文短横线，如 my-analysis）",
   "skill.newTitle": "新建技能",
+  "skill.readiness.needsSetup": "本机缺少：{0}",
+  "skill.readiness.unknown": "本机无法确认：{0}",
   "skill.saveBtn": "保存技能",
   "skill.historyBtn": "版本历史",
   "skill.historyTitle": "技能版本 — {0}",
@@ -979,6 +1206,9 @@ Object.assign(I18N.zh, {
   "toast.models.updated": "已更新：{0}",
   "toast.network.disabled": "联网已禁用",
   "toast.network.enabled": "联网已启用",
+  "toast.telemetry.on": "匿名统计已开启",
+  "toast.telemetry.off": "匿名统计已关闭，身份一并删除",
+  "toast.telemetry.failed": "统计开关未能保存，已恢复原状态：{0}",
   "toast.perm.enterTool": "请填写工具名",
   "toast.perm.resetDone": "已恢复默认规则",
   "toast.perm.ruleUpdated": "已更新规则",
@@ -1005,6 +1235,11 @@ Object.assign(I18N.zh, {
   "toolLabel.searchSkills": "搜索技能中",
   "toolLabel.writeFile": "写入文件中",
   "turn.failed": "这一轮失败了，请重试。",
+  "turn.failedCommitted": "这一轮失败了，但它已经产出了输出或执行过工具——直接重试会重复已经发生的操作。请先检查结果再决定。",
+  "turn.failure.llmRequestBurst": "模型服务触发了突发流量保护。这不是 API Key 配置问题，请稍后在当前会话继续，或临时切换模型。",
+  "turn.failure.llmRateLimited": "模型服务正在限流。请稍后在当前会话继续，或临时切换模型。",
+  "turn.failure.llmUpstreamOverloaded": "模型服务当前过载。这不是 API Key 配置问题，请稍后在当前会话继续，或临时切换模型。",
+  "turn.supportId": "支持 ID：{0}",
   "upload.dropping": "正在上传拖入的文件…",
   "upload.failed": "上传失败：{0}",
   "upload.pasting": "正在上传粘贴的文件…",
@@ -1036,6 +1271,7 @@ Object.assign(I18N.zh, {
   "viewer.renderer.version": "版本 {0}",
   "viewer.sequence.omitted": "为保持界面流畅，其余 {0} 个残基未展开。",
   "viewer.sequence.summary": "{0} 条序列 · {1} 个残基 · {2}",
+  "viewer.table.shape": "共 {0} 行 × {1} 列",
   "ws.nav.files": "文件",
   "ws.nav.new": "新建",
   "ws.sidebar.collapse": "收起侧栏 (⌘B)",
@@ -1067,6 +1303,8 @@ Object.assign(I18N.en, {
   "annot.save.err": "Annotation save failed: {0}",
   "annot.save.err404": "Save failed: backend annotation API not loaded, please restart the service (python3 -m openai4s serve)",
   "annot.status.open": "Pending",
+  "annot.status.pending": "Sending",
+  "annot.status.unknown": "Unknown",
   "annot.status.resolved": "Resolved",
   "annot.status.sent": "Sent",
   "app.title": "OpenAI4S",
@@ -1117,6 +1355,15 @@ Object.assign(I18N.en, {
   "composer.option.specialist": "Specialist",
   "composer.model": "Model",
   "composer.placeholder": "Ask anything — @ for artifacts, # for sessions, / for skills, ⌘K to search…",
+  "composer.placeholderQueue": "A turn is running — sending now queues this behind it…",
+  "queue.accepted": "Queued — it will run after the current turn",
+  "queue.waiting": "{0} queued",
+  "queue.noPreview": "(no text)",
+  "queue.underProfile": "profile {0} · rev {1}",
+  "queue.onBranch": "branch {0}",
+  "queue.cancelOne": "Drop this queued message (the running turn keeps going)",
+  "queue.cancelled": "Queued message dropped",
+  "queue.cancelFailed": "Could not drop the queued message: {0}",
   "composer.planMode": "Plan mode",
   "composer.exploreMode": "Explore mode",
   "composer.voice": "Voice input",
@@ -1124,6 +1371,9 @@ Object.assign(I18N.en, {
   "conv.dockToggle": "Side panel",
   "conv.jumpLast": "Jump to latest",
   "conv.jumpLastLabel": "Latest",
+  "conv.loadEarlier": "Load earlier messages",
+  "conv.loadEarlierFailed": "Could not load earlier messages: {0}",
+  "conv.exportTruncated": "(Export stopped at the walk limit; earlier messages are not included.)",
   "output.binaryElided": "Binary output elided ({0})",
   "skill.invokeDirective": "Use the \"{0}\" skill: call host.load_skill(\"{0}\") to load its full protocol, then follow it exactly.",
   "skill.useInChat": "Use in chat",
@@ -1178,6 +1428,62 @@ Object.assign(I18N.en, {
   "cust.connectors.namePlaceholder": "Name",
   "cust.connectors.test": "Test",
   "cust.connectors.testing": "Testing…",
+  "cust.datapro.title": "Volcengine Ark Professional Dataset DataPro",
+  "cust.datapro.desc": "Save one Agent Plan Key and call dataPro_search directly; an existing Ark API Key is reused automatically.",
+  "cust.datapro.connectorToggle": "Enable / disable the DataPro connector",
+  "cust.datapro.connectorOn": "DataPro connector enabled.",
+  "cust.datapro.connectorOff": "DataPro connector disabled; the agent can no longer reach it.",
+  "cust.datapro.keyLabel": "Agent Plan Key",
+  "cust.datapro.keyPlaceholder": "Enter Agent Plan Key",
+  "cust.datapro.keyPlaceholderSet": "Saved; enter a new key to replace it",
+  "cust.datapro.keyPlaceholderArk": "Using the Ark API Key; enter a new key to replace it",
+  "cust.datapro.keyConfigured": "Credential saved",
+  "cust.datapro.keyArkReused": "Using the Ark API Key",
+  "cust.datapro.keyMissing": "Agent Plan Key is not configured",
+  "cust.datapro.saveKey": "Save credential",
+  "cust.datapro.keyRequired": "Enter an Agent Plan Key",
+  "cust.datapro.keySaved": "Agent Plan Key saved securely",
+  "cust.datapro.queryLabel": "Search the professional dataset",
+  "cust.datapro.queryPlaceholder": "Enter a research question",
+  "cust.datapro.search": "Call professional dataset",
+  "cust.datapro.searching": "Searching…",
+  "cust.datapro.queryRequired": "Enter query text",
+  "cust.datapro.available": "Professional dataset available",
+  "cust.datapro.indexed": "Fully indexed all {0} records returned by this query ({1} content leaf nodes)",
+  "cust.datapro.indexFailed": "Indexing this returned content failed; the professional dataset is not yet available",
+  "cust.datapro.auth4011": "The Key is invalid, quota is insufficient, or the professional dataset Harness is not enabled.",
+  "cust.datapro.unavailable": "Professional dataset unavailable (code {0})",
+  "cust.datapro.requestFailed": "Professional dataset query failed: {0}",
+  "cust.datapro.result": "Query result",
+  "cust.datapro.noResult": "No query has been run yet.",
+  "cust.datapro.enableSkill": "Import/enable volcengine-datapro Skill",
+  "cust.datapro.enablingSkill": "Enabling…",
+  "cust.datapro.skillEnabled": "volcengine-datapro Skill enabled",
+  "cust.datapro.skillEnabledToast": "volcengine-datapro Skill and DataPro connector enabled",
+  "cust.datapro.artifact": "Saved: {0}",
+  "cust.doubao.title": "Doubao Search Custom",
+  "cust.doubao.primary": "Primary",
+  "cust.doubao.desc": "The primary web-search option. It shares one Agent Plan Key with Ark and DataPro, and is marked available only after a real non-empty Doubao response.",
+  "cust.doubao.keyLabel": "Agent Plan Key (one-time authorization)",
+  "cust.doubao.keyPlaceholder": "Enter Agent Plan Key",
+  "cust.doubao.keyPlaceholderSet": "Saved; enter a new key to replace it",
+  "cust.doubao.keyPlaceholderArk": "Using the Ark API Key; enter a new key to replace it",
+  "cust.doubao.keyConfigured": "Credential saved",
+  "cust.doubao.keyArkReused": "Using the Ark API Key",
+  "cust.doubao.keyMissing": "Agent Plan Key is not configured",
+  "cust.doubao.saveKey": "Save credential",
+  "cust.doubao.keyRequired": "Enter an Agent Plan Key",
+  "cust.doubao.keySaved": "Agent Plan Key saved securely for both Doubao Search and DataPro",
+  "cust.doubao.queryLabel": "Query Doubao Search",
+  "cust.doubao.queryPlaceholder": "Enter a web-search query (up to 100 characters)",
+  "cust.doubao.search": "Call Doubao Search",
+  "cust.doubao.searching": "Searching…",
+  "cust.doubao.queryRequired": "Enter query text",
+  "cust.doubao.available": "Doubao Search available",
+  "cust.doubao.empty": "Doubao Search returned no usable result",
+  "cust.doubao.requestFailed": "Doubao Search failed: {0}",
+  "cust.doubao.result": "Search results",
+  "cust.doubao.noResult": "No search has been run yet.",
   "cust.general.apiKeyConfigured": "✅ Configured",
   "cust.general.apiKeyMissing": "⚠️ API Key not configured — sending messages will fail",
   "cust.general.configureBtn": "Configure →",
@@ -1192,6 +1498,7 @@ Object.assign(I18N.en, {
   "cust.importing": "Importing…",
   "cust.jobs.cmdPlaceholder": "bash: e.g. \"for i in 1 2 3; do echo $i; sleep 1; done\"; python: a script",
   "cust.jobs.desc": "Run long commands/scripts as background jobs; view output and cancel",
+  "cust.jobs.dropped": "· {0} bytes dropped",
   "cust.jobs.empty": "No jobs yet.",
   "cust.jobs.runBtn": "Run",
   "cust.jobs.submitName": "Submit job",
@@ -1205,6 +1512,10 @@ Object.assign(I18N.en, {
   "cust.memory.empty": "No memories yet. Once added, they are injected into each session when enabled.",
   "cust.memory.enableName": "Enable memory",
   "cust.memory.enabledDesc": "Enabled — saved memories are injected into every session",
+  "cust.memory.injectedCounts": "{0} injected · {1} omitted · {2} inherited from global · {3} hidden by this project's own blocks",
+  "cust.memory.injectedInto": "Injected into {0}",
+  "cust.memory.scope.global": "Global (all projects)",
+  "cust.memory.scopeName": "Scope",
   "cust.memory.title": "Memory",
   "cust.models.activePill": "Active",
   "cust.models.addBtn": "Add",
@@ -1217,6 +1528,10 @@ Object.assign(I18N.en, {
   "cust.models.editHeading": "Edit: {0}",
   "cust.models.empty2": "No models configured yet. Add one with the form above.",
   "cust.models.hasKey": "🔑 Key configured",
+  "cust.models.reachable": "the endpoint answered a minimal request",
+  "cust.models.test": "Test",
+  "cust.models.testing": "contacting the endpoint…",
+  "cust.models.unreachable": "could not reach the endpoint",
   "cust.models.key.configured": "✅ API Key configured",
   "cust.models.key.missing": "⚠️ API Key not configured yet — sending messages will fail",
   "cust.models.key.placeholder.set": "API Key (already configured, leave blank to keep unchanged)",
@@ -1232,8 +1547,9 @@ Object.assign(I18N.en, {
   "cust.models.modelPlaceholder2": "Model id (leave blank for the protocol default)",
   "cust.models.namePlaceholder": "Name (e.g. DeepSeek Prod / Local vLLM)",
   "cust.models.local.title": "Local inference servers",
-  "cust.models.local.desc": "Automatically scans fixed loopback ports for Ollama, LM Studio, vLLM, and llama.cpp. Scanning never changes the active model; unknown capabilities default to conservative Code-as-Action.",
-  "cust.models.local.scan": "Scan again",
+  "cust.models.local.desc": "Press the button below to scan fixed loopback ports for Ollama, LM Studio, vLLM, and llama.cpp. Scanning never changes the active model; unknown capabilities default to conservative Code-as-Action.",
+  "cust.models.local.scan": "Scan this machine",
+  "cust.models.local.idle": "Not scanned yet. Press the button above to look for Ollama, LM Studio, vLLM, and llama.cpp on this machine.",
   "cust.models.local.scanning": "Scanning this machine…",
   "cust.models.local.none": "No local OpenAI-compatible endpoint was detected.",
   "cust.models.local.models": "{0} models",
@@ -1246,8 +1562,10 @@ Object.assign(I18N.en, {
   "cust.models.protocol.openai": "OpenAI-compatible protocol",
   "cust.models.protocol.anthropic": "Anthropic-compatible protocol",
   "cust.models.protocol.ark": "Ark-compatible protocol",
-  "cust.search.name": "Search API key (Tavily)",
-  "cust.search.desc": "Tavily key for web search; the endpoint is fixed to api.tavily.com.",
+  "cust.models.protocol.gemini": "Gemini-compatible protocol",
+  "cust.models.protocol.openaiResponses": "OpenAI Responses protocol",
+  "cust.search.name": "Backup search API key (Tavily)",
+  "cust.search.desc": "Tavily is the backup search option at the fixed api.tavily.com endpoint. The dedicated Doubao test never falls back to it.",
   "cust.search.set": "Configured",
   "cust.search.unset": "Not configured",
   "cust.search.ph": "Enter Tavily API key",
@@ -1265,6 +1583,10 @@ Object.assign(I18N.en, {
   "cust.network.disabledDesc": "Disabled — the agent uses only local knowledge and existing files",
   "cust.network.enabledDesc": "Enabled — the agent can search literature in real time, scrape databases, and download data packages",
   "cust.network.title": "Network",
+  "cust.telemetry.name": "Anonymous usage statistics",
+  "cust.telemetry.off": "Off — nothing leaves this machine",
+  "cust.telemetry.on": "On — anonymous counts only (version, OS, success/failure); never prompts, file names, or data",
+  "cust.telemetry.envlock": "Disabled by the OPENAI4S_TELEMETRY environment variable",
   "cust.perm.decision.ask": "Ask",
   "cust.perm.desc": "Control which tools need your approval. Priority: the more specific, the higher; at equal specificity, This conversation > This project > Global. Safe by default: reads are allowed, writes / commands / network / package installs need approval, .env reads are denied.",
   "cust.perm.noRules": "(no rules)",
@@ -1279,6 +1601,10 @@ Object.assign(I18N.en, {
   "cust.perm.scope.project": "This project",
   "cust.perm.title": "Permissions",
   "cust.perm.toolPlaceholder": "Tool (bash / write_file / *)",
+  "cust.skills.collection": "{0} collection ({1} skills)",
+  "cust.skills.collectionDesc": "Pinned read-only third-party recipes, collapsed by default; expand to enable or disable them individually.",
+  "cust.skills.collectionHide": "Hide",
+  "cust.skills.collectionShow": "Show",
   "cust.skills.deleteConfirm": "Delete skill {0}?",
   "cust.skills.desc": "{0} research skills; toggles control whether the agent can use them, and you can create/import your own",
   "cust.skills.importBtn": "Import SKILL.md",
@@ -1304,6 +1630,18 @@ Object.assign(I18N.en, {
   "dash.running.activeNow": "active now",
   "dash.running.count": "{0} running",
   "dash.sessions.empty": "No sessions yet.",
+  "ac.fromOtherSession": "from another session — copied in on send",
+  "refs.problemsTitle": "{0} reference(s) did not resolve (the turn still ran)",
+  "refs.unresolvedChip": "This reference resolves to nothing right now; the turn will still run.",
+  "cust.memory.edited": "edited",
+  "cust.memory.editPrompt": "Edit this memory:",
+  "versions.retrievalSource": "Retrieved from (read-only)",
+  "versions.retrievalTruncated": "clipped for length: {0}",
+  "versions.retrievalWithheld": "{0} further field(s) not shown",
+  "dash.example.cta": "Run the example analysis",
+  "dash.example.hint": "A real NIF3/DUF34 analysis: calls the UniProt and RCSB PDB APIs, runs 6 Python cells, and produces figures and a report. It does not run on startup \u2014 only when you click.",
+  "dash.example.running": "Running the example analysis\u2026",
+  "dash.example.failed": "The example analysis failed: ",
   "dash.tag.example": "Example",
   "data.col.data": "data",
   "data.column.plural": " columns",
@@ -1368,6 +1706,8 @@ Object.assign(I18N.en, {
   "menu.versionHistory": "Version history",
   "modal.title.preview": "Preview",
   "model.delete.confirm": "Delete model profile \"{0}\"?",
+  "model.rebind.confirm": "The model configuration this session was pinned to no longer exists. Re-bind it to the active configuration and continue?",
+  "model.rebind.done": "Re-bound to the active model configuration",
   "models.none": "No models",
   "mol.foot": "Drag to rotate • Scroll to zoom • Shift+drag to pan",
   "mol.style.cartoon": "Cartoon",
@@ -1426,6 +1766,8 @@ Object.assign(I18N.en, {
   "nb.status.ready": "Ready · {0}",
   "nb.revisions.summary": "{0} attempts · expand {1} failed revisions",
   "nb.table.rowsHidden": "… {0} rows not shown",
+  "nb.table.colsHidden": "… {0} columns not shown",
+  "nb.table.bothHidden": "… {0} rows and {1} columns not shown",
   "nb.action.copy": "Copy",
   "nb.action.copied": "Code copied",
   "nb.action.rerun": "Rerun as new",
@@ -1480,13 +1822,12 @@ Object.assign(I18N.en, {
   "runtime.trust": "Trust",
   "runtime.quarantineHint": "This imported Session is untrusted and view-only. Explicitly confirm Restart fresh in Recovery before continuing.",
   "timeline.title": "Action Timeline",
-  "timeline.subtitle": "Safe projection of the durable Action Ledger; raw arguments, wire state and tokens are never shown.",
+  "timeline.subtitle": "Safe projection of the durable Action Ledger; raw arguments and wire state are never shown.",
   "timeline.refresh": "Refresh",
   "timeline.loading": "Loading actions…",
   "timeline.loadEarlier": "Load earlier actions",
   "timeline.loadingEarlier": "Loading earlier actions…",
   "timeline.loadEarlierFailed": "Could not load earlier actions: {0}",
-  "timeline.historyLimit": "Showing the most recent {0} actions; earlier loading is capped to keep this view responsive.",
   "timeline.empty": "No actions to show yet. Notebook keeps scientific cells; the full control flow appears here.",
   "timeline.owner": "Owner",
   "timeline.permission": "Permission",
@@ -1498,6 +1839,46 @@ Object.assign(I18N.en, {
   "timeline.tokens": "Tokens",
   "timeline.tokensValue": "{0} in · {1} out",
   "timeline.cost": "Cost",
+  "timeline.column.ordinal": "#",
+  "timeline.column.kind": "Kind",
+  "timeline.column.action": "Action",
+  "timeline.turnBoundary": "Turn",
+  "timeline.inspector": "Action details",
+  "timeline.inspector.close": "Close details",
+  "timeline.row.open": "Open details for action #{0}: {1}",
+  "timeline.search.label": "Search loaded actions",
+  "timeline.search.placeholder": "Search title, kind, resources, and artifacts",
+  "timeline.search.scope": "Search covers only currently loaded actions (loaded: {0}); unloaded earlier history is not included. Searching temporarily reveals collapsed Turns; clearing restores them.",
+  "timeline.search.loaded": "Loaded actions: {0}",
+  "timeline.search.matches": "Loaded-window matches: {0} · loaded actions: {1}",
+  "timeline.search.matchesInSelection": "Matches in this time selection: {0} · loaded-window matches: {1} · loaded actions: {2}",
+  "timeline.search.clear": "Clear search",
+  "timeline.search.empty": "No matches in the currently loaded actions",
+  "timeline.search.emptySelection": "No search matches in this time selection · loaded-window matches: {0}",
+  "timeline.turn.collapse": "Collapse Turn {0} · visible actions: {1} · total duration: {2}",
+  "timeline.turn.expand": "Expand Turn {0} · visible actions: {1} · total duration: {2}",
+  "timeline.turn.summary": "Turn · visible actions: {0}",
+  "timeline.ledger.keyboard": "Keyboard: press Enter, Down, or Home on the ledger to enter it; use arrows, Page Up, Page Down, Home, and End to browse.",
+  "timeline.overview": "Timeline overview",
+  "timeline.overview.help": "Hover for exact timing; drag to filter; wheel to zoom; right-drag to pan.",
+  "timeline.overview.keyboard": "Keyboard: use Up and Down to inspect actions, Enter to open one, or Shift+Enter to filter by its known active interval.",
+  "timeline.overview.queue": "Queue",
+  "timeline.overview.ttft": "First response",
+  "timeline.overview.decode": "Decode",
+  "timeline.overview.allocated": "Allocated",
+  "timeline.overview.started": "Started",
+  "timeline.overview.response": "First response",
+  "timeline.overview.finished": "Finished",
+  "timeline.overview.running": "Running · real start only",
+  "timeline.overview.omitted": "Load omitted earlier actions",
+  "timeline.overview.omittedLoading": "Loading omitted earlier actions",
+  "timeline.overview.clear": "Clear time selection",
+  "timeline.overview.zoomIn": "Zoom in on time",
+  "timeline.overview.zoomOut": "Zoom out on time",
+  "timeline.overview.panEarlier": "Pan to earlier time",
+  "timeline.overview.panLater": "Pan to later time",
+  "timeline.overview.selection": "Selected {0} — {1}",
+  "timeline.overview.emptySelection": "No actions in this range",
   "timeline.kind.native_tool": "Native Tool",
   "timeline.kind.python": "Python Cell",
   "timeline.kind.r": "R Cell",
@@ -1512,6 +1893,29 @@ Object.assign(I18N.en, {
   "timeline.panel.context": "Context composition",
   "timeline.panel.security": "Sandbox · Permission",
   "timeline.panel.delegation": "Sub-agent tree",
+  "timeline.panel.compute": "Remote compute",
+  "attach.problemsTitle": "{0} image(s) were not sent with this turn",
+  "attach.tooLarge": "{0}, over the {1} per-image limit — downscale it and pin again.",
+  "attach.budget": "this turn's {0} image budget is spent — pin fewer figures, or split across turns.",
+  "attach.tooMany": "at most {0} images may be attached to one turn.",
+  "attach.versionChanged": "the figure was re-plotted over after you pinned it — the version you annotated no longer exists; pin again on the new one.",
+  "attach.notFound": "the file was deleted or moved, so it could not be sent.",
+  "attach.unsupported": "the file's actual contents are not a raster image (judged by its header), so it cannot be sent as one.",
+  "attach.decodeFailed": "the image could not be decoded (corrupt file, or Pillow missing on the server).",
+  "delegation.stop": "Stop this sub-agent and everything under it",
+  "delegation.steer": "Send it a message at its next turn boundary",
+  "delegation.steerPrompt": "What should this sub-agent be told at its next turn boundary?",
+  "delegation.steerQueued": "Queued — it will arrive at the sub-agent's next turn boundary.",
+  "delegation.stopFailed": "Stop failed",
+  "delegation.steerFailed": "Steering failed",
+  "compute.none": "No remote compute tasks in this session.",
+  "compute.live": "{0} in flight",
+  "compute.fromRecord": "from the local record — not re-checked",
+  "compute.checked": "just checked with the remote",
+  "compute.refresh": "Check the remote and harvest outputs",
+  "compute.refreshFailed": "Refresh failed",
+  "compute.outputs": "{0} output file(s) · {1}",
+  "compute.status.unknown": "unknown (the remote could not be reached)",
   "timeline.noBranch": "No branch/checkpoint projection is available yet.",
   "timeline.noContext": "No context composition projection is available yet.",
   "timeline.noSecurity": "No sandbox/permission projection is available yet.",
@@ -1562,6 +1966,11 @@ Object.assign(I18N.en, {
   "context.history": "Compaction history ({0})",
   "context.compaction": "Compaction",
   "context.savings": "{0} → {1} tokens",
+  "context.omitted.memory": "Memory (not injected)",
+  "context.omittedCount": "{0} omitted",
+  "context.reason.too_long": "too long",
+  "context.reason.too_many": "over the count",
+  "context.reason.budget_exhausted": "over the total",
   "context.artifacts": "{0} Artifact refs",
   "security.sandbox": "Sandbox",
   "security.generation": "Generation",
@@ -1581,10 +1990,13 @@ Object.assign(I18N.en, {
   "palette.empty": "No matches",
   "palette.group.artifacts": "Artifacts",
   "palette.group.commands": "Commands",
+  "palette.group.datapro": "Professional datasets",
   "palette.group.sessions": "Sessions",
   "palette.group.skills": "Skills",
-  "palette.searchPlaceholder": "Search sessions, artifacts, skills, or run a command…",
+  "palette.datapro.result": "DataPro query result",
+  "palette.searchPlaceholder": "Search sessions, artifacts, professional datasets, skills, or run a command…",
   "perm.badge.subAgent": "Subagent",
+  "perm.badge.dangerous": "High risk",
   "perm.btn.allow": "Allow",
   "perm.btn.continueReplan": "Continue and replan",
   "perm.btn.deny": "Deny",
@@ -1613,6 +2025,11 @@ Object.assign(I18N.en, {
   "plan.eyebrow.draft": "PLAN READY FOR YOUR REVIEW",
   "plan.eyebrow.executing": "EXECUTING PLAN",
   "plan.eyebrow.failed": "PLAN INTERRUPTED",
+  "plan.eyebrow.paused": "PLAN PAUSED \u2014 STEPS REMAIN",
+  "plan.status.paused": "Paused: {0}/{1} steps done, {2} remaining",
+  "plan.resume": "Run the remaining steps",
+  "plan.resumeFailed": "Could not resume: {0}",
+  "plan.resuming": "Running the remaining steps\u2026",
   "plan.legacy.approvedPrompt": "Approved. Please strictly follow the plan above: run code, use the relevant skills, and produce result files.",
   "plan.legacy.intro": "The above is the execution plan. Once approved, it will run as planned and produce result files.",
   "plan.prompt.intro": "[Plan Mode] Do not execute or call any tools yet. Devise a structured execution plan for the task below, and output only two parts:\n",
@@ -1670,6 +2087,8 @@ Object.assign(I18N.en, {
   "sessionPackage.export": "Export session package",
   "sessionPackage.imported": "Session imported safely; its Kernel remains Ended until explicit recovery",
   "sessionPackage.tooLarge": "Session package exceeds the 128 MiB client limit",
+  "sessionPackage.verified": "Verified: {0} file(s) match the package's own manifest — importing",
+  "sessionPackage.verifyFailed": "Verification failed, import refused: {0}",
   "projModal.create": "Create",
   "projModal.editTitle": "Project settings",
   "projModal.ctx.label": "Agent Context",
@@ -1686,6 +2105,7 @@ Object.assign(I18N.en, {
   "prov.env.loadingSnapshot": "Loading environment snapshot…",
   "prov.env.noPackages": "No packages to report.",
   "prov.env.recorded": "Recorded from the kernel environment at the time this artifact was produced",
+  "prov.env.recordedUnverified": "Environment recorded, but not confirmed to belong to this production run alone",
   "prov.env.remoteTitle": "Remote GPU compute (reproducible)",
   "prov.env.remoteHost": "Host",
   "prov.env.remoteEnv": "Env",
@@ -1695,7 +2115,11 @@ Object.assign(I18N.en, {
   "prov.env.remoteRun": "Run (UTC)",
   "prov.env.thPackage": "Package",
   "prov.env.thVersion": "Version",
-  "prov.exec.downloadNotebook": "Download notebook",
+  "prov.exec.downloadNotebook": "Download notebooks (zip)",
+  "prov.exec.downloadPython": "Python notebook only (.ipynb)",
+  "prov.exec.downloadR": "R notebook only (.ipynb)",
+  "prov.exec.downloadMarkdown": "Markdown record (.md)",
+  "prov.exec.downloadMore": "Other export formats",
   "prov.exec.noRecords": "No execution records yet.",
   "prov.msg.loadFailed": "Failed to load conversation: {0}",
   "prov.msg.loading": "Loading conversation…",
@@ -1719,6 +2143,8 @@ Object.assign(I18N.en, {
   "session.badge.runningTip": "Task still running in the background — click to resume",
   "session.duplicateSuffix": "(Copy)",
   "session.empty.label": "No sessions yet",
+  "session.loadMore": "Load more sessions",
+  "session.loadMoreLimit": "List limit reached — search for older sessions",
   "session.menu.tip": "Session actions",
   "session.newFolder": "＋ Folder",
   "session.untitled": "Untitled session",
@@ -1740,6 +2166,8 @@ Object.assign(I18N.en, {
   "skill.label.name": "Name",
   "skill.namePlaceholder": "Skill name (lowercase-hyphenated, e.g. my-analysis)",
   "skill.newTitle": "New skill",
+  "skill.readiness.needsSetup": "Not available on this machine: {0}",
+  "skill.readiness.unknown": "Cannot be verified on this machine: {0}",
   "skill.saveBtn": "Save skill",
   "skill.historyBtn": "Version history",
   "skill.historyTitle": "Skill versions — {0}",
@@ -1811,6 +2239,9 @@ Object.assign(I18N.en, {
   "toast.models.updated": "Updated: {0}",
   "toast.network.disabled": "Network access disabled",
   "toast.network.enabled": "Network access enabled",
+  "toast.telemetry.on": "Anonymous statistics on",
+  "toast.telemetry.off": "Anonymous statistics off; the identity was deleted too",
+  "toast.telemetry.failed": "Could not save the statistics setting; restored the previous state: {0}",
   "toast.perm.enterTool": "Please enter a tool name",
   "toast.perm.resetDone": "Default rules restored",
   "toast.perm.ruleUpdated": "Rule updated",
@@ -1837,6 +2268,11 @@ Object.assign(I18N.en, {
   "toolLabel.searchSkills": "Searching skills",
   "toolLabel.writeFile": "Writing file",
   "turn.failed": "This turn failed. Please try again.",
+  "turn.failedCommitted": "This turn failed after it had already produced output or run a tool — retrying would repeat work that already happened. Check the result before deciding.",
+  "turn.failure.llmRequestBurst": "The model provider's burst-traffic protection was triggered. This is not an API-key configuration problem. Continue this session later or temporarily switch models.",
+  "turn.failure.llmRateLimited": "The model provider is rate-limiting requests. Continue this session later or temporarily switch models.",
+  "turn.failure.llmUpstreamOverloaded": "The model provider is currently overloaded. This is not an API-key configuration problem. Continue this session later or temporarily switch models.",
+  "turn.supportId": "Support ID: {0}",
   "upload.dropping": "Uploading dropped files…",
   "upload.failed": "Upload failed: {0}",
   "upload.pasting": "Uploading pasted files…",
@@ -1868,6 +2304,7 @@ Object.assign(I18N.en, {
   "viewer.renderer.version": "Version {0}",
   "viewer.sequence.omitted": "{0} additional residues are collapsed to keep the viewer responsive.",
   "viewer.sequence.summary": "{0} sequences · {1} residues · {2}",
+  "viewer.table.shape": "{0} rows × {1} columns",
   "ws.nav.files": "Files",
   "ws.nav.new": "New",
   "ws.sidebar.collapse": "Collapse sidebar (⌘B)",
@@ -1974,8 +2411,8 @@ function publicText(value, limit = 180) {
     .replace(/([?&](?:key|token|api_key)=)[^&#\s]+/gi, "$1[redacted]");
   return out.length > limit ? out.slice(0, Math.max(0, limit - 1)) + "…" : out;
 }
-function publicList(value, limit = 24) {
-  return (Array.isArray(value) ? value : []).slice(0, limit).map(item => publicText(item, 160)).filter(Boolean);
+function publicList(value, limit = 24, textLimit = 160) {
+  return (Array.isArray(value) ? value : []).slice(0, limit).map(item => publicText(item, textLimit)).filter(Boolean);
 }
 function publicArtifacts(result) {
   const found = [];
@@ -1990,7 +2427,13 @@ function publicArtifacts(result) {
   walk(result, 0); return found;
 }
 const ACTION_TIMELINE_PAGE_SIZE = 500;
-const ACTION_TIMELINE_MAX_GROUPS = 2000;
+const ACTION_TIMELINE_ROW_HEIGHT = 46;
+const ACTION_TIMELINE_OVERSCAN = 8;
+const ACTION_TIMELINE_TOP_THRESHOLD = ACTION_TIMELINE_ROW_HEIGHT * 2;
+const ACTION_TIMELINE_BOTTOM_THRESHOLD = 2;
+const ACTION_TIMELINE_OVERVIEW_WIDTH = 1000;
+const ACTION_TIMELINE_OVERVIEW_HEIGHT = 112;
+const ACTION_TIMELINE_OVERVIEW_HOVER_DELAY = 500;
 function timelineOrdinal(value) {
   return value !== null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
 }
@@ -2014,14 +2457,20 @@ function sanitizeActionTimeline(payload) {
     session: group.session && typeof group.session === "object" ? {
       root_frame_id: publicText(group.session.root_frame_id, 96), name: publicText(group.session.name, 160)
     } : null,
-    events: ((group.events || []).slice(0, 100)).map(event => ({
+    // The server projection has already removed arguments, wire state and raw
+    // results. Keep every projected event and its complete bounded public
+    // resource/artifact lists so loaded-window search cannot miss a safe item
+    // merely because it appeared late in the group.
+    events: (group.events || []).map(event => ({
       event_id: publicText(event.event_id, 96), sequence: event.sequence, type: publicText(event.type, 64),
       action_id: publicText(event.action_id, 96), name: publicText(event.name, 120),
-      side_effect_class: publicText(event.side_effect_class, 64), resource_keys: publicList(event.resource_keys),
-      artifacts: publicList(event.artifacts).concat(publicArtifacts(event.result)).slice(0, 16),
+      side_effect_class: publicText(event.side_effect_class, 64), resource_keys: publicList(event.resource_keys, 64, 160),
+      artifacts: publicList(event.artifacts, 32, 200).concat(publicArtifacts(event.result)).slice(0, 32),
       outcome: publicText(event.outcome, 32), is_error: !!event.is_error, created_at: event.created_at
     })),
-    attempts: ((group.attempts || []).slice(0, 50)).map(attempt => ({
+    // Inspector state is about the latest execution. Retain the bounded tail
+    // so a long retry history cannot strand the UI on attempt 50 forever.
+    attempts: ((group.attempts || []).slice(-50)).map(attempt => ({
       attempt_id: publicText(attempt.attempt_id, 96), producing_cell_id: publicText(attempt.producing_cell_id, 96),
       attempt_ordinal: attempt.attempt_ordinal, generation_id: publicText(attempt.generation_id, 96),
       allocated_at: attempt.allocated_at, started_at: attempt.started_at, response_at: attempt.response_at,
@@ -2029,7 +2478,7 @@ function sanitizeActionTimeline(payload) {
       terminal_state: publicText(attempt.terminal_state, 48), error: publicText(attempt.error, 240),
       replayed_from_cell_id: publicText(attempt.replayed_from_cell_id, 96)
     }))
-  }));
+  })).filter(group => !!group.group_id);
   const firstOrdinal = timelineOrdinal(source && source.first_ordinal);
   const lastOrdinal = timelineOrdinal(source && source.last_ordinal);
   const hasMoreBefore = !!(source && (source.has_more_before || source.has_earlier));
@@ -2046,7 +2495,6 @@ function sanitizeActionTimeline(payload) {
     has_earlier: hasMoreBefore, has_more: hasMoreAfter,
     first_ordinal: firstOrdinal != null ? firstOrdinal : (groups[0] && groups[0].ordinal),
     last_ordinal: lastOrdinal != null ? lastOrdinal : (groups[groups.length - 1] && groups[groups.length - 1].ordinal),
-    history_limit_reached: !!(source && source.history_limit_reached),
     running: !!(source && source.running)
   };
 }
@@ -2055,24 +2503,20 @@ function mergeActionTimelines(current, incoming, direction = "latest") {
   if (!incoming) return current;
   if ((current.root_frame_id && incoming.root_frame_id && current.root_frame_id !== incoming.root_frame_id) ||
       (current.branch_id && incoming.branch_id && current.branch_id !== incoming.branch_id)) return incoming;
-  const key = group => group.group_id ? `id:${group.group_id}` : ["group", group.branch_id, group.ordinal, group.turn_id, group.kind, group.created_at, group.title].join("\u001f");
   const deduped = new Map();
   const ordered = direction === "before" ? (incoming.groups || []).concat(current.groups || []) :
     (current.groups || []).concat(incoming.groups || []);
-  ordered.forEach(group => deduped.set(key(group), group));
-  const all = Array.from(deduped.values()).sort((a, b) => {
+  ordered.forEach(group => { if (group && group.group_id) deduped.set(group.group_id, group); });
+  const groups = Array.from(deduped.values()).sort((a, b) => {
     const left = timelineOrdinal(a.ordinal), right = timelineOrdinal(b.ordinal);
     if (left != null && right != null && left !== right) return left - right;
     return (+a.created_at || 0) - (+b.created_at || 0);
   });
-  const groups = all.slice(-ACTION_TIMELINE_MAX_GROUPS); // always retain the latest research state
-  const hitLimit = !!current.history_limit_reached || all.length > groups.length ||
-    (direction === "before" && groups.length >= ACTION_TIMELINE_MAX_GROUPS && incoming.has_more_before);
   const currentFirst = timelineOrdinal(current.first_ordinal), incomingFirst = timelineOrdinal(incoming.first_ordinal);
   const beforeSource = direction === "before" ? incoming :
     (currentFirst != null && (incomingFirst == null || currentFirst <= incomingFirst) ? current : incoming);
   const afterSource = direction === "before" ? current : incoming;
-  const hasMoreBefore = !hitLimit && !!beforeSource.has_more_before;
+  const hasMoreBefore = !!beforeSource.has_more_before;
   const hasMoreAfter = !!afterSource.has_more_after;
   return {
     ...afterSource,
@@ -2080,13 +2524,20 @@ function mergeActionTimelines(current, incoming, direction = "latest") {
     branch_id: incoming.branch_id || current.branch_id,
     groups, count: groups.length,
     total_count: Math.max(+current.total_count || 0, +incoming.total_count || 0, groups.length),
-    truncated: hitLimit || hasMoreBefore || hasMoreAfter,
+    truncated: hasMoreBefore || hasMoreAfter,
     has_more_before: hasMoreBefore, has_more_after: hasMoreAfter,
     has_earlier: hasMoreBefore, has_more: hasMoreAfter,
     first_ordinal: groups.length ? groups[0].ordinal : null,
     last_ordinal: groups.length ? groups[groups.length - 1].ordinal : null,
-    history_limit_reached: hitLimit,
     running: direction === "before" ? !!current.running : !!incoming.running
+  };
+}
+function queueMetadata(raw) {
+  const m = raw || {};
+  const rev = +m.model_profile_revision;
+  return {
+    preview: publicText(m.preview, 160), model_profile_id: publicText(m.model_profile_id, 96),
+    model_profile_revision: Number.isFinite(rev) && rev > 0 ? rev : null
   };
 }
 function sanitizeExecutionQueue(payload) {
@@ -2097,7 +2548,12 @@ function sanitizeExecutionQueue(payload) {
     branch_id: publicText(item.branch_id, 96), language: publicText(item.language, 24),
     generation_id: publicText(item.generation_id, 96), resource_keys: publicList(item.resource_keys),
     queue_position: Number.isFinite(+item.queue_position) ? +item.queue_position : null,
-    queued_at: item.queued_at, started_at: item.started_at, cancel_requested: !!item.cancel_requested
+    queued_at: item.queued_at, started_at: item.started_at, cancel_requested: !!item.cancel_requested,
+    // The ticket's own frozen description of the work. A queued item has no
+    // frame row and no message row yet, so this is the only thing that can say
+    // what the item is — and it is frozen at admission, so it keeps saying the
+    // same thing while the frame's model pin is rewritten underneath it.
+    metadata: queueMetadata(item.metadata)
   } : null;
   return {
     owner: ticket(source.owner), queue: (source.queue || []).slice(0, 100).map(ticket).filter(Boolean),
@@ -2112,7 +2568,63 @@ function rememberExecutionQueue(payload) {
   S.executionIdentity = ticket && ticket.execution_id && ticket.owner && ticket.owner.kind && ticket.owner.id ? {
     execution_id: ticket.execution_id, owner: { kind: ticket.owner.kind, id: ticket.owner.id }
   } : null;
+  renderQueueStrip();
   return S.executionQueue;
+}
+// ---- queued follow-ups -----------------------------------------------------
+// The composer stays usable while a turn runs, so the FIFO queue is now
+// something the user can see rather than an internal detail. Every row is drawn
+// from the server projection alone: position, preview and the frozen
+// profile/branch all come off the ticket, so a repaint after any queue change
+// cannot disagree with what the server will actually run.
+function queueRowLabel(item) {
+  const meta = item.metadata || {};
+  const bits = [];
+  if (meta.model_profile_id) bits.push(t("queue.underProfile", meta.model_profile_id, meta.model_profile_revision == null ? "?" : meta.model_profile_revision));
+  if (item.branch_id) bits.push(t("queue.onBranch", item.branch_id));
+  bits.push(item.execution_id);
+  return bits.join(" · ");
+}
+function renderQueueStrip() {
+  const box = $("#queue-strip"); if (!box) return;
+  const queue = ((S.executionQueue || {}).queue || []).filter(item => (item.owner || {}).kind === "agent");
+  box.innerHTML = "";
+  box.classList.toggle("hidden", !queue.length);
+  if (!queue.length) return;
+  box.appendChild(el("div", "queue-head", t("queue.waiting", queue.length)));
+  queue.forEach(item => {
+    const row = el("div", "queue-row");
+    row.appendChild(el("span", "queue-pos", "#" + (item.queue_position == null ? "?" : item.queue_position)));
+    row.appendChild(el("span", "queue-preview", item.metadata.preview || t("queue.noPreview")));
+    const meta = el("span", "queue-meta", queueRowLabel(item));
+    meta.title = queueRowLabel(item);
+    row.appendChild(meta);
+    const drop = el("button", "icon-ghost queue-cancel");
+    drop.title = t("queue.cancelOne");
+    drop.appendChild(iconEl("x", 13));
+    // One item, by its own id AND its own owner. The server refuses a
+    // half-matching pair, which is what keeps this from ever reaching the
+    // running turn or a sibling that happens to sit at the same position.
+    drop.onclick = () => cancelQueuedExecution(item);
+    row.appendChild(drop);
+    box.appendChild(row);
+  });
+}
+async function cancelQueuedExecution(item) {
+  const fid = S.currentId;
+  if (!fid || !item || !item.execution_id || !(item.owner || {}).id) return;
+  try {
+    const r = await api(`/frames/${fid}/cancel`, { method: "POST", body: JSON.stringify({
+      execution_id: item.execution_id, owner: { kind: item.owner.kind, id: item.owner.id }, reason: "queued follow-up dropped by user"
+    }) });
+    if (!r || r.ok !== true) { hint(t("queue.cancelFailed", (r && r.reason) || ""), true); return; }
+    // Mark the optimistic bubble this item was sent as, rather than removing
+    // it: a message the user typed and can still see is easier to re-send than
+    // one that vanished, and the transcript should not silently lose a turn.
+    const bubble = [...document.querySelectorAll(".msg.user")].find(n => n.dataset.executionId === item.execution_id);
+    if (bubble) bubble.classList.add("cancelled");
+    hint(t("queue.cancelled"));
+  } catch (e) { hint(t("queue.cancelFailed", apiErrorText(e)), true); }
 }
 function rememberExecutionState(event) {
   const status = String(event && event.status || "").toLowerCase();
@@ -2326,6 +2838,16 @@ function sanitizeContext(payload) {
       token_count: Number.isFinite(+layer.token_count) ? +layer.token_count : null,
       status: publicText(layer.status, 48), compressed: !!layer.compressed
     })),
+    // What this turn's budgets left out. Dropping it here would have made the
+    // server-side omission report unreachable — the panel would keep reading
+    // as a complete account of the context while quietly being a partial one.
+    omitted: (Array.isArray(source.omitted) ? source.omitted : []).slice(0, 20).map(item => ({
+      kind: publicText(item && item.kind, 48),
+      count: Math.max(0, Number(item && item.count) || 0),
+      reasons: (Array.isArray(item && item.reasons) ? item.reasons : []).slice(0, 8).map(r => ({
+        reason: publicText(r && r.reason, 48), count: Math.max(0, Number(r && r.count) || 0)
+      }))
+    })),
     compaction_history: history.slice(0, 50).map(item => ({
       archive_id: publicText(item && item.archive_id, 120), branch_id: publicText(item && item.branch_id, 120),
       generation_id: publicText(item && item.generation_id, 120), created_at: Number(item && item.created_at) || 0,
@@ -2400,25 +2922,54 @@ async function optionalApi(paths) {
   for (const path of paths) { try { return await api(path); } catch {} }
   return null;
 }
+function actionTimelineBranchScope(timeline = S.actionTimeline, groups = null) {
+  const items = groups || ((timeline && timeline.groups) || []);
+  return publicText((timeline && timeline.branch_id) || (items[0] && items[0].branch_id) || S.currentId, 96);
+}
+function actionTimelineRootScope(timeline = S.actionTimeline) {
+  return publicText((timeline && timeline.root_frame_id) || S.currentId, 96);
+}
+function actionTimelineHistoryIsLoading(timeline = S.actionTimeline) {
+  const loading = S._timelineHistoryLoading;
+  return !!loading && loading.frameId === S.currentId && loading.branchId === actionTimelineBranchScope(timeline);
+}
 async function loadEarlierActionTimeline() {
   const id = S.currentId, timeline = S.actionTimeline;
-  if (!id || !timeline || !timeline.has_more_before || S._timelineHistoryLoading === id) return;
+  const branchId = actionTimelineBranchScope(timeline);
+  if (!id || !timeline || !branchId || !timeline.has_more_before || S._timelineHistoryLoading) return;
   const first = timelineOrdinal(timeline.first_ordinal);
   if (first == null || first < 0) return;
   const request = S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1;
-  S._timelineHistoryLoading = id;
+  const loading = { frameId: id, branchId, firstOrdinal: first };
+  S._timelineHistoryLoading = loading;
   delete S.workbenchErrors.timelineHistory;
-  if (S.activeTab === "timeline") renderActionTimeline();
+  if (S.activeTab === "timeline") syncActionTimelineHistoryState();
   try {
-    const page = await api(`/frames/${encodeURIComponent(id)}/action-timeline?before_ordinal=${first}&limit=${ACTION_TIMELINE_PAGE_SIZE}`);
-    if (request !== S._timelineHistoryReq || id !== S.currentId) return;
-    S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(page), "before");
+    const page = await api(`/frames/${encodeURIComponent(id)}/action-timeline?before_ordinal=${first}&limit=${ACTION_TIMELINE_PAGE_SIZE}&branch_id=${encodeURIComponent(branchId)}`);
+    const current = S.actionTimeline, incoming = sanitizeActionTimeline(page);
+    if (request !== S._timelineHistoryReq || id !== S.currentId ||
+        actionTimelineBranchScope(current) !== branchId || (incoming.branch_id && incoming.branch_id !== branchId)) return;
+    // Take the anchor immediately before the synchronous merge. A WS append
+    // that arrived while this request was in flight is therefore already part
+    // of oldScrollHeight and cannot be mistaken for prepended history.
+    const view = S._timelineView;
+    const matchingView = view && view.scroll && view.rootFrameId === actionTimelineRootScope(current) && view.branchId === branchId;
+    const prependSnapshot = S.activeTab === "timeline" && matchingView
+      ? { node: view.scroll, scrollHeight: view.scroll.scrollHeight, scrollTop: view.scroll.scrollTop,
+        followTail: actionTimelineBottomDistance(view) <= ACTION_TIMELINE_BOTTOM_THRESHOLD }
+      : null;
+    const pendingPrependRestore = S.activeTab !== "timeline" && matchingView ? actionTimelineFilterScrollSnapshot(view) : null;
+    S.actionTimeline = mergeActionTimelines(current, incoming, "before");
+    if (S.activeTab === "timeline") updateActionTimelineLedger({ direction: "before", prependSnapshot });
+    else if (pendingPrependRestore) view.pendingPrependRestore = pendingPrependRestore;
   } catch (error) {
-    if (request === S._timelineHistoryReq && id === S.currentId) S.workbenchErrors.timelineHistory = publicText(error && error.message, 240);
+    if (request === S._timelineHistoryReq && id === S.currentId && actionTimelineBranchScope() === branchId) {
+      S.workbenchErrors.timelineHistory = publicText(error && error.message, 240);
+    }
   } finally {
-    if (request === S._timelineHistoryReq && id === S.currentId) {
+    if (request === S._timelineHistoryReq && id === S.currentId && S._timelineHistoryLoading === loading) {
       S._timelineHistoryLoading = null;
-      if (S.activeTab === "timeline") renderActionTimeline();
+      if (S.activeTab === "timeline") syncActionTimelineHistoryState();
     }
   }
 }
@@ -2428,11 +2979,17 @@ async function loadWorkbenchState(id, force = false) {
   const request = S._workbenchReq = (S._workbenchReq || 0) + 1;
   S._workbenchLoading = id;
   const base = `/frames/${id}`;
-  const [timeline, execution, branches, context, security, delegation, recovery, recoveryActions] = await Promise.all([
+  const [timeline, execution, branches, context, security, delegation, recovery, recoveryActions, computeTasks] = await Promise.all([
     optionalApi([base + `/action-timeline?limit=${ACTION_TIMELINE_PAGE_SIZE}`]),
     optionalApi([base + "/execution-queue", base + "/execution"]),
     optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]), optionalApi([base + "/delegations"]),
-    optionalApi([base + "/recovery"]), optionalApi([base + "/recovery/actions"])
+    optionalApi([base + "/recovery"]), optionalApi([base + "/recovery/actions"]),
+    // Reading the durable record, not asking a provider. The server route has
+    // no path to a ComputeManager, so opening the workbench cannot contact a
+    // remote — which matters because in this system contacting the remote is
+    // what harvests files and closes the job. The harvest stays behind the
+    // per-task button below.
+    optionalApi([base + "/compute/tasks"])
   ]);
   if (request !== S._workbenchReq || id !== S.currentId) return;
   S._workbenchLoading = null;
@@ -2444,6 +3001,7 @@ async function loadWorkbenchState(id, force = false) {
   if (delegation) S.delegationState = sanitizeDelegations(delegation);
   if (recovery) S.recoveryState = sanitizeRecovery(recovery);
   if (recoveryActions) S.recoveryActions = sanitizeRecoveryActions(recoveryActions);
+  if (computeTasks) S.computeTasks = sanitizeComputeTasks(computeTasks);
   if (S.activeTab === "timeline") renderActionTimeline();
   if (S.activeTab === "notebook") renderNotebook();
 }
@@ -2500,10 +3058,13 @@ function runtimeSummaryNode(compact = false) {
   if (runtime.viewOnly && runtime.trustState === "quarantined") item("runtime.trust", t("runtime.trust.quarantined"));
   return root;
 }
+function latestActionTimelineAttempt(group) {
+  return ((group && group.attempts) || []).slice(-1)[0] || null;
+}
 function timelineKind(group) {
   const kind = String(group && group.kind || "").toLowerCase();
   const eventKinds = (group.events || []).map(event => String(event.type || "").toLowerCase()).join(" ");
-  const latestAttempt = (group.attempts || []).slice(-1)[0], linkedCell = latestAttempt && nbFindCell(latestAttempt.producing_cell_id);
+  const latestAttempt = latestActionTimelineAttempt(group), linkedCell = latestAttempt && nbFindCell(latestAttempt.producing_cell_id);
   const language = String(group.language || (linkedCell && linkedCell.language) || "").toLowerCase();
   if (/final/.test(kind + " " + eventKinds)) return "finalize";
   if (/permission|approval/.test(kind + " " + eventKinds)) return "permission";
@@ -2516,12 +3077,24 @@ function timelineKind(group) {
   if (/tool/.test(kind + " " + eventKinds)) return "native_tool";
   return "action";
 }
-function timelineDuration(attempt) {
+function timelineDurationMs(attempt) {
   if (!attempt) return "";
-  const parse = value => { if (value == null) return null; const number = +value; if (Number.isFinite(number)) return number > 1e12 ? number : number * 1000; const date = Date.parse(value); return Number.isFinite(date) ? date : null; };
-  const start = parse(attempt.started_at || attempt.allocated_at), end = parse(attempt.finished_at || attempt.capture_at || attempt.response_at);
+  // ActionTimelineService exposes INTEGER epoch milliseconds, and a small
+  // numeric timestamp is never reinterpreted as seconds. Parsing goes through
+  // timelineEpochMs so the ledger, the overview and the turn stats agree about
+  // which timestamps exist — a field one of them can read and another cannot
+  // produced a duration with no bar and a completed turn labelled "≥".
+  const parse = timelineEpochMs;
+  const start = parse(attempt.started_at != null ? attempt.started_at : attempt.allocated_at);
+  const end = parse(attempt.finished_at != null ? attempt.finished_at : (attempt.capture_at != null ? attempt.capture_at : attempt.response_at));
   if (start == null || end == null || end < start) return "";
-  const ms = end - start; return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " s";
+  return end - start;
+}
+function timelineDurationValue(ms) {
+  return ms === "" || !Number.isFinite(+ms) || +ms < 0 ? "" : (+ms < 1000 ? Math.round(+ms) + " ms" : (+ms / 1000).toFixed(+ms < 10000 ? 1 : 0) + " s");
+}
+function timelineDuration(attempt) {
+  return timelineDurationValue(timelineDurationMs(attempt));
 }
 function timelineCost(value) {
   if (value == null || !Number.isFinite(+value) || +value < 0) return "";
@@ -2534,30 +3107,1224 @@ function timelineMeta(label, value) {
   const values = Array.isArray(value) ? value : [value]; const body = el("span", "timeline-meta-value");
   values.slice(0, 24).forEach(item => body.appendChild(el("span", "timeline-pill", publicText(item, 160)))); row.appendChild(body); return row;
 }
+function timelineKindIcon(kind) {
+  if (kind === "delegate") return "users";
+  if (kind === "permission") return "lock";
+  if (kind === "recovery") return "refresh";
+  if (kind === "finalize") return "check";
+  if (kind === "native_tool" || kind === "dynamic_tool") return "sliders";
+  return "terminal";
+}
+function actionTimelineDetails(group) {
+  const latest = latestActionTimelineAttempt(group);
+  const resources = [], artifacts = [];
+  (group.events || []).forEach(event => {
+    (event.resource_keys || []).forEach(value => { if (!resources.includes(value)) resources.push(value); });
+    (event.artifacts || []).forEach(value => { if (!artifacts.includes(value)) artifacts.push(value); });
+  });
+  return {
+    latest, resources, artifacts, owner: group.owner || "",
+    permission: group.permission || (group.events || []).map(event => event.side_effect_class).filter(Boolean),
+    replay: group.replay_policy || (latest && latest.replayed_from_cell_id ? "replayed" : "original"),
+    duration: timelineDuration(latest),
+    tokens: t("timeline.tokensValue", (group.usage || {}).input_tokens || 0, (group.usage || {}).output_tokens || 0),
+    cost: timelineCost(group.cost)
+  };
+}
+function appendActionTimelineDetails(container, group) {
+  const details = actionTimelineDetails(group);
+  [
+    timelineMeta(t("timeline.owner"), details.owner),
+    timelineMeta(t("timeline.permission"), details.permission),
+    timelineMeta(t("timeline.resources"), details.resources),
+    timelineMeta(t("timeline.artifacts"), details.artifacts),
+    timelineMeta(t("timeline.generation"), details.latest && details.latest.generation_id),
+    timelineMeta(t("timeline.replay"), details.replay),
+    timelineMeta(t("timeline.duration"), details.duration),
+    timelineMeta(t("timeline.tokens"), details.tokens),
+    timelineMeta(t("timeline.cost"), details.cost)
+  ].filter(Boolean).forEach(node => container.appendChild(node));
+  if (details.latest && details.latest.error) container.appendChild(el("div", "timeline-error", details.latest.error));
+  return details;
+}
 function actionTimelineCard(group) {
   const kind = timelineKind(group), status = String(group.status || "completed").toLowerCase();
   const card = el("article", "timeline-card kind-" + kind + " status-" + status); card.setAttribute("data-action-kind", kind);
   const head = el("div", "timeline-card-head");
-  const kindLabel = el("span", "timeline-kind"); kindLabel.appendChild(iconEl(kind === "delegate" ? "users" : (kind === "permission" ? "lock" : (kind === "recovery" ? "refresh" : (kind === "finalize" ? "check" : (kind === "native_tool" || kind === "dynamic_tool" ? "sliders" : "terminal")))), 14)); kindLabel.appendChild(el("span", null, t("timeline.kind." + kind))); head.appendChild(kindLabel);
+  const kindLabel = el("span", "timeline-kind"); kindLabel.appendChild(iconEl(timelineKindIcon(kind), 14)); kindLabel.appendChild(el("span", null, t("timeline.kind." + kind))); head.appendChild(kindLabel);
   head.appendChild(el("span", "timeline-status " + status, publicText(status || "completed", 32))); card.appendChild(head);
   card.appendChild(el("div", "timeline-card-title", group.title || t("timeline.kind." + kind)));
-  const latest = (group.attempts || []).slice(-1)[0] || null;
-  const resources = []; const artifacts = [];
-  (group.events || []).forEach(event => { (event.resource_keys || []).forEach(value => { if (!resources.includes(value)) resources.push(value); }); (event.artifacts || []).forEach(value => { if (!artifacts.includes(value)) artifacts.push(value); }); });
-  const owner = group.owner || "";
-  [
-    timelineMeta(t("timeline.owner"), owner),
-    timelineMeta(t("timeline.permission"), group.permission || (group.events || []).map(event => event.side_effect_class).filter(Boolean)),
-    timelineMeta(t("timeline.resources"), resources),
-    timelineMeta(t("timeline.artifacts"), artifacts),
-    timelineMeta(t("timeline.generation"), latest && latest.generation_id),
-    timelineMeta(t("timeline.replay"), group.replay_policy || (latest && latest.replayed_from_cell_id ? "replayed" : "original")),
-    timelineMeta(t("timeline.duration"), timelineDuration(latest)),
-    timelineMeta(t("timeline.tokens"), t("timeline.tokensValue", (group.usage || {}).input_tokens || 0, (group.usage || {}).output_tokens || 0)),
-    timelineMeta(t("timeline.cost"), timelineCost(group.cost))
-  ].filter(Boolean).forEach(node => card.appendChild(node));
-  if (latest && latest.error) card.appendChild(el("div", "timeline-error", latest.error));
+  appendActionTimelineDetails(card, group);
   return card;
+}
+function actionTimelineInspector(group) {
+  const kind = timelineKind(group), status = String(group.status || "completed").toLowerCase();
+  const panel = el("section", "timeline-inspector kind-" + kind + " status-" + status);
+  panel.id = "timeline-action-inspector"; panel.dataset.groupId = group.group_id; panel.setAttribute("role", "region"); panel.setAttribute("aria-labelledby", "timeline-inspector-label");
+  const inspectorHead = el("div", "timeline-inspector-head");
+  const inspectorLabel = el("div", "timeline-inspector-label", t("timeline.inspector")); inspectorLabel.id = "timeline-inspector-label"; inspectorHead.appendChild(inspectorLabel);
+  const close = ghostIconBtn("x", t("timeline.inspector.close")); close.setAttribute("aria-label", t("timeline.inspector.close"));
+  close.onclick = event => { event.stopPropagation(); S._timelineRestoreFocusGroupId = group.group_id; S.actionTimelineSelectedGroupId = null; S.actionTimelineSelectedBranchId = null; updateActionTimelineLedger(); };
+  inspectorHead.appendChild(close); panel.appendChild(inspectorHead);
+  const cardHead = el("div", "timeline-card-head");
+  const kindLabel = el("span", "timeline-kind"); kindLabel.appendChild(iconEl(timelineKindIcon(kind), 14)); kindLabel.appendChild(el("span", null, t("timeline.kind." + kind))); cardHead.appendChild(kindLabel);
+  cardHead.appendChild(el("span", "timeline-status " + status, publicText(status || "completed", 32))); panel.appendChild(cardHead);
+  panel.appendChild(el("div", "timeline-card-title", group.title || t("timeline.kind." + kind)));
+  appendActionTimelineDetails(panel, group); appendActionTimelineTimingDetails(panel, group); panel._timelineGroup = group; panel._timelineLanguage = LANG;
+  return panel;
+}
+function timelineTokenTotal(usage) {
+  const source = usage || {}, input = +source.input_tokens || 0, output = +source.output_tokens || 0, total = +source.total_tokens || 0;
+  return total > 0 ? total : input + output;
+}
+// Every consumer of an attempt timestamp must agree on what is parseable, or a
+// projection renders a duration the chart cannot plot and the turn stats read
+// as still running. This is the single parser: it accepts what
+// timelineDurationMs accepts, including the ISO string fallback kept for
+// imported legacy projections, and refuses anything Date cannot represent
+// (|t| > 8.64e15) so toISOString can never throw out of a render.
+const TIMELINE_MAX_EPOCH_MS = 8.64e15;
+function timelineEpochMs(value) {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  const ms = Number.isFinite(number) ? Math.round(number) : Date.parse(value);
+  return Number.isFinite(ms) && ms >= 0 && ms <= TIMELINE_MAX_EPOCH_MS ? ms : null;
+}
+function actionTimelineSpan(group, rank, laneCount) {
+  const attempt = latestActionTimelineAttempt(group);
+  if (!attempt || !group || !group.group_id) return null;
+  const times = {
+    allocated: timelineEpochMs(attempt.allocated_at),
+    started: timelineEpochMs(attempt.started_at),
+    response: timelineEpochMs(attempt.response_at),
+    capture: timelineEpochMs(attempt.capture_at),
+    finished: timelineEpochMs(attempt.finished_at)
+  };
+  if (times.allocated == null) return null;
+  const segments = [];
+  const addSegment = (phase, start, end) => {
+    if (start != null && end != null && end >= start) segments.push({ phase, start, end });
+  };
+  const running = times.finished == null;
+  if (!running && times.finished >= times.allocated) {
+    addSegment("queue", times.allocated, times.started);
+    addSegment("ttft", times.started, times.response);
+    addSegment("decode", times.response, times.finished);
+  }
+  if (!running && times.finished < times.allocated) return null;
+  // An unfinished attempt is drawn only as its allocated-at marker, but its
+  // filter interval may extend through milestones we actually observed.  This
+  // never guesses a finish time or extends the record to "now".
+  const latestKnown = [times.allocated, times.started, times.response, times.capture]
+    .filter(value => value != null && value >= times.allocated)
+    .reduce((latest, value) => Math.max(latest, value), times.allocated);
+  return {
+    groupId: group.group_id, group, attempt, rank, laneCount, times, segments,
+    start: times.allocated, end: running ? latestKnown : times.finished,
+    markerAt: running ? times.allocated : null,
+    pointAt: !running && !segments.some(segment => segment.end > segment.start) ? times.allocated : null,
+    running
+  };
+}
+function actionTimelineOverviewModel(groups, domainGroups = groups) {
+  const drawableItems = groups.map(group => actionTimelineSpan(group, 0, 1)).filter(Boolean);
+  const items = [], byId = new Map(), laneCount = Math.max(1, drawableItems.length);
+  let dataStart = null, dataEnd = null;
+  drawableItems.forEach((item, rank) => {
+    item.rank = rank; item.laneCount = laneCount;
+    items.push(item); byId.set(item.groupId, item);
+  });
+  // Searching changes which bars are painted, not the honest time domain of
+  // the loaded window.  Keeping the full loaded domain also leaves the
+  // omitted-prefix control anchored to the real earliest loaded timestamp.
+  domainGroups.forEach(group => {
+    const attempt = latestActionTimelineAttempt(group); if (!attempt) return;
+    [attempt.allocated_at, attempt.started_at, attempt.response_at, attempt.capture_at, attempt.finished_at].forEach(raw => {
+      const value = timelineEpochMs(raw);
+      if (value == null) return;
+      dataStart = dataStart == null ? value : Math.min(dataStart, value);
+      dataEnd = dataEnd == null ? value : Math.max(dataEnd, value);
+    });
+  });
+  return { items, byId, laneCount, dataStart, dataEnd };
+}
+function timelineOverviewTimeToX(overview, value) {
+  const start = overview.viewStart, end = overview.viewEnd;
+  if (start == null || end == null || value == null) return null;
+  if (end === start) return ACTION_TIMELINE_OVERVIEW_WIDTH / 2;
+  return (value - start) / (end - start) * ACTION_TIMELINE_OVERVIEW_WIDTH;
+}
+function timelineOverviewPathRect(x1, x2, y1, y2) {
+  if (![x1, x2, y1, y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) return "";
+  const n = value => Number(value.toFixed(3));
+  return `M${n(x1)},${n(y1)}H${n(x2)}V${n(y2)}H${n(x1)}Z`;
+}
+function timelineOverviewItemPaths(overview, item) {
+  const laneHeight = ACTION_TIMELINE_OVERVIEW_HEIGHT / item.laneCount;
+  const padding = Math.min(.22, laneHeight * .12), y1 = item.rank * laneHeight + padding, y2 = (item.rank + 1) * laneHeight - padding;
+  const paths = { queue: "", ttft: "", decode: "", marker: "", point: "", highlight: "" };
+  item.segments.forEach(segment => {
+    const rawX1 = timelineOverviewTimeToX(overview, segment.start), rawX2 = timelineOverviewTimeToX(overview, segment.end);
+    if (rawX1 == null || rawX2 == null || rawX2 < 0 || rawX1 > ACTION_TIMELINE_OVERVIEW_WIDTH) return;
+    const rect = timelineOverviewPathRect(Math.max(0, rawX1), Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, rawX2), y1, y2);
+    paths[segment.phase] += rect; paths.highlight += rect;
+  });
+  const markerAt = item.markerAt != null ? item.markerAt : item.pointAt;
+  if (markerAt != null) {
+    const x = timelineOverviewTimeToX(overview, markerAt), center = (y1 + y2) / 2;
+    if (x != null && x >= 0 && x <= ACTION_TIMELINE_OVERVIEW_WIDTH) {
+      const n = value => Number(value.toFixed(3));
+      const marker = `M${n(x)},${n(Math.max(0, center - .9))}V${n(Math.min(ACTION_TIMELINE_OVERVIEW_HEIGHT, center + .9))}`;
+      paths[item.running ? "marker" : "point"] += marker; paths.highlight += marker;
+    }
+  }
+  return paths;
+}
+function actionTimelineOverviewVisualExtent(item) {
+  if (!item) return null;
+  const values = [];
+  item.segments.forEach(segment => { values.push(segment.start, segment.end); });
+  if (item.markerAt != null) values.push(item.markerAt);
+  if (item.pointAt != null) values.push(item.pointAt);
+  const finite = values.filter(Number.isFinite);
+  return finite.length ? { start: Math.min(...finite), end: Math.max(...finite) } : null;
+}
+function timelineOverviewExactTime(value) {
+  const ms = timelineEpochMs(value);
+  return ms == null ? "—" : new Date(ms).toISOString();
+}
+function timelineOverviewExactDuration(start, end) {
+  const left = timelineEpochMs(start), right = timelineEpochMs(end);
+  return left == null || right == null || right < left ? "—" : String(right - left) + " ms";
+}
+function appendActionTimelineTimingDetails(container, group) {
+  const attempt = latestActionTimelineAttempt(group); if (!attempt || timelineEpochMs(attempt.allocated_at) == null) return;
+  [
+    timelineMeta(t("timeline.overview.allocated"), timelineOverviewExactTime(attempt.allocated_at)),
+    timelineMeta(t("timeline.overview.started"), timelineOverviewExactTime(attempt.started_at)),
+    timelineMeta(t("timeline.overview.response"), timelineOverviewExactTime(attempt.response_at)),
+    timelineMeta(t("timeline.overview.finished"), timelineOverviewExactTime(attempt.finished_at)),
+    timelineMeta(t("timeline.overview.queue"), timelineOverviewExactDuration(attempt.allocated_at, attempt.started_at)),
+    timelineMeta(t("timeline.overview.ttft"), timelineOverviewExactDuration(attempt.started_at, attempt.response_at)),
+    timelineMeta(t("timeline.overview.decode"), timelineOverviewExactDuration(attempt.response_at, attempt.finished_at))
+  ].filter(Boolean).forEach(node => container.appendChild(node));
+}
+function clearActionTimelineOverviewHover(view) {
+  const overview = view && view.overview; if (!overview) return;
+  if (overview.hoverTimer) clearTimeout(overview.hoverTimer);
+  if (overview.hoverLeaveTimer) clearTimeout(overview.hoverLeaveTimer);
+  overview.hoverTimer = 0; overview.hoverLeaveTimer = 0; overview.tooltipHovered = false; overview.hoverCandidateId = null; overview.hoverGroupId = null;
+  overview.tooltip.replaceChildren(); overview.tooltip.classList.add("hidden"); overview.tooltip.setAttribute("aria-hidden", "true");
+  overview.hoverPath.setAttribute("d", "");
+}
+function cancelActionTimelineOverviewHoverClear(view) {
+  const overview = view && view.overview; if (!overview || !overview.hoverLeaveTimer) return;
+  clearTimeout(overview.hoverLeaveTimer); overview.hoverLeaveTimer = 0;
+}
+function scheduleActionTimelineOverviewHoverClear(view) {
+  const overview = view && view.overview; if (!overview) return;
+  cancelActionTimelineOverviewHoverClear(view);
+  overview.hoverLeaveTimer = setTimeout(() => {
+    overview.hoverLeaveTimer = 0;
+    if (!overview.tooltipHovered) clearActionTimelineOverviewHover(view);
+  }, 150);
+}
+function positionActionTimelineOverviewTooltip(overview, clientX, clientY) {
+  const rect = overview.shell.getBoundingClientRect();
+  const width = overview.tooltip.offsetWidth || 220, height = overview.tooltip.offsetHeight || 120;
+  const pointerX = clientX - rect.left, pointerY = clientY - rect.top;
+  const left = Math.max(8, Math.min(Math.max(8, rect.width - width - 8), pointerX - width / 2));
+  let top = pointerY + 8;
+  if (top + height > rect.height - 8) top = Math.max(8, pointerY - height - 8);
+  overview.tooltip.style.left = left + "px"; overview.tooltip.style.top = top + "px";
+}
+function showActionTimelineOverviewTooltip(view, groupId, clientX, clientY) {
+  const overview = view && view.overview, item = overview && overview.model && overview.model.byId.get(groupId);
+  if (!overview || !item || overview.hoverCandidateId !== groupId) return;
+  const ordinal = timelineOrdinal(item.group.ordinal), title = item.group.title || t("timeline.kind." + timelineKind(item.group));
+  const head = el("div", "timeline-overview-tooltip-title", (ordinal == null ? "" : "#" + ordinal + " · ") + title);
+  const body = el("div", "timeline-overview-tooltip-grid");
+  const row = (label, value) => { body.appendChild(el("span", "timeline-overview-tooltip-key", label)); body.appendChild(el("code", null, value)); };
+  row(t("timeline.overview.allocated"), timelineOverviewExactTime(item.times.allocated));
+  row(t("timeline.overview.started"), timelineOverviewExactTime(item.times.started));
+  row(t("timeline.overview.response"), timelineOverviewExactTime(item.times.response));
+  row(t("timeline.overview.finished"), timelineOverviewExactTime(item.times.finished));
+  row(t("timeline.overview.queue"), timelineOverviewExactDuration(item.times.allocated, item.times.started));
+  row(t("timeline.overview.ttft"), timelineOverviewExactDuration(item.times.started, item.times.response));
+  row(t("timeline.overview.decode"), timelineOverviewExactDuration(item.times.response, item.times.finished));
+  if (item.running) body.appendChild(el("span", "timeline-overview-running", t("timeline.overview.running")));
+  overview.tooltip.replaceChildren(head, body); overview.tooltip.classList.remove("hidden"); overview.tooltip.setAttribute("aria-hidden", "false");
+  overview.hoverGroupId = groupId; positionActionTimelineOverviewTooltip(overview, clientX, clientY);
+  overview.hoverPath.setAttribute("d", timelineOverviewItemPaths(overview, item).highlight);
+}
+function actionTimelineOverviewHit(view, event) {
+  const overview = view && view.overview, model = overview && overview.model;
+  if (!overview || !model || !model.items.length) return null;
+  const rect = overview.svg.getBoundingClientRect(); if (!rect.width || !rect.height) return null;
+  const x = Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, (event.clientX - rect.left) / rect.width * ACTION_TIMELINE_OVERVIEW_WIDTH));
+  const y = Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_HEIGHT - .0001, (event.clientY - rect.top) / rect.height * ACTION_TIMELINE_OVERVIEW_HEIGHT));
+  const rank = Math.floor(y / ACTION_TIMELINE_OVERVIEW_HEIGHT * model.laneCount);
+  const radius = Math.min(256, Math.max(2, Math.ceil(5 / rect.height * model.laneCount)));
+  const tolerance = 6 / rect.width * ACTION_TIMELINE_OVERVIEW_WIDTH;
+  let best = null, bestDistance = Infinity;
+  for (let candidateRank = Math.max(0, rank - radius); candidateRank <= Math.min(model.laneCount - 1, rank + radius); candidateRank += 1) {
+    // A search compresses the SVG lanes to matching records.  Resolve the
+    // lane from that painted model, never from the unfiltered loaded array.
+    const item = model.items[candidateRank];
+    if (!item) continue;
+    const markerAt = item.markerAt != null ? item.markerAt : item.pointAt;
+    const markerX = markerAt == null ? null : timelineOverviewTimeToX(overview, markerAt);
+    const onMarker = markerX != null && Math.abs(markerX - x) <= tolerance;
+    const onSegment = item.segments.some(segment => {
+      const x1 = timelineOverviewTimeToX(overview, segment.start), x2 = timelineOverviewTimeToX(overview, segment.end);
+      return x1 != null && x2 != null && x >= Math.min(x1, x2) - tolerance && x <= Math.max(x1, x2) + tolerance;
+    });
+    const distance = Math.abs(candidateRank - rank);
+    if ((onMarker || onSegment) && distance < bestDistance) { best = item; bestDistance = distance; }
+  }
+  return best;
+}
+function actionTimelineOverviewPointerMove(view, event) {
+  const overview = view && view.overview; if (!overview) return;
+  cancelActionTimelineOverviewHoverClear(view);
+  if (overview.gesture) { moveActionTimelineOverviewGesture(view, event); return; }
+  const hit = actionTimelineOverviewHit(view, event), groupId = hit && hit.groupId;
+  // Once visible, keep the tooltip at its original anchor so a magnification
+  // user can actually catch it. Moving across compressed lanes on the way to
+  // the tooltip gets a short grace period; stopping elsewhere dismisses it.
+  if (overview.hoverGroupId) {
+    if (groupId === overview.hoverGroupId) return;
+    scheduleActionTimelineOverviewHoverClear(view); return;
+  }
+  if (!groupId) { clearActionTimelineOverviewHover(view); return; }
+  if (overview.hoverCandidateId === groupId) {
+    overview.hoverPoint = { clientX: event.clientX, clientY: event.clientY };
+    return;
+  }
+  clearActionTimelineOverviewHover(view); overview.hoverCandidateId = groupId;
+  overview.hoverPoint = { clientX: event.clientX, clientY: event.clientY };
+  overview.hoverTimer = setTimeout(() => {
+    overview.hoverTimer = 0;
+    const point = overview.hoverPoint || { clientX: event.clientX, clientY: event.clientY };
+    showActionTimelineOverviewTooltip(view, groupId, point.clientX, point.clientY);
+  }, ACTION_TIMELINE_OVERVIEW_HOVER_DELAY);
+}
+function timelineOverviewEventX(overview, event) {
+  const rect = overview.svg.getBoundingClientRect();
+  if (!rect.width) return 0;
+  return Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, (event.clientX - rect.left) / rect.width * ACTION_TIMELINE_OVERVIEW_WIDTH));
+}
+function timelineOverviewXToTime(overview, x) {
+  if (overview.viewStart == null || overview.viewEnd == null) return null;
+  if (overview.viewStart === overview.viewEnd) return overview.viewStart;
+  const ratio = Math.max(0, Math.min(1, x / ACTION_TIMELINE_OVERVIEW_WIDTH));
+  return overview.viewStart + ratio * (overview.viewEnd - overview.viewStart);
+}
+function timelineOverviewXToDomainTime(start, end, x) {
+  if (start == null || end == null) return null;
+  if (start === end) return start;
+  const ratio = Math.max(0, Math.min(1, x / ACTION_TIMELINE_OVERVIEW_WIDTH));
+  return start + ratio * (end - start);
+}
+// A time filter is a question about when an action happened, not about whether
+// the chart could paint it. Permission decisions, native tool calls, delegates
+// and finalize groups carry no execution attempt, so they have no span — they
+// are still real actions with a real timestamp, and dropping them would hide
+// the control plane from the surface whose whole job is to show it.
+function actionTimelineSelectionOverlaps(item, selection, group = null) {
+  if (!selection) return true;
+  const left = Math.min(selection.start, selection.end), right = Math.max(selection.start, selection.end);
+  if (item) return item.start <= right && item.end >= left;
+  const createdAt = timelineEpochMs(group && group.created_at);
+  return createdAt != null && createdAt >= left && createdAt <= right;
+}
+function normalizeActionTimelineSearch(value) {
+  return String(value || "").trim().toLocaleLowerCase();
+}
+function actionTimelineSearchDocument(group) {
+  // The placeholder promises the Kind column, so index the label the row
+  // actually shows. group.kind is the raw server token ("code"); the displayed
+  // kind is derived from it plus language and event types ("python" ->
+  // "Python Cell"), so indexing the raw value alone left the visible text
+  // unsearchable. Keep the raw token too — it is what the ledger stores.
+  const kind = timelineKind(group || {});
+  const fields = [group && group.title, group && group.kind, kind, t("timeline.kind." + kind)];
+  ((group && group.events) || []).forEach(event => {
+    (event.resource_keys || []).forEach(value => fields.push(value));
+    (event.artifacts || []).forEach(value => fields.push(value));
+  });
+  return fields.filter(value => value != null && value !== "").map(value => String(value).toLocaleLowerCase()).join("\u0000");
+}
+function syncActionTimelineSearchIndex(view, groups) {
+  const previous = view.searchIndex || new Map(), next = new Map();
+  groups.forEach(group => {
+    const cached = previous.get(group.group_id);
+    // The document carries a localized kind label, so it is language-scoped.
+    next.set(group.group_id, cached && cached.group === group && cached.lang === LANG
+      ? cached : { group, lang: LANG, text: actionTimelineSearchDocument(group) });
+  });
+  view.searchIndex = next;
+}
+function searchActionTimelineGroups(view, groups) {
+  syncActionTimelineSearchIndex(view, groups);
+  if (!view.searchNeedle) return groups;
+  return groups.filter(group => {
+    const indexed = view.searchIndex.get(group.group_id);
+    return !!indexed && indexed.text.includes(view.searchNeedle);
+  });
+}
+function filteredActionTimelineGroups(view, groups) {
+  const selection = view && view.overview && view.overview.selection;
+  if (!selection) return groups;
+  return groups.filter(group => actionTimelineSelectionOverlaps(view.overview.model.byId.get(group.group_id), selection, group));
+}
+function actionTimelineTurnStats(groups) {
+  let totalMs = 0, hasDuration = false, hasRunning = false;
+  groups.forEach(group => {
+    const attempt = latestActionTimelineAttempt(group), duration = timelineDurationMs(attempt);
+    if (duration !== "") { totalMs += duration; hasDuration = true; }
+    if (attempt && timelineEpochMs(attempt.finished_at) == null) hasRunning = true;
+  });
+  const duration = hasDuration ? (hasRunning ? "≥ " : "") + timelineDurationValue(totalMs) : "—";
+  return { count: groups.length, totalMs: hasDuration ? totalMs : null, hasRunning, duration };
+}
+function actionTimelineLedgerEntries(view, groups) {
+  const turns = new Map();
+  groups.forEach(group => {
+    const turnId = publicText(group.turn_id, 96); if (!turnId) return;
+    if (!turns.has(turnId)) turns.set(turnId, []);
+    turns.get(turnId).push(group);
+  });
+  const stats = new Map(); turns.forEach((turnGroups, turnId) => stats.set(turnId, actionTimelineTurnStats(turnGroups)));
+  const entries = [], emittedCollapsed = new Set(), searchActive = !!view.searchNeedle;
+  groups.forEach((group, index) => {
+    const turnId = publicText(group.turn_id, 96);
+    const previousTurnId = index > 0 ? publicText(groups[index - 1].turn_id, 96) : "";
+    const turnStart = index === 0 || previousTurnId !== turnId;
+    const turnBoundary = index > 0 && previousTurnId !== turnId;
+    // Search temporarily reveals every matching action so its announced match
+    // count equals the ledger rows.  The Set is retained and takes effect
+    // again as soon as the query is cleared.
+    if (!searchActive && turnId && view.collapsedTurns.has(turnId)) {
+      if (emittedCollapsed.has(turnId)) return;
+      emittedCollapsed.add(turnId);
+      entries.push({ type: "turn", turnId, groups: turns.get(turnId), stats: stats.get(turnId), turnBoundary });
+      return;
+    }
+    entries.push({ type: "group", group, turnId, turnStart, turnBoundary, stats: turnId ? stats.get(turnId) : null, foldable: !!turnId && !searchActive });
+  });
+  return entries;
+}
+function actionTimelineEntryKey(entry) {
+  return !entry ? "" : (entry.type === "turn" ? "turn:" + entry.turnId : "group:" + entry.group.group_id);
+}
+// `display:none` destroys the scrolling box, so a hidden ledger reports
+// scrollTop 0 and offsetHeight 0. Snapshotting it live would anchor every
+// off-tab restore to the first entry with a fabricated -30px offset, so read
+// through the cached values whenever the pane has no layout box.
+function actionTimelineLiveScrollTop(view) {
+  return view.scroll.clientHeight > 0 ? view.scroll.scrollTop : view.scrollTop;
+}
+function actionTimelineHeaderHeight(view) {
+  const measured = view.thead.offsetHeight;
+  if (measured > 0) { view.headerHeight = measured; return measured; }
+  return view.headerHeight || 30;
+}
+function actionTimelineFilterScrollSnapshot(view) {
+  const headerHeight = actionTimelineHeaderHeight(view), scrollTop = actionTimelineLiveScrollTop(view);
+  const entries = view.entries || [], index = Math.max(0, Math.min(entries.length - 1, Math.floor(Math.max(0, scrollTop - headerHeight) / ACTION_TIMELINE_ROW_HEIGHT)));
+  const entry = entries[index];
+  return {
+    entryKey: actionTimelineEntryKey(entry),
+    groupId: entry && entry.type === "group" ? entry.group.group_id : null,
+    turnId: entry && (entry.turnId || (entry.group && entry.group.turn_id)),
+    offset: scrollTop - (headerHeight + index * ACTION_TIMELINE_ROW_HEIGHT),
+    followTail: view.followTail
+  };
+}
+function syncActionTimelineOverviewDecorations(view) {
+  const overview = view.overview, activeSelection = overview.draftSelection || overview.selection;
+  const selected = overview.model.byId.get(S.actionTimelineSelectedGroupId);
+  overview.selectedPath.setAttribute("d", selected ? timelineOverviewItemPaths(overview, selected).highlight : "");
+  if (activeSelection && overview.viewStart != null && overview.viewEnd != null) {
+    const x1 = timelineOverviewTimeToX(overview, Math.min(activeSelection.start, activeSelection.end));
+    const x2 = timelineOverviewTimeToX(overview, Math.max(activeSelection.start, activeSelection.end));
+    const left = Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, x1));
+    const right = Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, x2));
+    overview.selectionRect.setAttribute("x", String(Math.min(left, right)));
+    overview.selectionRect.setAttribute("width", String(Math.abs(right - left)));
+    overview.selectionRect.classList.remove("hidden");
+  } else {
+    overview.selectionRect.classList.add("hidden"); overview.selectionRect.setAttribute("width", "0");
+  }
+  if (overview.selection) {
+    overview.selectionStatus.textContent = t("timeline.overview.selection", timelineOverviewExactTime(overview.selection.start), timelineOverviewExactTime(overview.selection.end));
+    overview.clearButton.classList.remove("hidden"); overview.clearButton.disabled = false;
+  } else {
+    overview.selectionStatus.textContent = ""; overview.clearButton.classList.add("hidden"); overview.clearButton.disabled = true;
+  }
+}
+function syncActionTimelineOverviewControls(view) {
+  const overview = view && view.overview, timeline = S.actionTimeline || {};
+  if (!overview) return;
+  const span = overview.viewStart != null && overview.viewEnd != null ? Math.max(0, overview.viewEnd - overview.viewStart) : 0;
+  const tolerance = span / ACTION_TIMELINE_OVERVIEW_WIDTH;
+  const includesLoadedStart = overview.dataStart != null && overview.viewStart != null && overview.viewEnd != null &&
+    overview.viewStart <= overview.dataStart + tolerance && overview.viewEnd >= overview.dataStart - tolerance;
+  // A page made entirely of non-attempt groups has no honest time coordinate.
+  // Keep the omission visible at the left edge without inventing a duration.
+  const visible = !!timeline.has_more_before && (overview.dataStart == null || includesLoadedStart);
+  const loading = actionTimelineHistoryIsLoading(timeline);
+  const restoreFocus = !visible && document.activeElement === overview.prefixButton;
+  const restoreAfterLoad = !!overview.restoreFocusAfterPrefix && !loading;
+  overview.prefixButton.classList.toggle("hidden", !visible); overview.prefixButton.disabled = !visible || loading;
+  overview.prefixButton.setAttribute("aria-busy", loading ? "true" : "false");
+  overview.prefixButton.setAttribute("aria-label", t(loading ? "timeline.overview.omittedLoading" : "timeline.overview.omitted"));
+  const x = overview.dataStart == null ? 0 : timelineOverviewTimeToX(overview, overview.dataStart);
+  overview.prefixButton.style.left = Math.max(0, Math.min(100, (x == null ? 0 : x / ACTION_TIMELINE_OVERVIEW_WIDTH * 100))) + "%";
+  if (restoreFocus || restoreAfterLoad) {
+    overview.restoreFocusAfterPrefix = false;
+    const target = visible ? overview.prefixButton : overview.shell;
+    try { target.focus({ preventScroll: true }); } catch { target.focus(); }
+  }
+}
+function clearActionTimelineOverviewSelection(view, options = {}) {
+  const overview = view && view.overview; if (!overview || (!overview.selection && !overview.draftSelection)) return false;
+  const restoreControlFocus = document.activeElement === overview.clearButton;
+  overview.selection = null; overview.draftSelection = null;
+  const restore = options.restore !== false && !view.searchNeedle ? view.preFilterScroll : null;
+  if (!view.searchNeedle) view.preFilterScroll = null;
+  view.autoLoadArmed = false; clearActionTimelineOverviewHover(view);
+  if (options.update !== false) updateActionTimelineLedger({ direction: "filter", filterChanged: true, filterRestore: restore });
+  else syncActionTimelineOverviewDecorations(view);
+  if (restoreControlFocus) { try { overview.shell.focus({ preventScroll: true }); } catch { overview.shell.focus(); } }
+  return true;
+}
+function commitActionTimelineOverviewSelection(view, start, end) {
+  const overview = view && view.overview;
+  if (!overview || start == null || end == null) return;
+  if (!overview.selection && !view.searchNeedle) view.preFilterScroll = actionTimelineFilterScrollSnapshot(view);
+  overview.selection = { start: Math.floor(Math.min(start, end)), end: Math.ceil(Math.max(start, end)) };
+  overview.draftSelection = null; view.autoLoadArmed = false; clearActionTimelineOverviewHover(view);
+  updateActionTimelineLedger({ direction: "filter", filterChanged: true });
+}
+function selectActionTimelineGroup(groupId, branchScope, fromOverview = false) {
+  const view = S._timelineView;
+  const targetGroup = view && view.allGroups.find(group => group.group_id === groupId);
+  if (!view || !groupId || !targetGroup) return;
+  let filterChanged = false, filterRestore = null;
+  if (fromOverview && view.overview.selection && !view.groups.some(group => group.group_id === groupId)) {
+    filterChanged = clearActionTimelineOverviewSelection(view, { update: false, restore: false });
+  }
+  if (fromOverview && targetGroup.turn_id && view.collapsedTurns.has(targetGroup.turn_id) && !view.searchNeedle) {
+    filterRestore = actionTimelineFilterScrollSnapshot(view); view.collapsedTurns.delete(targetGroup.turn_id); filterChanged = true;
+  }
+  S._timelineRestoreFocusGroupId = groupId; S.actionTimelineSelectedGroupId = groupId; S.actionTimelineSelectedBranchId = branchScope;
+  updateActionTimelineLedger({ direction: "selection", filterChanged, filterRestore });
+  if (fromOverview) {
+    const current = S._timelineView, index = current && current.groups.findIndex(group => group.group_id === groupId);
+    if (current && index >= 0) focusActionTimelineGroup(current, index);
+  } else {
+    const current = S._timelineView; revealActionTimelineOverviewGroup(current, groupId);
+    const close = current && current.inspectorHost.querySelector(".timeline-inspector button");
+    if (close) { try { close.focus({ preventScroll: true }); } catch { close.focus(); } }
+  }
+}
+function revealActionTimelineOverviewGroup(view, groupId) {
+  const overview = view && view.overview, item = overview && overview.model.byId.get(groupId);
+  if (!item || overview.viewStart == null || overview.viewEnd == null || overview.dataStart == null || overview.dataEnd == null) return;
+  const extent = actionTimelineOverviewVisualExtent(item); if (!extent) return;
+  const itemStart = extent.start, itemEnd = extent.end;
+  if (itemEnd >= overview.viewStart && itemStart <= overview.viewEnd) return;
+  const domainSpan = overview.dataEnd - overview.dataStart, currentSpan = overview.viewEnd - overview.viewStart;
+  if (domainSpan <= 0 || currentSpan <= 0) return;
+  const span = Math.min(domainSpan, Math.max(currentSpan, itemEnd - itemStart));
+  const center = itemStart + (itemEnd - itemStart) / 2;
+  const start = Math.max(overview.dataStart, Math.min(center - span / 2, overview.dataEnd - span));
+  overview.viewStart = start; overview.viewEnd = start + span; renderActionTimelineOverviewPaths(view);
+}
+function beginActionTimelineOverviewGesture(view, event) {
+  const overview = view && view.overview;
+  const button = event.button === 2 || (event.button === 0 && event.ctrlKey) ? 2 : event.button;
+  if (!overview || ![0, 2].includes(button) || overview.viewStart == null || overview.viewEnd == null) return;
+  clearActionTimelineOverviewHover(view);
+  const x = timelineOverviewEventX(overview, event), time = timelineOverviewXToTime(overview, x);
+  const hit = button === 0 ? actionTimelineOverviewHit(view, event) : null;
+  overview.gesture = { pointerId: event.pointerId, button, startClientX: event.clientX, startX: x, startTime: time, lastTime: time,
+    startViewStart: overview.viewStart, startViewEnd: overview.viewEnd, dragging: false, hitGroupId: hit && hit.groupId };
+  try { overview.svg.setPointerCapture(event.pointerId); } catch {}
+  event.preventDefault();
+}
+function moveActionTimelineOverviewGesture(view, event) {
+  const overview = view && view.overview, gesture = overview && overview.gesture;
+  if (!gesture || gesture.pointerId !== event.pointerId) return;
+  const x = timelineOverviewEventX(overview, event);
+  const time = timelineOverviewXToDomainTime(gesture.startViewStart, gesture.startViewEnd, x);
+  if (!gesture.dragging && Math.abs(event.clientX - gesture.startClientX) >= 4) gesture.dragging = true;
+  gesture.lastTime = time;
+  if (gesture.dragging && gesture.button === 0) {
+    overview.draftSelection = { start: Math.floor(Math.min(gesture.startTime, time)), end: Math.ceil(Math.max(gesture.startTime, time)) };
+    syncActionTimelineOverviewDecorations(view);
+  } else if (gesture.dragging && gesture.button === 2) {
+    const rect = overview.svg.getBoundingClientRect(), span = gesture.startViewEnd - gesture.startViewStart, domainSpan = overview.dataEnd - overview.dataStart;
+    if (rect.width && span > 0 && span < domainSpan) {
+      const shifted = gesture.startViewStart - (event.clientX - gesture.startClientX) / rect.width * span;
+      overview.viewStart = Math.max(overview.dataStart, Math.min(shifted, overview.dataEnd - span)); overview.viewEnd = overview.viewStart + span;
+      scheduleActionTimelineOverviewPaths(view);
+    }
+  }
+  event.preventDefault();
+}
+function finishActionTimelineOverviewGesture(view, event) {
+  const overview = view && view.overview, gesture = overview && overview.gesture;
+  if (!gesture || gesture.pointerId !== event.pointerId) return;
+  overview.gesture = null;
+  try { overview.svg.releasePointerCapture(event.pointerId); } catch {}
+  if (gesture.button === 0 && gesture.dragging) commitActionTimelineOverviewSelection(view, gesture.startTime, gesture.lastTime);
+  else if (gesture.button === 0 && gesture.hitGroupId) selectActionTimelineGroup(gesture.hitGroupId, view.branchId, true);
+  else if (gesture.button === 2 && !gesture.dragging) clearActionTimelineOverviewSelection(view);
+  else { overview.draftSelection = null; syncActionTimelineOverviewDecorations(view); }
+  event.preventDefault();
+}
+function cancelActionTimelineOverviewGesture(view, event) {
+  const overview = view && view.overview, gesture = overview && overview.gesture;
+  if (!gesture || (event && gesture.pointerId !== event.pointerId)) return;
+  overview.gesture = null; overview.draftSelection = null; syncActionTimelineOverviewDecorations(view);
+}
+function renderActionTimelineOverviewPaths(view) {
+  const overview = view.overview, model = overview.model;
+  if (!overview || !model) return;
+  const aggregate = { queue: "", ttft: "", decode: "", marker: "", point: "" };
+  model.items.forEach(item => {
+    const paths = timelineOverviewItemPaths(overview, item);
+    Object.keys(aggregate).forEach(key => { aggregate[key] += paths[key]; });
+  });
+  overview.queuePath.setAttribute("d", aggregate.queue); overview.ttftPath.setAttribute("d", aggregate.ttft);
+  overview.decodePath.setAttribute("d", aggregate.decode); overview.markerPath.setAttribute("d", aggregate.marker);
+  overview.pointPath.setAttribute("d", aggregate.point); syncActionTimelineOverviewDecorations(view);
+  if (overview.hoverGroupId && !model.byId.has(overview.hoverGroupId)) clearActionTimelineOverviewHover(view);
+  else if (overview.hoverGroupId) {
+    const point = overview.hoverPoint;
+    if (point) showActionTimelineOverviewTooltip(view, overview.hoverGroupId, point.clientX, point.clientY);
+    else overview.hoverPath.setAttribute("d", timelineOverviewItemPaths(overview, model.byId.get(overview.hoverGroupId)).highlight);
+  }
+  const axisTime = value => value == null ? "—" : new Date(Math.round(value)).toISOString();
+  const startText = axisTime(overview.viewStart), endText = axisTime(overview.viewEnd);
+  overview.axisStart.textContent = startText === "—" ? startText : startText.slice(11, 23); overview.axisStart.title = startText;
+  overview.axisEnd.textContent = endText === "—" ? endText : endText.slice(11, 23); overview.axisEnd.title = endText;
+  overview.shell.dataset.viewStart = overview.viewStart == null ? "" : String(Math.round(overview.viewStart));
+  overview.shell.dataset.viewEnd = overview.viewEnd == null ? "" : String(Math.round(overview.viewEnd));
+  syncActionTimelineOverviewControls(view);
+}
+function scheduleActionTimelineOverviewPaths(view) {
+  const overview = view && view.overview;
+  if (!overview || view !== S._timelineView || overview.raf) return;
+  overview.raf = requestAnimationFrame(() => {
+    overview.raf = 0;
+    if (view === S._timelineView && overview.shell.isConnected) renderActionTimelineOverviewPaths(view);
+  });
+}
+function actionTimelineOverviewZoomAt(view, factor, anchorRatio) {
+  const overview = view && view.overview;
+  if (!overview || overview.dataStart == null || overview.dataEnd == null || overview.viewStart == null || overview.viewEnd == null) return false;
+  const domainSpan = overview.dataEnd - overview.dataStart, currentSpan = overview.viewEnd - overview.viewStart;
+  if (domainSpan <= 0 || currentSpan <= 0 || !Number.isFinite(factor) || factor <= 0) return false;
+  const minSpan = Math.max(1, domainSpan / 1000), nextSpan = Math.max(minSpan, Math.min(domainSpan, currentSpan * factor));
+  if (Math.abs(nextSpan - currentSpan) < .001) return false;
+  const ratio = Math.max(0, Math.min(1, anchorRatio)), anchor = overview.viewStart + currentSpan * ratio;
+  let start = anchor - nextSpan * ratio;
+  start = Math.max(overview.dataStart, Math.min(start, overview.dataEnd - nextSpan));
+  overview.viewStart = start; overview.viewEnd = start + nextSpan; clearActionTimelineOverviewHover(view); scheduleActionTimelineOverviewPaths(view);
+  return true;
+}
+function actionTimelineOverviewPanBy(view, delta) {
+  const overview = view && view.overview;
+  if (!overview || overview.dataStart == null || overview.dataEnd == null || overview.viewStart == null || overview.viewEnd == null) return false;
+  const span = overview.viewEnd - overview.viewStart, domainSpan = overview.dataEnd - overview.dataStart;
+  if (span <= 0 || span >= domainSpan || !Number.isFinite(delta)) return false;
+  const start = Math.max(overview.dataStart, Math.min(overview.viewStart + delta, overview.dataEnd - span));
+  if (Math.abs(start - overview.viewStart) < .001) return false;
+  overview.viewStart = start; overview.viewEnd = start + span; clearActionTimelineOverviewHover(view); scheduleActionTimelineOverviewPaths(view);
+  return true;
+}
+function actionTimelineOverviewWheel(view, event) {
+  const overview = view && view.overview; if (!overview || !event.deltaY) return;
+  const rect = overview.svg.getBoundingClientRect(); if (!rect.width) return;
+  const unit = event.deltaMode === 1 ? 16 : (event.deltaMode === 2 ? rect.height : 1);
+  const factor = Math.exp(event.deltaY * unit * .0015), ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  if (actionTimelineOverviewZoomAt(view, factor, ratio)) event.preventDefault();
+}
+function showActionTimelineOverviewKeyboardItem(view, groupId) {
+  const overview = view && view.overview, item = overview && overview.model.byId.get(groupId);
+  if (!item) return false;
+  revealActionTimelineOverviewGroup(view, groupId); clearActionTimelineOverviewHover(view);
+  overview.keyboardGroupId = groupId; overview.hoverCandidateId = groupId;
+  const rect = overview.svg.getBoundingClientRect();
+  const extent = actionTimelineOverviewVisualExtent(item);
+  const anchorTime = extent ? extent.start + (extent.end - extent.start) / 2 : item.start;
+  const rawX = timelineOverviewTimeToX(overview, anchorTime);
+  const point = {
+    clientX: rect.left + Math.max(0, Math.min(ACTION_TIMELINE_OVERVIEW_WIDTH, rawX == null ? 0 : rawX)) / ACTION_TIMELINE_OVERVIEW_WIDTH * rect.width,
+    clientY: rect.top + (item.rank + .5) / item.laneCount * rect.height
+  };
+  overview.hoverPoint = point; showActionTimelineOverviewTooltip(view, groupId, point.clientX, point.clientY);
+  return true;
+}
+function actionTimelineOverviewKeydown(view, event) {
+  const overview = view && view.overview; if (!overview) return;
+  if (event.target !== overview.shell && event.target.closest && event.target.closest("button")) return;
+  if (event.key === "Escape") {
+    if (overview.selection) clearActionTimelineOverviewSelection(view); else clearActionTimelineOverviewHover(view);
+    event.preventDefault(); return;
+  }
+  const items = overview.model.items;
+  if (["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key) && items.length) {
+    const current = Math.max(0, items.findIndex(item => item.groupId === overview.keyboardGroupId));
+    const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 :
+      Math.max(0, Math.min(items.length - 1, current + (event.key === "ArrowUp" ? -1 : 1)));
+    event.preventDefault(); showActionTimelineOverviewKeyboardItem(view, items[next].groupId); return;
+  }
+  if (event.key === "Enter" && overview.keyboardGroupId) {
+    const item = overview.model.byId.get(overview.keyboardGroupId); if (!item) return;
+    event.preventDefault();
+    if (event.shiftKey) commitActionTimelineOverviewSelection(view, item.start, item.end);
+    else {
+      selectActionTimelineGroup(item.groupId, view.branchId, true);
+      const close = view.inspectorHost.querySelector(".timeline-inspector button");
+      if (close) { try { close.focus({ preventScroll: true }); } catch { close.focus(); } }
+    }
+    return;
+  }
+  if (event.key === "+" || event.key === "=") { if (actionTimelineOverviewZoomAt(view, .75, .5)) event.preventDefault(); return; }
+  if (event.key === "-") { if (actionTimelineOverviewZoomAt(view, 4 / 3, .5)) event.preventDefault(); return; }
+  const span = overview.viewEnd != null && overview.viewStart != null ? overview.viewEnd - overview.viewStart : 0;
+  if (event.key === "ArrowLeft" && actionTimelineOverviewPanBy(view, -span * .1)) event.preventDefault();
+  else if (event.key === "ArrowRight" && actionTimelineOverviewPanBy(view, span * .1)) event.preventDefault();
+}
+function drawActionTimelineOverview(view, groups, force = false, domainGroups = groups) {
+  const overview = view.overview, model = actionTimelineOverviewModel(groups, domainGroups);
+  const previousStart = overview.dataStart, previousEnd = overview.dataEnd;
+  const wasFull = !overview.initialized || (overview.viewStart === previousStart && overview.viewEnd === previousEnd);
+  overview.model = model; overview.dataStart = model.dataStart; overview.dataEnd = model.dataEnd;
+  if (!overview.gesture && (!overview.initialized || wasFull)) {
+    overview.viewStart = model.dataStart; overview.viewEnd = model.dataEnd; overview.initialized = model.dataStart != null;
+  } else if (!overview.gesture && model.dataStart != null && model.dataEnd != null) {
+    const span = Math.max(0, overview.viewEnd - overview.viewStart);
+    overview.viewStart = Math.max(model.dataStart, Math.min(overview.viewStart, model.dataEnd - span));
+    overview.viewEnd = Math.min(model.dataEnd, overview.viewStart + span);
+  }
+  renderActionTimelineOverviewPaths(view);
+  overview.shell.dataset.itemCount = String(model.items.length);
+  overview.label.textContent = t("timeline.overview"); overview.svg.setAttribute("aria-label", t("timeline.overview")); overview.help.textContent = t("timeline.overview.help"); overview.keyboardHelp.textContent = t("timeline.overview.keyboard");
+  overview.clearButton.textContent = t("timeline.overview.clear"); overview.clearButton.setAttribute("aria-label", t("timeline.overview.clear"));
+  [[overview.zoomInButton, "timeline.overview.zoomIn"], [overview.zoomOutButton, "timeline.overview.zoomOut"], [overview.panEarlierButton, "timeline.overview.panEarlier"], [overview.panLaterButton, "timeline.overview.panLater"]].forEach(([button, key]) => { button.title = t(key); button.setAttribute("aria-label", t(key)); });
+  overview.legendQueue.lastChild.textContent = t("timeline.overview.queue"); overview.legendTtft.lastChild.textContent = t("timeline.overview.ttft"); overview.legendDecode.lastChild.textContent = t("timeline.overview.decode");
+  overview.shell.classList.toggle("timeline-overview-empty", !model.items.length);
+  if ((overview.hoverGroupId && !model.byId.has(overview.hoverGroupId)) ||
+      (overview.hoverCandidateId && !model.byId.has(overview.hoverCandidateId))) clearActionTimelineOverviewHover(view);
+  if (overview.keyboardGroupId && !model.byId.has(overview.keyboardGroupId)) overview.keyboardGroupId = null;
+  if (force) clearActionTimelineOverviewHover(view);
+}
+function createActionTimelineOverview() {
+  const shell = el("section", "timeline-overview"); shell.tabIndex = 0; shell.setAttribute("aria-labelledby", "timeline-overview-label"); shell.setAttribute("aria-describedby", "timeline-overview-help timeline-overview-keyboard-help timeline-overview-tooltip");
+  const head = el("div", "timeline-overview-head"), label = el("div", "timeline-overview-label", t("timeline.overview")); label.id = "timeline-overview-label"; head.appendChild(label);
+  const legend = el("div", "timeline-overview-legend");
+  const legendItem = (className, text) => { const item = el("span", "timeline-overview-legend-item " + className); item.appendChild(el("i")); item.appendChild(el("span", null, text)); legend.appendChild(item); return item; };
+  const legendQueue = legendItem("queue", t("timeline.overview.queue"));
+  const legendTtft = legendItem("ttft", t("timeline.overview.ttft"));
+  const legendDecode = legendItem("decode", t("timeline.overview.decode")); head.appendChild(legend);
+  const clearButton = el("button", "timeline-overview-clear hidden", t("timeline.overview.clear")); clearButton.type = "button"; clearButton.disabled = true; clearButton.setAttribute("aria-label", t("timeline.overview.clear")); head.appendChild(clearButton); shell.appendChild(head);
+  const help = el("div", "timeline-overview-help", t("timeline.overview.help")); help.id = "timeline-overview-help"; shell.appendChild(help);
+  const keyboardHelp = el("div", "timeline-overview-keyboard-help", t("timeline.overview.keyboard")); keyboardHelp.id = "timeline-overview-keyboard-help"; shell.appendChild(keyboardHelp);
+  const selectionStatus = el("div", "timeline-overview-selection-status"); selectionStatus.setAttribute("aria-live", "polite"); shell.appendChild(selectionStatus);
+  const plot = el("div", "timeline-overview-plot");
+  const svg = svgElement("svg", { viewBox: `0 0 ${ACTION_TIMELINE_OVERVIEW_WIDTH} ${ACTION_TIMELINE_OVERVIEW_HEIGHT}`, preserveAspectRatio: "none", role: "img", "aria-label": t("timeline.overview") });
+  svg.appendChild(svgElement("rect", { class: "timeline-overview-background", x: 0, y: 0, width: ACTION_TIMELINE_OVERVIEW_WIDTH, height: ACTION_TIMELINE_OVERVIEW_HEIGHT }));
+  const queuePath = svgElement("path", { class: "timeline-overview-phase queue" });
+  const ttftPath = svgElement("path", { class: "timeline-overview-phase ttft" });
+  const decodePath = svgElement("path", { class: "timeline-overview-phase decode" });
+  const pointPath = svgElement("path", { class: "timeline-overview-point" });
+  const markerPath = svgElement("path", { class: "timeline-overview-running" });
+  const selectionRect = svgElement("rect", { class: "timeline-overview-selection hidden", x: 0, y: 0, width: 0, height: ACTION_TIMELINE_OVERVIEW_HEIGHT });
+  const selectedPath = svgElement("path", { class: "timeline-overview-highlight selected" });
+  const hoverPath = svgElement("path", { class: "timeline-overview-highlight hover" });
+  [queuePath, ttftPath, decodePath, pointPath, markerPath, selectionRect, selectedPath, hoverPath].forEach(node => svg.appendChild(node));
+  plot.appendChild(svg);
+  const prefixButton = el("button", "timeline-overview-prefix hidden", "…"); prefixButton.type = "button"; prefixButton.setAttribute("data-action", "load-omitted-timeline"); prefixButton.setAttribute("aria-label", t("timeline.overview.omitted")); prefixButton.setAttribute("aria-busy", "false"); plot.appendChild(prefixButton);
+  shell.appendChild(plot);
+  const tooltip = el("div", "timeline-overview-tooltip hidden"); tooltip.id = "timeline-overview-tooltip"; tooltip.setAttribute("role", "tooltip"); tooltip.setAttribute("aria-live", "polite"); tooltip.setAttribute("aria-hidden", "true"); shell.appendChild(tooltip);
+  const axis = el("div", "timeline-overview-axis"), axisStart = el("time"), axisEnd = el("time"), nav = el("div", "timeline-overview-nav");
+  const navButton = (text, key) => { const button = el("button", "timeline-overview-nav-button", text); button.type = "button"; button.title = t(key); button.setAttribute("aria-label", t(key)); nav.appendChild(button); return button; };
+  const panEarlierButton = navButton("←", "timeline.overview.panEarlier"), zoomOutButton = navButton("−", "timeline.overview.zoomOut");
+  const zoomInButton = navButton("+", "timeline.overview.zoomIn"), panLaterButton = navButton("→", "timeline.overview.panLater");
+  axis.appendChild(axisStart); axis.appendChild(nav); axis.appendChild(axisEnd); shell.appendChild(axis);
+  return { shell, head, label, help, keyboardHelp, selectionStatus, clearButton, plot, svg, prefixButton, tooltip, axis, axisStart, axisEnd, nav, zoomInButton, zoomOutButton, panEarlierButton, panLaterButton, queuePath, ttftPath, decodePath, pointPath, markerPath, selectionRect, selectedPath, hoverPath,
+    legendQueue, legendTtft, legendDecode, model: actionTimelineOverviewModel([]), dataStart: null, dataEnd: null,
+    viewStart: null, viewEnd: null, initialized: false, selection: null, draftSelection: null, gesture: null,
+    hoverTimer: 0, hoverLeaveTimer: 0, tooltipHovered: false, hoverCandidateId: null, hoverGroupId: null, hoverPoint: null, keyboardGroupId: null, restoreFocusAfterPrefix: false, raf: 0 };
+}
+function actionTimelineTurnToggle(turnId, stats, expanded, view) {
+  const label = t(expanded ? "timeline.turn.collapse" : "timeline.turn.expand", shortRuntime(turnId), stats.count, stats.duration);
+  const button = el("button", "timeline-turn-toggle"); button.type = "button"; button.dataset.turnId = turnId;
+  button.setAttribute("aria-expanded", expanded ? "true" : "false"); button.setAttribute("aria-label", label); button.title = label;
+  const chevron = el("span", "timeline-turn-chevron", expanded ? "▾" : "▸"); chevron.setAttribute("aria-hidden", "true"); button.appendChild(chevron);
+  button.appendChild(el("span", "timeline-turn-marker", t("timeline.turnBoundary")));
+  button.onclick = event => { event.stopPropagation(); toggleActionTimelineTurn(view, turnId); };
+  return button;
+}
+function actionTimelineLedgerRow(group, reusableRow, turnBoundary, selected, branchScope, firstRow = false, options = {}) {
+  const kind = timelineKind(group), status = String(group.status || "completed").toLowerCase();
+  const statusClass = status.replace(/[^a-z0-9_-]/g, "-") || "completed";
+  const row = reusableRow || el("tr", "timeline-ledger-row");
+  row.className = "timeline-ledger-row kind-" + kind + " status-" + statusClass + (turnBoundary ? " turn-boundary" : "") + (selected ? " selected" : "") + (firstRow ? " timeline-first-row" : "") + (options.searchMatch ? " search-match" : "");
+  row.setAttribute("role", "row");
+  row.dataset.groupId = group.group_id; row.dataset.turnId = group.turn_id || ""; row.dataset.actionKind = kind;
+  row.dataset.status = statusClass;
+  const ordinal = timelineOrdinal(group.ordinal), ordinalText = ordinal == null ? "—" : String(ordinal);
+  row.replaceChildren();
+  const cell = className => { const node = el("td", className); node.setAttribute("role", "cell"); return node; };
+  const ordinalCell = cell("timeline-ledger-ordinal");
+  if (options.turnStart) {
+    if (options.foldable && options.stats) ordinalCell.appendChild(actionTimelineTurnToggle(options.turnId, options.stats, true, S._timelineView));
+    else ordinalCell.appendChild(el("span", "timeline-turn-marker", t("timeline.turnBoundary")));
+  }
+  ordinalCell.appendChild(el("span", "timeline-ordinal-value", "#" + ordinalText)); row.appendChild(ordinalCell);
+  const kindCell = cell("timeline-ledger-kind"); const kindIcon = el("span", "timeline-kind-icon");
+  kindIcon.title = t("timeline.kind." + kind); kindIcon.setAttribute("aria-hidden", "true"); kindIcon.appendChild(iconEl(timelineKindIcon(kind), 15)); kindCell.appendChild(kindIcon);
+  kindCell.appendChild(el("span", "timeline-kind-label", t("timeline.kind." + kind))); row.appendChild(kindCell);
+  const title = group.title || t("timeline.kind." + kind), titleCell = cell("timeline-ledger-title");
+  // Status was color on a 15px glyph and nothing else, so cancelled, pending,
+  // running and recorded rows were pixel-identical to completed and no
+  // accessible name carried the state. Anything that is not a plain completion
+  // gets text, in the row and in its accessible name.
+  const statusText = publicText(status || "completed", 32);
+  const statusNoteworthy = statusClass !== "completed" && statusClass !== "recorded";
+  if (statusNoteworthy) titleCell.appendChild(el("span", "timeline-ledger-status timeline-status " + statusClass, statusText));
+  const titleButton = el("button", "timeline-row-button", title); titleButton.type = "button";
+  const latest = latestActionTimelineAttempt(group), rowError = latest && latest.error;
+  titleButton.title = rowError ? title + " — " + rowError : title;
+  titleButton.setAttribute("aria-label", statusNoteworthy
+    ? t("timeline.row.open", ordinalText, title) + " · " + statusText + (rowError ? " · " + rowError : "")
+    : t("timeline.row.open", ordinalText, title));
+  titleButton.setAttribute("aria-expanded", selected ? "true" : "false");
+  if (selected) titleButton.setAttribute("aria-controls", "timeline-action-inspector");
+  titleCell.appendChild(titleButton); row.appendChild(titleCell);
+  // Only the two scalars are needed here; actionTimelineDetails also walks
+  // every event and de-dupes resources/artifacts with Array.includes, and the
+  // row discarded all of it.
+  const durationCell = cell("timeline-ledger-duration"); durationCell.textContent = timelineDuration(latest) || "—"; row.appendChild(durationCell);
+  // An absent usage row means unknown, not zero. The server returns null for
+  // every group that carried no model reply, and a fabricated 0 is
+  // indistinguishable from a real one.
+  const tokens = cell("timeline-ledger-tokens");
+  tokens.textContent = group.usage ? String(timelineTokenTotal(group.usage)) : "—";
+  if (group.usage) tokens.title = t("timeline.tokensValue", (group.usage || {}).input_tokens || 0, (group.usage || {}).output_tokens || 0);
+  row.appendChild(tokens);
+  const groupId = group.group_id;
+  row.onclick = () => selectActionTimelineGroup(groupId, branchScope, false);
+  row._timelineGroup = group; row._timelineTurnBoundary = turnBoundary; row._timelineSelected = selected;
+  row._timelineBranchScope = branchScope; row._timelineLanguage = LANG; row._timelineFirstRow = firstRow;
+  row._timelineTurnStart = !!options.turnStart; row._timelineTurnSignature = options.stats ? options.stats.count + ":" + options.stats.duration : "";
+  row._timelineFoldable = !!options.foldable; row._timelineSearchMatch = !!options.searchMatch;
+  return row;
+}
+function actionTimelineTurnSummaryRow(entry, reusableRow, branchScope, firstRow = false) {
+  const row = reusableRow || el("tr", "timeline-ledger-row timeline-turn-summary");
+  row.className = "timeline-ledger-row timeline-turn-summary" + (entry.turnBoundary ? " turn-boundary" : "") + (firstRow ? " timeline-first-row" : "");
+  row.setAttribute("role", "row");
+  delete row.dataset.groupId; delete row.dataset.actionKind; delete row.dataset.status; row.dataset.turnId = entry.turnId;
+  row.replaceChildren();
+  const cell = (className, text) => { const node = el("td", className, text); node.setAttribute("role", "cell"); return node; };
+  const ordinalCell = cell("timeline-ledger-ordinal"); ordinalCell.appendChild(actionTimelineTurnToggle(entry.turnId, entry.stats, false, S._timelineView)); row.appendChild(ordinalCell);
+  const kindCell = cell("timeline-ledger-kind"); const chevron = el("span", "timeline-turn-summary-icon", "↳"); chevron.setAttribute("aria-hidden", "true"); kindCell.appendChild(chevron); row.appendChild(kindCell);
+  row.appendChild(cell("timeline-ledger-title", t("timeline.turn.summary", entry.stats.count)));
+  row.appendChild(cell("timeline-ledger-duration", entry.stats.duration)); row.appendChild(cell("timeline-ledger-tokens", "—"));
+  row.onclick = () => toggleActionTimelineTurn(S._timelineView, entry.turnId);
+  row._timelineTurnId = entry.turnId; row._timelineTurnBoundary = entry.turnBoundary; row._timelineTurnSignature = entry.stats.count + ":" + entry.stats.duration;
+  row._timelineBranchScope = branchScope; row._timelineLanguage = LANG; row._timelineFirstRow = firstRow;
+  return row;
+}
+function actionTimelineEntryIndexForGroup(view, groupId) {
+  return (view.entries || []).findIndex(entry => entry.type === "group" ? entry.group.group_id === groupId : entry.groups.some(group => group.group_id === groupId));
+}
+function focusActionTimelineEntry(view, index) {
+  if (!view || !view.entries.length) return;
+  const targetIndex = Math.max(0, Math.min(view.entries.length - 1, index)), entry = view.entries[targetIndex];
+  const viewportTop = targetIndex * ACTION_TIMELINE_ROW_HEIGHT;
+  const headerHeight = actionTimelineHeaderHeight(view);
+  const viewportBottom = viewportTop + ACTION_TIMELINE_ROW_HEIGHT + headerHeight;
+  if (viewportTop < view.scroll.scrollTop) view.scroll.scrollTop = viewportTop;
+  else if (viewportBottom > view.scroll.scrollTop + view.scroll.clientHeight) view.scroll.scrollTop = viewportBottom - view.scroll.clientHeight;
+  view.scrollTop = view.scroll.scrollTop;
+  if (entry.type === "group") S._timelineRestoreFocusGroupId = entry.group.group_id;
+  else view.restoreFocusTurnId = entry.turnId;
+  reconcileActionTimelineWindow(view);
+}
+function focusActionTimelineGroup(view, index) {
+  if (!view || !view.groups.length) return;
+  const group = view.groups[Math.max(0, Math.min(view.groups.length - 1, index))];
+  const entryIndex = group && actionTimelineEntryIndexForGroup(view, group.group_id);
+  if (entryIndex >= 0) focusActionTimelineEntry(view, entryIndex);
+}
+function actionTimelineLedgerKeydown(view, event) {
+  const row = event.target && event.target.closest ? event.target.closest(".timeline-ledger-row") : null;
+  if (!row || !view || view !== S._timelineView) return;
+  const index = view.entries.findIndex(entry => entry.type === "group" ? entry.group.group_id === row.dataset.groupId : entry.turnId === row.dataset.turnId);
+  if (index < 0) return;
+  const page = Math.max(1, Math.floor(view.scroll.clientHeight / ACTION_TIMELINE_ROW_HEIGHT) - 1);
+  const targets = { ArrowUp: index - 1, ArrowDown: index + 1, PageUp: index - page, PageDown: index + page, Home: 0, End: view.entries.length - 1 };
+  if (!(event.key in targets)) return;
+  event.preventDefault(); focusActionTimelineEntry(view, targets[event.key]);
+}
+function sortedActionTimelineGroups(timeline = S.actionTimeline) {
+  return ((timeline && timeline.groups) || []).filter(group => !!group.group_id).slice().sort((left, right) => {
+    const leftOrdinal = timelineOrdinal(left.ordinal), rightOrdinal = timelineOrdinal(right.ordinal);
+    if (leftOrdinal != null && rightOrdinal != null && leftOrdinal !== rightOrdinal) return leftOrdinal - rightOrdinal;
+    if (leftOrdinal != null && rightOrdinal == null) return -1;
+    if (leftOrdinal == null && rightOrdinal != null) return 1;
+    const created = (+left.created_at || 0) - (+right.created_at || 0);
+    return created || String(left.group_id).localeCompare(String(right.group_id));
+  });
+}
+function destroyActionTimelineView(view = S._timelineView) {
+  if (!view) return;
+  if (view.raf) cancelAnimationFrame(view.raf);
+  if (view.overview && view.overview.raf) cancelAnimationFrame(view.overview.raf);
+  if (view.overview && view.overview.dismissKeydown) document.removeEventListener("keydown", view.overview.dismissKeydown);
+  clearActionTimelineOverviewHover(view);
+  if (view.resizeObserver) view.resizeObserver.disconnect();
+  if (S._timelineView === view) S._timelineView = null;
+}
+function actionTimelineViewMatches(view, rootFrameId, branchId) {
+  return !!view && view.rootFrameId === rootFrameId && view.branchId === branchId;
+}
+function actionTimelineBottomDistance(view) {
+  return Math.max(0, view.scroll.scrollHeight - view.scroll.clientHeight - view.scroll.scrollTop);
+}
+function scheduleActionTimelineWindow(view) {
+  if (!view || view !== S._timelineView || view.raf) return;
+  view.raf = requestAnimationFrame(() => {
+    view.raf = 0;
+    if (view === S._timelineView && view.region.isConnected) reconcileActionTimelineWindow(view);
+  });
+}
+function actionTimelineViewportScrolled(view) {
+  if (!view || view !== S._timelineView) return;
+  view.scrollTop = view.scroll.scrollTop; view.scrollLeft = view.scroll.scrollLeft;
+  view.followTail = actionTimelineBottomDistance(view) <= ACTION_TIMELINE_BOTTOM_THRESHOLD;
+  if (view.scroll.scrollTop > ACTION_TIMELINE_TOP_THRESHOLD) {
+    view.autoLoadArmed = true; view.autoLoadCursor = null;
+  }
+  scheduleActionTimelineWindow(view);
+  const timeline = S.actionTimeline || {}, first = timelineOrdinal(timeline.first_ordinal);
+  if (!view.overview.selection && !view.searchNeedle && view.scroll.scrollTop <= ACTION_TIMELINE_TOP_THRESHOLD && timeline.has_more_before &&
+      !S._timelineHistoryLoading && view.autoLoadArmed && first != null && view.autoLoadCursor !== first) {
+    view.autoLoadArmed = false; view.autoLoadCursor = first; loadEarlierActionTimeline();
+  }
+}
+function createActionTimelineToolbar() {
+  const shell = el("form", "timeline-toolbar"); shell.setAttribute("role", "search"); shell.onsubmit = event => event.preventDefault();
+  const field = el("div", "timeline-search-field");
+  const label = el("label", "timeline-search-label", t("timeline.search.label")); label.htmlFor = "timeline-action-search"; field.appendChild(label);
+  const controls = el("div", "timeline-search-controls");
+  const input = el("input", "timeline-search-input"); input.id = "timeline-action-search"; input.type = "search"; input.maxLength = 256;
+  input.autocomplete = "off"; input.spellcheck = false; input.placeholder = t("timeline.search.placeholder");
+  input.setAttribute("aria-describedby", "timeline-search-scope timeline-search-status"); controls.appendChild(input);
+  const clearButton = el("button", "timeline-search-clear hidden", t("timeline.search.clear")); clearButton.type = "button"; clearButton.disabled = true;
+  clearButton.setAttribute("aria-label", t("timeline.search.clear")); controls.appendChild(clearButton); field.appendChild(controls); shell.appendChild(field);
+  const meta = el("div", "timeline-search-meta");
+  const status = el("span", "timeline-search-status", t("timeline.search.loaded", 0)); status.id = "timeline-search-status";
+  status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite"); status.setAttribute("aria-atomic", "true"); meta.appendChild(status);
+  const scope = el("span", "timeline-search-scope", t("timeline.search.scope", 0)); scope.id = "timeline-search-scope"; meta.appendChild(scope);
+  shell.appendChild(meta); return { shell, label, input, clearButton, status, scope };
+}
+function syncActionTimelineSearchToolbar(view, loadedCount, matchCount, searchMatchCount = matchCount, force = false) {
+  const search = view.search, active = !!view.searchNeedle;
+  if (search.input.value !== view.searchQuery) search.input.value = view.searchQuery;
+  search.shell.dataset.matchCount = String(matchCount); search.shell.dataset.searchMatchCount = String(searchMatchCount); search.shell.dataset.loadedCount = String(loadedCount);
+  search.status.textContent = active && view.overview.selection
+    ? t("timeline.search.matchesInSelection", matchCount, searchMatchCount, loadedCount)
+    : t(active ? "timeline.search.matches" : "timeline.search.loaded", active ? matchCount : loadedCount, loadedCount);
+  search.scope.textContent = t("timeline.search.scope", loadedCount);
+  search.clearButton.classList.toggle("hidden", !active); search.clearButton.disabled = !active;
+  if (force) {
+    search.label.textContent = t("timeline.search.label"); search.input.placeholder = t("timeline.search.placeholder");
+    search.clearButton.textContent = t("timeline.search.clear"); search.clearButton.setAttribute("aria-label", t("timeline.search.clear"));
+  }
+}
+function changeActionTimelineSearch(view, rawQuery) {
+  if (!view || view !== S._timelineView) return;
+  const query = String(rawQuery || "").slice(0, 256), needle = normalizeActionTimelineSearch(query);
+  if (query === view.searchQuery && needle === view.searchNeedle) return;
+  const wasFiltered = !!view.searchNeedle || !!view.overview.selection;
+  if (!wasFiltered && needle) view.preFilterScroll = actionTimelineFilterScrollSnapshot(view);
+  view.searchQuery = query; view.searchNeedle = needle; view.autoLoadArmed = false;
+  let restore = null;
+  if (!needle && !view.overview.selection) { restore = view.preFilterScroll; view.preFilterScroll = null; }
+  clearActionTimelineOverviewHover(view);
+  updateActionTimelineLedger({ direction: "search", filterChanged: true, filterRestore: restore });
+}
+function toggleActionTimelineTurn(view, turnId) {
+  if (!view || view !== S._timelineView || !turnId || view.searchNeedle) return;
+  const snapshot = actionTimelineFilterScrollSnapshot(view), collapsing = !view.collapsedTurns.has(turnId);
+  if (collapsing) view.collapsedTurns.add(turnId); else view.collapsedTurns.delete(turnId);
+  if (collapsing) {
+    const selected = view.groups.find(group => group.group_id === S.actionTimelineSelectedGroupId);
+    if (selected && selected.turn_id === turnId) { S.actionTimelineSelectedGroupId = null; S.actionTimelineSelectedBranchId = null; }
+  }
+  view.restoreFocusTurnId = turnId; view.autoLoadArmed = false;
+  updateActionTimelineLedger({ direction: "fold", filterChanged: true, filterRestore: snapshot });
+}
+function createActionTimelineView(rootFrameId, branchId) {
+  const region = el("div", "timeline-ledger-region");
+  region.dataset.rootFrameId = rootFrameId; region.dataset.branchId = branchId;
+  region.style.setProperty("--timeline-row-height", ACTION_TIMELINE_ROW_HEIGHT + "px");
+  const search = createActionTimelineToolbar(); region.appendChild(search.shell);
+  const overview = createActionTimelineOverview(); region.appendChild(overview.shell);
+  const inspectorHost = el("div", "timeline-inspector-host hidden"); region.appendChild(inspectorHost);
+  const filterEmpty = el("div", "workbench-empty timeline-filter-empty hidden", t("timeline.overview.emptySelection")); region.appendChild(filterEmpty);
+  const ledgerHelp = el("div", "timeline-ledger-keyboard-help", t("timeline.ledger.keyboard")); ledgerHelp.id = "timeline-ledger-keyboard-help"; region.appendChild(ledgerHelp);
+  const scroll = el("div", "timeline-ledger-scroll");
+  scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", t("timeline.title")); scroll.setAttribute("aria-describedby", ledgerHelp.id);
+  // The stylesheet gives every table element an explicit display (block/grid/
+  // flex) so the rows can be absolutely positioned, and that strips the
+  // implicit table/rowgroup/row/cell roles. aria-colcount, aria-rowcount and
+  // aria-rowindex are only honoured inside a table role context, so without
+  // these the virtualized "row 412 of 8000" announcement is silently dropped.
+  const table = el("table", "timeline-ledger"); table.setAttribute("role", "table"); table.setAttribute("aria-colcount", "5");
+  const thead = el("thead"), header = el("tr");
+  thead.setAttribute("role", "rowgroup"); header.setAttribute("role", "row"); header.setAttribute("aria-rowindex", "1");
+  const headerColumns = [["timeline.column.ordinal", "timeline-ledger-ordinal"], ["timeline.column.kind", "timeline-ledger-kind"], ["timeline.column.action", "timeline-ledger-title"], ["timeline.duration", "timeline-ledger-duration"], ["timeline.tokens", "timeline-ledger-tokens"]];
+  headerColumns.forEach(([key, className], column) => {
+    const th = el("th", className, t(key)); th.scope = "col"; th.dataset.i18nKey = key;
+    th.setAttribute("role", "columnheader"); th.setAttribute("aria-colindex", String(column + 1)); header.appendChild(th);
+  });
+  thead.appendChild(header); table.appendChild(thead);
+  const tbody = el("tbody", "timeline-ledger-body"); tbody.setAttribute("role", "rowgroup"); table.appendChild(tbody); scroll.appendChild(table); region.appendChild(scroll);
+  const view = { rootFrameId, branchId, region, search, overview, inspectorHost, filterEmpty, ledgerHelp, scroll, table, thead, tbody, allGroups: [], groups: [], entries: [],
+    initialized: false, followTail: true, scrollTop: 0, scrollLeft: 0, headerHeight: 0, start: 0, end: 0,
+    autoLoadArmed: true, autoLoadCursor: null, raf: 0, resizeObserver: null, language: LANG,
+    searchQuery: "", searchNeedle: "", searchIndex: new Map(), collapsedTurns: new Set(), preFilterScroll: null,
+    pendingPrependRestore: null, restoreFocusTurnId: null };
+  search.input.oninput = () => changeActionTimelineSearch(view, search.input.value);
+  search.input.onkeydown = event => { if (event.key === "Escape" && view.searchNeedle) { event.preventDefault(); changeActionTimelineSearch(view, ""); } };
+  search.clearButton.onclick = event => { event.preventDefault(); search.input.focus(); changeActionTimelineSearch(view, ""); };
+  overview.svg.addEventListener("pointermove", event => actionTimelineOverviewPointerMove(view, event));
+  overview.svg.addEventListener("pointerdown", event => beginActionTimelineOverviewGesture(view, event));
+  overview.svg.addEventListener("pointerup", event => finishActionTimelineOverviewGesture(view, event));
+  overview.svg.addEventListener("pointercancel", event => cancelActionTimelineOverviewGesture(view, event));
+  overview.svg.addEventListener("lostpointercapture", event => cancelActionTimelineOverviewGesture(view, event));
+  overview.svg.addEventListener("pointerleave", event => {
+    if (overview.gesture) return;
+    if (event.relatedTarget === overview.tooltip || overview.tooltip.contains(event.relatedTarget)) return;
+    scheduleActionTimelineOverviewHoverClear(view);
+  });
+  overview.tooltip.addEventListener("pointerenter", () => { overview.tooltipHovered = true; cancelActionTimelineOverviewHoverClear(view); });
+  overview.tooltip.addEventListener("pointerleave", event => {
+    overview.tooltipHovered = false;
+    if (event.relatedTarget === overview.svg || overview.svg.contains(event.relatedTarget)) return;
+    scheduleActionTimelineOverviewHoverClear(view);
+  });
+  overview.svg.addEventListener("wheel", event => actionTimelineOverviewWheel(view, event), { passive: false });
+  overview.svg.addEventListener("contextmenu", event => event.preventDefault());
+  overview.shell.addEventListener("keydown", event => actionTimelineOverviewKeydown(view, event));
+  overview.shell.addEventListener("focus", () => {
+    const groupId = overview.keyboardGroupId || (overview.model.byId.has(S.actionTimelineSelectedGroupId) ? S.actionTimelineSelectedGroupId : (overview.model.items[0] || {}).groupId);
+    if (groupId) showActionTimelineOverviewKeyboardItem(view, groupId);
+  });
+  overview.shell.addEventListener("focusout", event => { if (!overview.shell.contains(event.relatedTarget)) clearActionTimelineOverviewHover(view); });
+  overview.dismissKeydown = event => {
+    if (event.key === "Escape" && view === S._timelineView && (overview.hoverTimer || overview.hoverGroupId)) {
+      clearActionTimelineOverviewHover(view); event.preventDefault();
+    }
+  };
+  document.addEventListener("keydown", overview.dismissKeydown);
+  overview.clearButton.onclick = event => { event.stopPropagation(); clearActionTimelineOverviewSelection(view); };
+  overview.zoomInButton.onclick = event => { event.stopPropagation(); actionTimelineOverviewZoomAt(view, .75, .5); };
+  overview.zoomOutButton.onclick = event => { event.stopPropagation(); actionTimelineOverviewZoomAt(view, 4 / 3, .5); };
+  overview.panEarlierButton.onclick = event => { event.stopPropagation(); const span = overview.viewEnd - overview.viewStart; actionTimelineOverviewPanBy(view, -span * .1); };
+  overview.panLaterButton.onclick = event => { event.stopPropagation(); const span = overview.viewEnd - overview.viewStart; actionTimelineOverviewPanBy(view, span * .1); };
+  overview.prefixButton.addEventListener("pointerdown", event => event.stopPropagation());
+  // Arm the focus-restore latch only if the load actually took the lock.
+  // loadEarlierActionTimeline sets it synchronously before its first await, so
+  // this reads the real outcome; setting the latch unconditionally left it
+  // armed across every early return, and the next repaint then stole focus.
+  overview.prefixButton.onclick = event => {
+    event.stopPropagation(); loadEarlierActionTimeline();
+    overview.restoreFocusAfterPrefix = !!S._timelineHistoryLoading;
+  };
+  scroll.addEventListener("scroll", () => actionTimelineViewportScrolled(view), { passive: true });
+  scroll.addEventListener("keydown", event => {
+    if (event.target !== scroll || !view.entries.length || !["Enter", "ArrowDown", "Home"].includes(event.key)) return;
+    const headerHeight = actionTimelineHeaderHeight(view);
+    const firstVisible = Math.max(0, Math.min(view.entries.length - 1,
+      Math.floor(Math.max(0, view.scroll.scrollTop - headerHeight) / ACTION_TIMELINE_ROW_HEIGHT)));
+    event.preventDefault(); focusActionTimelineEntry(view, event.key === "Home" ? 0 : firstVisible);
+  });
+  table.addEventListener("keydown", event => actionTimelineLedgerKeydown(view, event));
+  if (typeof ResizeObserver !== "undefined") {
+    view.resizeObserver = new ResizeObserver(() => scheduleActionTimelineWindow(view));
+    view.resizeObserver.observe(scroll);
+  }
+  S._timelineView = view; return view;
+}
+function actionTimelineLedger(groups, branchScope, rootFrameScope) {
+  let view = S._timelineView;
+  if (!actionTimelineViewMatches(view, rootFrameScope, branchScope)) {
+    destroyActionTimelineView(view); view = createActionTimelineView(rootFrameScope, branchScope);
+  }
+  return view.region;
+}
+function syncActionTimelineInspector(view, force = false) {
+  const selected = view.groups.find(group => group.group_id === S.actionTimelineSelectedGroupId) || null;
+  const current = view.inspectorHost.firstElementChild;
+  if (!selected) {
+    view.inspectorHost.replaceChildren(); view.inspectorHost.classList.add("hidden"); return;
+  }
+  view.inspectorHost.classList.remove("hidden");
+  if (force || !current || current._timelineGroup !== selected || current._timelineLanguage !== LANG) {
+    const restoreCloseFocus = !!(current && current.contains(document.activeElement));
+    const next = actionTimelineInspector(selected); view.inspectorHost.replaceChildren(next);
+    if (restoreCloseFocus) {
+      const close = next.querySelector("button");
+      if (close) { try { close.focus({ preventScroll: true }); } catch { close.focus(); } }
+    }
+  }
+}
+function reconcileActionTimelineWindow(view, force = false) {
+  if (!view || view !== S._timelineView) return;
+  const entries = view.entries, scroll = view.scroll;
+  const viewportHeight = scroll.clientHeight || ACTION_TIMELINE_ROW_HEIGHT * 12;
+  const headerHeight = actionTimelineHeaderHeight(view);
+  const viewportStart = Math.max(0, scroll.scrollTop - headerHeight);
+  const viewportEnd = Math.max(0, scroll.scrollTop + viewportHeight - headerHeight);
+  const start = Math.max(0, Math.floor(viewportStart / ACTION_TIMELINE_ROW_HEIGHT) - ACTION_TIMELINE_OVERSCAN);
+  const end = Math.min(entries.length, Math.ceil(viewportEnd / ACTION_TIMELINE_ROW_HEIGHT) + ACTION_TIMELINE_OVERSCAN);
+  const activeRow = document.activeElement && document.activeElement.closest ? document.activeElement.closest(".timeline-ledger-row") : null;
+  const activeGroupId = activeRow && activeRow.dataset.groupId, activeTurnId = activeRow && !activeGroupId && activeRow.dataset.turnId;
+  const requestedFocusGroupId = S._timelineRestoreFocusGroupId; S._timelineRestoreFocusGroupId = null;
+  const requestedFocusTurnId = view.restoreFocusTurnId; view.restoreFocusTurnId = null;
+  const reusableRows = new Map(), reusableTurns = new Map();
+  view.tbody.querySelectorAll(".timeline-ledger-row[data-group-id]").forEach(row => { if (row.dataset.groupId) reusableRows.set(row.dataset.groupId, row); });
+  view.tbody.querySelectorAll(".timeline-turn-summary[data-turn-id]").forEach(row => { if (row.dataset.turnId) reusableTurns.set(row.dataset.turnId, row); });
+  const fragment = document.createDocumentFragment();
+  entries.slice(start, end).forEach((entry, offset) => {
+    const index = start + offset, firstRow = index === 0;
+    let row;
+    if (entry.type === "turn") {
+      row = reusableTurns.get(entry.turnId);
+      const signature = entry.stats.count + ":" + entry.stats.duration;
+      if (force || !row || row._timelineTurnBoundary !== entry.turnBoundary || row._timelineTurnSignature !== signature ||
+          row._timelineBranchScope !== view.branchId || row._timelineLanguage !== LANG || row._timelineFirstRow !== firstRow) {
+        row = actionTimelineTurnSummaryRow(entry, row, view.branchId, firstRow);
+      }
+    } else {
+      const group = entry.group, selected = group.group_id === S.actionTimelineSelectedGroupId;
+      row = reusableRows.get(group.group_id);
+      const signature = entry.stats ? entry.stats.count + ":" + entry.stats.duration : "";
+      if (force || !row || row._timelineGroup !== group || row._timelineTurnBoundary !== entry.turnBoundary ||
+          row._timelineSelected !== selected || row._timelineBranchScope !== view.branchId || row._timelineLanguage !== LANG ||
+          row._timelineFirstRow !== firstRow || row._timelineTurnStart !== entry.turnStart || row._timelineTurnSignature !== signature ||
+          row._timelineFoldable !== entry.foldable || row._timelineSearchMatch !== !!view.searchNeedle) {
+        row = actionTimelineLedgerRow(group, row, entry.turnBoundary, selected, view.branchId, firstRow, {
+          turnStart: entry.turnStart, turnId: entry.turnId, stats: entry.stats, foldable: entry.foldable, searchMatch: !!view.searchNeedle
+        });
+      }
+    }
+    row.style.transform = `translateY(${index * ACTION_TIMELINE_ROW_HEIGHT}px)`;
+    row.setAttribute("aria-rowindex", String(index + 2)); fragment.appendChild(row);
+  });
+  view.tbody.replaceChildren(fragment); view.start = start; view.end = end;
+  const focusGroupId = requestedFocusGroupId || activeGroupId, focusTurnId = requestedFocusTurnId || activeTurnId;
+  if (focusGroupId) {
+    const focusRow = Array.from(view.tbody.querySelectorAll(".timeline-ledger-row[data-group-id]")).find(row => row.dataset.groupId === focusGroupId);
+    const group = view.groups.find(item => item.group_id === focusGroupId);
+    const summaryRow = !focusRow && group ? Array.from(view.tbody.querySelectorAll(".timeline-turn-summary[data-turn-id]")).find(row => row.dataset.turnId === group.turn_id) : null;
+    const focusTarget = focusRow ? focusRow.querySelector(".timeline-row-button") : summaryRow && summaryRow.querySelector(".timeline-turn-toggle");
+    if (focusTarget && document.activeElement !== focusTarget) {
+      try { focusTarget.focus({ preventScroll: true }); } catch { focusTarget.focus(); }
+    }
+  } else if (focusTurnId) {
+    const turnRow = Array.from(view.tbody.querySelectorAll(".timeline-ledger-row[data-turn-id]")).find(row => row.dataset.turnId === focusTurnId);
+    const focusTarget = turnRow && (turnRow.querySelector(".timeline-turn-toggle") || turnRow.querySelector(".timeline-row-button"));
+    if (focusTarget && document.activeElement !== focusTarget) {
+      try { focusTarget.focus({ preventScroll: true }); } catch { focusTarget.focus(); }
+    }
+  }
+}
+function updateActionTimelineLedger(options = {}) {
+  if (S.activeTab !== "timeline") return;
+  const timeline = S.actionTimeline || {}, allGroups = sortedActionTimelineGroups(timeline);
+  const rootFrameScope = actionTimelineRootScope(timeline), branchScope = actionTimelineBranchScope(timeline, allGroups);
+  const view = S._timelineView;
+  if (!allGroups.length || !actionTimelineViewMatches(view, rootFrameScope, branchScope) || !view.region.isConnected) {
+    renderActionTimeline(); return;
+  }
+  const previousVisibleGroups = view.groups;
+  const force = view.language !== LANG;
+  view.allGroups = allGroups; view.language = LANG;
+  const searchGroups = searchActionTimelineGroups(view, allGroups);
+  drawActionTimelineOverview(view, searchGroups, force, allGroups);
+  const groups = filteredActionTimelineGroups(view, searchGroups), entries = actionTimelineLedgerEntries(view, groups);
+  const selectedHasActionRow = entries.some(entry => entry.type === "group" && entry.group.group_id === S.actionTimelineSelectedGroupId);
+  if (S.actionTimelineSelectedBranchId !== branchScope || !groups.some(group => group.group_id === S.actionTimelineSelectedGroupId) || !selectedHasActionRow) {
+    S.actionTimelineSelectedGroupId = null; S.actionTimelineSelectedBranchId = null;
+  }
+  const previousVisibleIds = new Set(previousVisibleGroups.map(group => group.group_id));
+  // A running group can enter a loaded-window search when a streamed event
+  // adds a matching resource or artifact, even though allGroups did not grow.
+  // Treat that as a visible append for tail following without mistaking a
+  // removal/non-match for newly visible data.
+  const tailAdded = !options.filterChanged && groups.some(group => !previousVisibleIds.has(group.group_id));
+  view.groups = groups; view.entries = entries; syncActionTimelineOverviewDecorations(view);
+  syncActionTimelineSearchToolbar(view, allGroups.length, groups.length, searchGroups.length, force); view.search.shell.dataset.visibleCount = String(groups.length);
+  view.table.setAttribute("aria-rowcount", String(entries.length + 1)); view.table.setAttribute("aria-label", t("timeline.title"));
+  view.scroll.setAttribute("aria-label", t("timeline.title")); view.tbody.style.height = (entries.length * ACTION_TIMELINE_ROW_HEIGHT) + "px";
+  const filterEmpty = (view.overview.selection || view.searchNeedle) && !groups.length;
+  view.filterEmpty.classList.toggle("hidden", !filterEmpty);
+  if (filterEmpty) view.filterEmpty.textContent = t(view.searchNeedle
+    ? (view.overview.selection && searchGroups.length ? "timeline.search.emptySelection" : "timeline.search.empty")
+    : "timeline.overview.emptySelection", searchGroups.length);
+  view.overview.selectionStatus.dataset.matchCount = String(groups.length);
+  if (force) {
+    view.thead.querySelectorAll("th[data-i18n-key]").forEach(th => { th.textContent = t(th.dataset.i18nKey); });
+    view.ledgerHelp.textContent = t("timeline.ledger.keyboard");
+    // The clear button's own label is already re-localized unconditionally in
+    // drawActionTimelineOverview, which ran above.
+    if (!filterEmpty) view.filterEmpty.textContent = t("timeline.overview.emptySelection");
+  }
+  syncActionTimelineInspector(view, force);
+  const snapshot = options.prependSnapshot, pendingPrependRestore = view.pendingPrependRestore; view.pendingPrependRestore = null;
+  if (snapshot && snapshot.node === view.scroll) {
+    const delta = view.scroll.scrollHeight - snapshot.scrollHeight;
+    view.scroll.scrollTop = snapshot.scrollTop + delta;
+    view.followTail = !!snapshot.followTail && actionTimelineBottomDistance(view) <= ACTION_TIMELINE_BOTTOM_THRESHOLD;
+  } else if (options.filterChanged || pendingPrependRestore) {
+    const restore = options.filterRestore || pendingPrependRestore;
+    if (restore && restore.followTail) view.scroll.scrollTop = Math.max(0, view.scroll.scrollHeight - view.scroll.clientHeight);
+    else if (restore && (restore.entryKey || restore.groupId || restore.turnId)) {
+      let index = entries.findIndex(entry => actionTimelineEntryKey(entry) === restore.entryKey);
+      if (index < 0 && restore.groupId) index = actionTimelineEntryIndexForGroup(view, restore.groupId);
+      if (index < 0 && restore.turnId) index = entries.findIndex(entry => entry.turnId === restore.turnId);
+      const headerHeight = actionTimelineHeaderHeight(view);
+      view.scroll.scrollTop = index >= 0 ? Math.max(0, headerHeight + index * ACTION_TIMELINE_ROW_HEIGHT + restore.offset) : 0;
+    } else view.scroll.scrollTop = 0;
+    view.followTail = !!(restore && restore.followTail); view.initialized = true;
+  } else if (!view.initialized && entries.length && view.scroll.clientHeight > 0) {
+    view.scroll.scrollTop = Math.max(0, view.scroll.scrollHeight - view.scroll.clientHeight);
+    view.initialized = true; view.followTail = true;
+  } else if (view.initialized && view.followTail && tailAdded) {
+    view.scroll.scrollTop = Math.max(0, view.scroll.scrollHeight - view.scroll.clientHeight);
+  } else if (view.initialized) {
+    view.scroll.scrollTop = view.scrollTop;
+  }
+  view.scroll.scrollLeft = view.scrollLeft;
+  // Only trust a live reading. A hidden pane has no scrolling box and reports
+  // 0, which would overwrite the cache that is the sole record of where the
+  // reader was.
+  if (view.scroll.clientHeight > 0) { view.scrollTop = view.scroll.scrollTop; view.scrollLeft = view.scroll.scrollLeft; }
+  reconcileActionTimelineWindow(view, force); syncActionTimelineHistoryState();
+  if (!view.initialized && entries.length) scheduleActionTimelineWindow(view);
 }
 function recoveryIsCurrentBranch(actions) {
   if (!actions || !S.currentId) return false;
@@ -2740,6 +4507,13 @@ function renderContextPanel() {
   if (state.compressed) summary.appendChild(el("span", "timeline-pill", t("context.compressed")));
   if (state.handoff) summary.appendChild(el("span", "timeline-pill", t("context.handoff"))); panel.appendChild(summary);
   state.layers.forEach(layer => { const row = el("div", "context-layer"); row.appendChild(el("span", "context-layer-name", layer.name || layer.kind || "context")); if (layer.token_count != null) row.appendChild(el("span", "context-layer-tokens", t("context.tokens", layer.token_count))); if (layer.status) row.appendChild(el("span", "timeline-pill", layer.status)); panel.appendChild(row); });
+  (state.omitted || []).forEach(item => {
+    const row = el("div", "context-layer context-omitted");
+    row.appendChild(el("span", "context-layer-name", tOptional("context.omitted." + item.kind) || item.kind));
+    row.appendChild(el("span", "context-layer-tokens", t("context.omittedCount", item.count)));
+    (item.reasons || []).forEach(r => row.appendChild(el("span", "timeline-pill", (tOptional("context.reason." + r.reason) || r.reason) + " ×" + r.count)));
+    panel.appendChild(row);
+  });
   if ((state.compaction_history || []).length) {
     const history = el("details", "context-history"); history.appendChild(el("summary", null, t("context.history", state.compaction_count || state.compaction_history.length)));
     state.compaction_history.forEach(item => {
@@ -2768,6 +4542,102 @@ function renderSecurityPanel() {
   row(t("security.permission"), [permission.mode || "unknown", permission.pending_count ? t("security.pending", permission.pending_count) : ""]);
   if (sandbox.detail) panel.appendChild(el("div", "security-detail", sandbox.detail)); return panel;
 }
+function sanitizeComputeTasks(payload) {
+  const source = payload && (payload.tasks ? payload : payload.payload || payload) || {};
+  const tasks = Array.isArray(source.tasks) ? source.tasks : [];
+  return {
+    // `polled` is the server saying whether it contacted a provider. Rendered,
+    // not inferred: a panel that decided for itself would be guessing about
+    // the one thing the user needs to be able to trust here.
+    polled: !!source.polled,
+    live_count: Math.max(0, Number(source.live_count) || 0),
+    tasks: tasks.slice(0, 200).map(task => ({
+      job_id: publicText(task && task.job_id, 120),
+      provider: publicText(task && task.provider, 64),
+      status: publicText(task && task.status, 32) || "unknown",
+      reason: publicText(task && (task.reason || task.termination_reason), 500),
+      live: !!(task && task.live), terminal: !!(task && task.terminal),
+      updated_at: Number(task && task.updated_at) || 0,
+      outputs: {
+        file_count: Math.max(0, Number(task && task.outputs && task.outputs.file_count) || 0),
+        total_bytes: Math.max(0, Number(task && task.outputs && task.outputs.total_bytes) || 0)
+      }
+    }))
+  };
+}
+async function refreshComputeTask(jobId, button) {
+  // The only action here that reaches a provider — and it harvests, which is
+  // why it is a button a person presses rather than something on a timer.
+  const id = S.currentId; if (!id || !jobId) return;
+  button.disabled = true;
+  try {
+    await api(`/frames/${id}/compute/tasks/${encodeURIComponent(jobId)}/refresh`, { method: "POST", body: "{}" });
+    await loadWorkbenchState(id, true);
+  } catch (e) {
+    hint(t("compute.refreshFailed") + " — " + apiErrorText(e), true);
+  } finally { button.disabled = false; }
+}
+function renderComputeTasksPanel() {
+  const panel = panelShell(t("timeline.panel.compute"), "compute-panel"), state = S.computeTasks;
+  if (!state || !(state.tasks || []).length) { panel.appendChild(el("div", "workbench-empty", t("compute.none"))); return panel; }
+  const summary = el("div", "compute-summary");
+  summary.appendChild(el("span", "timeline-pill", t("compute.live", state.live_count)));
+  // Said out loud. A list of states with no provenance reads as current, and
+  // these rows are as old as the last time anyone actually checked.
+  summary.appendChild(el("span", "timeline-pill", state.polled ? t("compute.checked") : t("compute.fromRecord")));
+  panel.appendChild(summary);
+  state.tasks.forEach(task => {
+    const row = el("div", "compute-task status-" + String(task.status).toLowerCase());
+    const head = el("div", "compute-task-head");
+    head.appendChild(el("span", "compute-task-id", shortRuntime(task.job_id) || task.job_id));
+    head.appendChild(el("span", "timeline-status " + String(task.status).toLowerCase(), tOptional("compute.status." + task.status) || task.status));
+    if (task.provider) head.appendChild(el("span", "timeline-pill", task.provider));
+    row.appendChild(head);
+    if (task.outputs.file_count) row.appendChild(el("div", "compute-task-outputs", t("compute.outputs", task.outputs.file_count, bytes(task.outputs.total_bytes))));
+    if (task.reason) row.appendChild(el("div", "compute-task-message", task.reason));
+    // Only a job that might still be out there is worth contacting a provider
+    // about. A finished one has nothing left to harvest, and offering the
+    // button anyway would invite a paid round trip that cannot change anything.
+    if (task.live) {
+      const btn = ghostIconBtn("refresh", t("compute.refresh"));
+      btn.onclick = () => refreshComputeTask(task.job_id, btn);
+      row.appendChild(btn);
+    }
+    panel.appendChild(row);
+  });
+  return panel;
+}
+async function stopDelegationChild(childId, button) {
+  const id = S.currentId; if (!id || !childId) return;
+  button.disabled = true;
+  try {
+    await api(`/frames/${id}/delegations/${encodeURIComponent(childId)}/stop`, { method: "POST", body: "{}" });
+    await loadWorkbenchState(id, true);
+  } catch (e) {
+    // A 409 here is the ordinary post-restart answer, not a fault: the record
+    // survived and the run that owned it did not. Show what the server said
+    // rather than a generic failure, then re-read so the row stops offering
+    // an action that cannot work.
+    hint(t("delegation.stopFailed") + " — " + apiErrorText(e), true);
+    await loadWorkbenchState(id, true);
+  } finally { button.disabled = false; }
+}
+async function steerDelegationChild(childId, button) {
+  const id = S.currentId; if (!id || !childId) return;
+  const message = prompt(t("delegation.steerPrompt"));
+  if (!message || !message.trim()) return;
+  button.disabled = true;
+  try {
+    await api(`/frames/${id}/delegations/${encodeURIComponent(childId)}/steer`, {
+      method: "POST", body: JSON.stringify({ message })
+    });
+    hint(t("delegation.steerQueued"));
+    await loadWorkbenchState(id, true);
+  } catch (e) {
+    hint(t("delegation.steerFailed") + " — " + apiErrorText(e), true);
+    await loadWorkbenchState(id, true);
+  } finally { button.disabled = false; }
+}
 function renderDelegationPanel() {
   const panel = panelShell(t("timeline.panel.delegation"), "delegation-panel"), state = S.delegationState;
   if (!state || !(state.children || []).length) {
@@ -2792,32 +4662,110 @@ function renderDelegationPanel() {
     if (child.steering && (child.steering.queued || child.steering.delivered)) details.appendChild(el("span", "timeline-pill", t("delegation.steering", child.steering.queued || 0, child.steering.delivered || 0)));
     row.appendChild(details);
     if (child.error || child.stop_reason) row.appendChild(el("div", "delegation-child-message", child.error || child.stop_reason));
+    // Only a child that is actually going can be stopped or steered. Offering
+    // the controls on a finished one invites a 409 the user cannot act on,
+    // and after a daemon restart every child here is finished.
+    if (["running", "pending"].includes(String(child.status || "").toLowerCase())) {
+      const controls = el("div", "delegation-child-controls");
+      const stop = ghostIconBtn("stop", t("delegation.stop"));
+      stop.onclick = () => stopDelegationChild(child.child_id, stop);
+      controls.appendChild(stop);
+      const steer = ghostIconBtn("message-square", t("delegation.steer"));
+      steer.onclick = () => steerDelegationChild(child.child_id, steer);
+      controls.appendChild(steer);
+      row.appendChild(controls);
+    }
     panel.appendChild(row);
   });
   return panel;
 }
+function syncActionTimelineHistoryState(host = null) {
+  if (S._timelineView) syncActionTimelineOverviewControls(S._timelineView);
+  const root = $("#dock-timeline");
+  const target = host || (root && root.querySelector(".timeline-history-state"));
+  if (!target) return;
+  // Measure with the previous reservation still applied. Clearing it first
+  // reads 0 on an already-reserved slot, which collapses the band during the
+  // same frame as a prepend and moves the compensated row -- the exact jump
+  // the reservation below exists to prevent. It does not leak: renderActionTimeline
+  // builds a fresh .timeline-history-state node, so the reservation cannot
+  // outlive the next full render.
+  const previousHeight = target.getBoundingClientRect().height;
+  const timeline = S.actionTimeline || {}; target.replaceChildren(); target.style.minHeight = "";
+  if (timeline.has_more_before) {
+    const controls = el("div", "workbench-controls timeline-history-controls");
+    const loading = actionTimelineHistoryIsLoading(timeline);
+    const earlier = el("button", "outline-btn small", t(loading ? "timeline.loadingEarlier" : "timeline.loadEarlier"));
+    earlier.disabled = loading; earlier.setAttribute("data-action", "load-earlier-timeline");
+    earlier.setAttribute("aria-busy", loading ? "true" : "false"); earlier.onclick = () => loadEarlierActionTimeline();
+    controls.appendChild(earlier); target.appendChild(controls);
+  }
+  if (S.workbenchErrors.timelineHistory) target.appendChild(el("div", "timeline-error", t("timeline.loadEarlierFailed", S.workbenchErrors.timelineHistory)));
+  // When the final prepend proves there is no earlier page, removing the
+  // fallback control would move the whole scroll viewport during the same
+  // frame. Reserve its measured slot until the next full render so the
+  // compensated row remains at the same screen coordinate.
+  const preserveEmptyHeight = !target.children.length && previousHeight > 0 && !!S._timelineView;
+  if (preserveEmptyHeight) target.style.minHeight = previousHeight + "px";
+  target.classList.toggle("hidden", !target.children.length && !preserveEmptyHeight);
+}
 function renderActionTimeline() {
-  const root = $("#dock-timeline"); if (!root) return; root.innerHTML = "";
+  const root = $("#dock-timeline"); if (!root) return;
+  const timeline = S.actionTimeline || {};
+  const groups = sortedActionTimelineGroups(timeline);
+  const rootFrameScope = actionTimelineRootScope(timeline), branchScope = actionTimelineBranchScope(timeline, groups);
+  const previousView = S._timelineView;
+  const activeRow = document.activeElement && document.activeElement.closest ? document.activeElement.closest(".timeline-ledger-row") : null;
+  const restoreInspectorFocus = !!(previousView && previousView.inspectorHost.contains(document.activeElement));
+  const restoreSearchFocus = !!(previousView && previousView.search && previousView.search.shell.contains(document.activeElement));
+  const searchSelection = restoreSearchFocus ? [previousView.search.input.selectionStart, previousView.search.input.selectionEnd] : null;
+  if (activeRow && actionTimelineViewMatches(previousView, rootFrameScope, branchScope)) {
+    if (activeRow.dataset.groupId) S._timelineRestoreFocusGroupId = activeRow.dataset.groupId;
+    else previousView.restoreFocusTurnId = activeRow.dataset.turnId || null;
+  }
+  if (actionTimelineViewMatches(previousView, rootFrameScope, branchScope)) {
+    // Returning to the tab re-creates the scrolling box at offset 0, so the
+    // live reading is 0 and only the cache still knows where the reader was.
+    if (previousView.scroll.clientHeight > 0) {
+      previousView.scrollTop = previousView.scroll.scrollTop; previousView.scrollLeft = previousView.scroll.scrollLeft;
+    }
+  } else {
+    destroyActionTimelineView(previousView); S._timelineRestoreFocusGroupId = null;
+  }
+  if (S.actionTimelineSelectedBranchId !== branchScope || !groups.some(group => group.group_id === S.actionTimelineSelectedGroupId)) {
+    S.actionTimelineSelectedGroupId = null; S.actionTimelineSelectedBranchId = null;
+  }
+  root.replaceChildren(); root.dataset.timelineBranch = branchScope;
   const top = el("div", "timeline-top"); const heading = el("div"); heading.appendChild(el("div", "timeline-title", t("timeline.title"))); heading.appendChild(el("div", "timeline-subtitle", t("timeline.subtitle"))); top.appendChild(heading);
   const refresh = ghostIconBtn("refresh", t("timeline.refresh")); refresh.onclick = () => loadWorkbenchState(S.currentId, true); top.appendChild(refresh); root.appendChild(top);
   root.appendChild(runtimeSummaryNode(false));
   const layout = el("div", "workbench-layout"), side = el("div", "workbench-side"), actions = el("section", "timeline-actions");
-  side.appendChild(renderBranchPanel()); side.appendChild(renderDelegationPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
-  const timeline = S.actionTimeline || {}, groups = timeline.groups || [];
-  if (timeline.has_more_before) {
-    const controls = el("div", "workbench-controls timeline-history-controls");
-    const loading = S._timelineHistoryLoading === S.currentId;
-    const earlier = el("button", "outline-btn small", t(loading ? "timeline.loadingEarlier" : "timeline.loadEarlier"));
-    earlier.disabled = loading; earlier.setAttribute("data-action", "load-earlier-timeline");
-    earlier.setAttribute("aria-busy", loading ? "true" : "false"); earlier.onclick = loadEarlierActionTimeline;
-    controls.appendChild(earlier); actions.appendChild(controls);
+  side.appendChild(renderBranchPanel()); side.appendChild(renderDelegationPanel()); side.appendChild(renderComputeTasksPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
+  const historyState = el("div", "timeline-history-state hidden"); actions.appendChild(historyState); syncActionTimelineHistoryState(historyState);
+  const hasRecovery = !!(S.recoveryActions || (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length)));
+  if (hasRecovery) actions.appendChild(recoveryTimelineCard(S.recoveryState, S.recoveryActions));
+  if (groups.length) actions.appendChild(actionTimelineLedger(groups, branchScope, rootFrameScope));
+  else {
+    // root.replaceChildren() above detached the region, so any path that does
+    // not re-append it must destroy the view. Destroying only on the fully
+    // empty path stranded a detached tree that still held a document-level
+    // keydown listener and a live ResizeObserver, and that
+    // syncActionTimelineHistoryState kept writing into.
+    destroyActionTimelineView();
+    if (!timeline.has_more_before && !S.workbenchErrors.timelineHistory && !hasRecovery) {
+      actions.appendChild(el("div", "workbench-empty timeline-empty", S._workbenchLoading ? t("timeline.loading") : t("timeline.empty")));
+    }
   }
-  if (S.workbenchErrors.timelineHistory) actions.appendChild(el("div", "timeline-error", t("timeline.loadEarlierFailed", S.workbenchErrors.timelineHistory)));
-  if (timeline.history_limit_reached) actions.appendChild(el("div", "workbench-empty", t("timeline.historyLimit", ACTION_TIMELINE_MAX_GROUPS)));
-  if (S.recoveryActions || (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length))) actions.appendChild(recoveryTimelineCard(S.recoveryState, S.recoveryActions));
-  if (!groups.length && !actions.children.length) actions.appendChild(el("div", "workbench-empty timeline-empty", S._workbenchLoading ? t("timeline.loading") : t("timeline.empty")));
-  else groups.slice().sort((a, b) => (+a.ordinal || 0) - (+b.ordinal || 0)).forEach(group => actions.appendChild(actionTimelineCard(group)));
   layout.appendChild(actions); root.appendChild(layout);
+  if (groups.length) updateActionTimelineLedger({ direction: "render" });
+  else S._timelineRestoreFocusGroupId = null;
+  if (restoreInspectorFocus && S._timelineView) {
+    const close = S._timelineView.inspectorHost.querySelector("button");
+    if (close) { try { close.focus({ preventScroll: true }); } catch { close.focus(); } }
+  } else if (restoreSearchFocus && S._timelineView) {
+    const input = S._timelineView.search.input; try { input.focus({ preventScroll: true }); } catch { input.focus(); }
+    if (searchSelection && searchSelection[0] != null) try { input.setSelectionRange(searchSelection[0], searchSelection[1]); } catch {}
+  }
 }
 
 /* ---------- WebSocket ---------- */
@@ -2841,19 +4789,63 @@ function connectWS() {
 // the server replays only what was missed instead of the whole turn — the
 // client would otherwise have to de-duplicate a stream it cannot tell apart.
 S._seqSeen = S._seqSeen || {};
-const sub = (f) => { try { S.ws && S.ws.readyState === 1 && S.ws.send(JSON.stringify({ type: "view_session", root_frame_id: f, since_seq: S._seqSeen[f] || 0 })); } catch {} };
+// The daemon run that issued our cursors. A cursor only means anything within
+// the process that produced it, so it travels with the epoch and the server
+// tells us (gap) when it cannot honour it.
+S._streamEpoch = S._streamEpoch || null;
+const sub = (f) => { try { S.ws && S.ws.readyState === 1 && S.ws.send(JSON.stringify({ type: "view_session", root_frame_id: f, since_seq: S._seqSeen[f] || 0, epoch: S._streamEpoch || undefined })); } catch {} };
 const unsub = (f) => { try { S.ws && S.ws.readyState === 1 && f && S.ws.send(JSON.stringify({ type: "unview_session", root_frame_id: f })); } catch {} };
 const conn = (on) => { const d = $("#conn-dot"); if (d) d.className = "dot " + (on ? "on" : "off"); };
 function onEvent(m) {
   const fid = m.root_frame_id || m.frame_id;
-  if (m.type === "replay_begin") { if (mine(fid)) { if (S.stream && S.stream.wrap) S.stream.wrap.remove(); S.stream = null; S.liveCells = []; S._liveCell = null; } }
-  else if (m.type === "replay_end") { if (mine(fid)) down(); }
-  else if (m.type === "text_reset") { if (mine(fid)) startStream(); }
+  if (m.type === "replay_begin") {
+    // A restarted daemon issues a new epoch; every cursor we hold describes a
+    // stream it never produced, so drop them all rather than resuming from a
+    // position it cannot interpret.
+    if (m.epoch && m.epoch !== S._streamEpoch) { S._streamEpoch = m.epoch; S._seqSeen = {}; }
+    if (mine(fid)) {
+      if (S.stream && S.stream.wrap) S.stream.wrap.remove();
+      S.stream = null; S.liveCells = []; S._liveCell = null;
+      // `gap` means the server could not serve our cursor — the buffer had
+      // aged past it, or it belonged to a previous run. Replaying from a hole
+      // we cannot see would leave the transcript quietly wrong, so reload it.
+      if (m.gap) { S._seqSeen[fid] = 0; S._replayGap = fid; }
+    }
+  }
+  else if (m.type === "replay_end") {
+    if (mine(fid)) {
+      if (S._replayGap === fid) { S._replayGap = null; openConversation(fid, S.project); }
+      down();
+    }
+  }
+  else if (m.type === "artifact_ref_problems") {
+    // A reference that did not resolve is *shown*. The old resolver dropped
+    // one in silence, so a user could ask a question about a file the model
+    // never received and had no way to notice. Not an error state for the
+    // turn -- it still runs, and referencing four files with one typo should
+    // answer about the other three.
+    if (mine(fid)) renderRefProblems(m.problems || []);
+  }
+  else if (m.type === "attachment_problems") {
+    if (mine(fid)) renderAttachmentProblems(m.problems || []);
+  }
+  // A late failure's prose is addressed to the turn that produced it. Without
+  // this it wipes the running turn's stream and prints its predecessor's error
+  // into it.
+  else if (m.type === "text_reset") { if (mine(fid) && !isStaleTurnEvent(m)) startStream(); }
   else if (m.type === "notebook_cell_draft") { if (mine(fid)) nbCellDraft(m); }
   else if (m.type === "notebook_cell_start") { if (mine(fid)) nbCellStart(m); }
   else if (m.type === "notebook_cell_chunk") { if (mine(fid)) nbCellChunk(m); }
   else if (m.type === "notebook_cell_finished") { if (mine(fid)) { nbCellFinished(m); scheduleWorkbenchRefresh(); } }
-  else if (m.type === "action_timeline" || m.type === "action-timeline") { if (mine(fid)) { S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(m), "latest"); if (S.activeTab === "timeline") renderActionTimeline(); } }
+  else if (m.type === "action_timeline" || m.type === "action-timeline") { if (mine(fid)) {
+    const incoming = sanitizeActionTimeline(m), currentBranch = actionTimelineBranchScope(S.actionTimeline);
+    // Branch activation keeps the root frame id, so a delayed delta from the
+    // previous branch must not replace the newly active branch projection.
+    if (!S.actionTimeline || !incoming.branch_id || !currentBranch || incoming.branch_id === currentBranch) {
+      S.actionTimeline = mergeActionTimelines(S.actionTimeline, incoming, "latest");
+      if (S.activeTab === "timeline") updateActionTimelineLedger({ direction: "latest" });
+    }
+  } }
   else if (m.type === "execution_queue") { if (mine(fid)) { rememberExecutionQueue(m); if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook(); } }
   else if (m.type === "execution_state" || m.type === "execution_owner") { if (mine(fid)) {
     // State/owner events are deltas. Paint the safe owner immediately, then
@@ -2885,7 +4877,7 @@ function onEvent(m) {
     scheduleWorkbenchRefresh(60); if (S.activeTab === "timeline") renderActionTimeline();
   } }
   else if (["sandbox", "sandbox_status", "security_status"].includes(m.type)) { if (mine(fid)) { S.securityState = sanitizeSecurity(m); if (S.activeTab === "timeline") renderActionTimeline(); } }
-  else if (m.type === "text_chunk") { if (mine(fid)) feed(m.block_type || "text", m.chunk || "", m); }
+  else if (m.type === "text_chunk") { if (mine(fid) && !isStaleTurnEvent(m)) feed(m.block_type || "text", m.chunk || "", m); }
   else if (m.type === "step") { if (mine(fid)) addLiveStep(m); }
   else if (m.type === "step_update") { if (mine(fid)) updateLiveStep(m); }
   else if (m.type === "plan_ready") { if (mine(fid)) renderPlanCard(m.plan, m.status); }
@@ -2894,8 +4886,20 @@ function onEvent(m) {
   else if (m.type === "permission_resolved") { if (mine(fid)) { resolvePermissionCard(m); scheduleWorkbenchRefresh(); } }
   else if (m.type === "frame_update") {
     if (mine(m.frame_id) || mine(fid)) {
+      // Unconditional, and deliberately outside the `!S.running` guard below:
+      // when a queued follow-up starts, `S.running` is already true from the
+      // turn that just ended, and that is precisely the hand-off this exists
+      // for.
+      if (m.status === "processing") activateTurnTicket(m.request_id, m.execution_id);
       if (m.status === "processing" && !S.running) { S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); resumeWatch(fid, S._openGen); }  // a turn observed on the WS (e.g. started from another tab) — watchdog covers a missed terminal event
-      if (["completed","failed","cancelled","success","done","ready"].includes(m.status)) { turnDone(m.status); scheduleWorkbenchRefresh(); }
+      if (["completed","failed","cancelled","success","done","ready"].includes(m.status)) {
+        // A terminal event for a turn that is no longer on screen may not
+        // close the one that is: no hint, no teardown, no ticket cleared. The
+        // workbench still refreshes, because the artifacts and cells that turn
+        // produced are real.
+        if (isStaleTurnEvent(m)) scheduleWorkbenchRefresh();
+        else { turnDone(m.status, m); scheduleWorkbenchRefresh(); }
+      }
     }
     loadSessions();
   }
@@ -3084,13 +5088,193 @@ function feed(kind, chunk, event) {
   } else { st.text += chunk; st.full += chunk; st.md.classList.add("cursor"); scheduleRender(st); return; }
   down();
 }
-function turnDone(status) {
+// A turn's request ticket, guarded by a generation.
+//
+// The job runs on its own thread and can fail before the handler has even
+// returned the 202. So the terminal WS event -- and `turnDone` with it -- can
+// arrive *first*, clear the ticket, and then `send`'s POST promise resolves
+// and writes the finished turn's id back into the slot. The next turn then
+// quotes a support id belonging to the previous one, which is worse than
+// showing none: it sends an operator to the wrong request.
+//
+// `openTurnTicket` takes the generation before the POST; `closeTurnTicket`
+// invalidates it (turn end, session switch); `commitTurnTicket` writes only if
+// the generation is still the one it took AND the turn is still running.
+function openTurnTicket() {
+  S.turnTicket = (S.turnTicket || 0) + 1;
+  return S.turnTicket;
+}
+function commitTurnTicket(token, accepted) {
+  if (!accepted || !accepted.request_id) return false;
+  if (token !== S.turnTicket) return false;   // a newer turn owns the slot
+  if (!S.running) return false;               // this turn already ended
+  S.pendingRequestId = String(accepted.request_id);
+  // The 202 names the execution too, and it is the id the stale filter
+  // actually compares -- a reused request id cannot tell two turns apart.
+  if (accepted.execution_id) S.pendingExecutionId = String(accepted.execution_id);
+  return true;
+}
+// A turn has started running server-side: it owns the slot from now on.
+//
+// This is the hand-off a queued follow-up depends on. Its 202 resolved while
+// the previous turn still owned the screen, so it could not take the slot then
+// -- and if it had, the earlier turn's own failure would have quoted the
+// follow-up's id. The `processing` event is the first moment the id is
+// current, and it carries it for exactly this reason.
+//
+// Bumping the generation here is what makes a late 202 from ANY earlier turn
+// unable to write: it is stale by definition once another turn is running.
+// Whether the server says this submission was QUEUED, whatever the client
+// believed when it started.
+//
+// `queueing` is a snapshot taken at the top of `send`, and several awaits run
+// before the POST -- the skills catalogue, sometimes creating the frame. In
+// that window another tab, or a recovered turn, can take ownership, so a send
+// that began idle can be answered with `queue_position: 1`. The 202 is the
+// authoritative answer and the local snapshot is only a hint.
+// Does THIS send still own the UI's current turn?
+//
+// `queueing`, read at the top of `send`, is a snapshot: several awaits follow
+// before the POST, and another tab -- or a recovered turn -- can change who
+// owns the session in that window. Deciding anything later from that snapshot
+// is how a rejected follow-up tore down a turn that had started meanwhile.
+// The provisional token is the honest question: it exists only for a send that
+// began as the active turn, and it stops matching the moment any other turn is
+// activated.
+function ownsTurnTicket(token) {
+  return token != null && token === S.turnTicket;
+}
+// Claim the slot for this submission, if the server says it is the one running.
+//
+// `queue_position === 0` is the ONLY proof of that. Greater than zero is
+// queued behind someone else; absent means the snapshot could not be taken --
+// typically a job that finished before it was read -- and an unknown is not a
+// yes. Neither may write, or the running turn's failure quotes the wrong id.
+function acceptTurnTicket(token, accepted) {
+  // Ownership is `commitTurnTicket`'s question and it already asks it; asking
+  // again here would be a branch no test can reach, which reads as care and is
+  // decoration. What this adds is the server's answer.
+  if (!accepted || !accepted.request_id) return false;
+  if (accepted.queue_position !== 0) return false;
+  return commitTurnTicket(token, accepted);
+}
+// This send is not the running turn after all: kill its provisional ticket so
+// a later resolution cannot claim the slot with it. Deliberately leaves
+// `pendingRequestId` alone -- if we no longer own the generation, whatever is
+// in there belongs to somebody else's turn.
+// Is this event the tail of a turn that is no longer the one on screen?
+//
+// The ordering is real and reproducible: `processing(A)`, `processing(B)`,
+// then `failed(A)` -- A fails inside the turn, persists its row, and only
+// finishes unwinding after B has been promoted out of the queue. Acting on
+// A's terminal there closes B's turn, unlocks the composer under a running
+// turn, and prints A's error into B's transcript.
+//
+// Filtered on the EXECUTION, not the request: a client may reuse
+// `X-Request-Id`, so A and B can legitimately share one. Request id is the
+// fallback for a daemon old enough not to send an execution id, and when
+// neither side offers any identity at all the event is treated as current --
+// the pre-identity behaviour, which is the only safe default for a client
+// talking to an older server.
+function isStaleTurnEvent(event) {
+  const incomingExec = (event && event.execution_id) || "";
+  if (incomingExec && S.pendingExecutionId) return incomingExec !== S.pendingExecutionId;
+  if (incomingExec || S.pendingExecutionId) return false;   // one side is silent
+  const incomingReq = (event && event.request_id) || "";
+  if (incomingReq && S.pendingRequestId) return incomingReq !== S.pendingRequestId;
+  return false;
+}
+function retireTurnTicket(token) {
+  if (!ownsTurnTicket(token)) return false;
+  S.turnTicket = (S.turnTicket || 0) + 1;
+  return true;
+}
+function activateTurnTicket(requestId, executionId) {
+  // The generation always advances: another turn is running now, so every
+  // ticket in flight is stale whether or not this event named itself.
+  S.turnTicket = (S.turnTicket || 0) + 1;
+  // The identities are only *overwritten* by an event that carries them. An
+  // older daemon sends `processing` with neither, and clearing on that would
+  // throw away the ids the 202 had already given us -- leaving the running
+  // turn's own failure with nothing to quote and nothing to filter on.
+  if (requestId) S.pendingRequestId = String(requestId).slice(0, 96);
+  if (executionId) S.pendingExecutionId = String(executionId).slice(0, 96);
+  return S.turnTicket;
+}
+function closeTurnTicket() {
+  S.turnTicket = (S.turnTicket || 0) + 1;
+  S.pendingRequestId = null;
+  S.pendingExecutionId = null;
+}
+// The sentence a failed turn shows, from whichever source has the facts.
+//
+// Two of them exist and they have to agree: the `frame_update` a live client
+// receives, and the `failure` metadata `GET /frames/{id}/messages` projects
+// when the same client reopens the session later. Before this, reopening lost
+// both the support id and the retry veto -- the socket event was gone and the
+// stored row was a sentence, so the user most likely to need them (the one who
+// closed the tab on a failure) was the one who could not get them.
+// The stored failure, shown on its own message. Text only -- these three
+// fields are what the projector already published, and nothing here is derived
+// from the exception.
+// The failure on the LAST message, or null if the transcript does not end in
+// one. Read from the DOM the render just produced rather than from a second
+// fetch, so the two cannot disagree about what the newest message is.
+function lastTerminalFailure() {
+  const rows = [...document.querySelectorAll("#messages .msg")];
+  const last = rows[rows.length - 1];
+  if (!last) return null;
+  const box = last.querySelector(".msg-failure-meta");
+  return box ? { request_id: box.dataset.requestId || "", code: box.dataset.failureCode || "", output_committed: box.dataset.committed === "1" } : null;
+}
+function failureCodeHint(code) {
+  const key = ({
+    llm_request_burst: "turn.failure.llmRequestBurst",
+    llm_rate_limited: "turn.failure.llmRateLimited",
+    llm_upstream_overloaded: "turn.failure.llmUpstreamOverloaded",
+  })[String(code || "")];
+  return key ? t(key) : "";
+}
+function failureMeta(failure) {
+  const box = el("div", "msg-failure-meta");
+  const bits = [];
+  const cause = failureCodeHint(failure.code);
+  if (cause) bits.push(cause);
+  if (failure.output_committed) bits.push(t("turn.failedCommitted"));
+  if (failure.request_id) bits.push(t("turn.supportId", String(failure.request_id).slice(0, 96)));
+  box.textContent = bits.join(" ");
+  box.dataset.requestId = failure.request_id ? String(failure.request_id).slice(0, 96) : "";
+  box.dataset.failureCode = failure.code ? String(failure.code).slice(0, 64) : "";
+  if (failure.output_committed) box.dataset.committed = "1";
+  return box;
+}
+function failureHint(detail) {
+  const committed = !!(detail && detail.output_committed);
+  const cause = failureCodeHint(detail && detail.code);
+  const base = committed
+    ? [t("turn.failedCommitted"), cause].filter(Boolean).join(" ")
+    : (cause || t("turn.failed"));
+  const raw = (detail && detail.request_id) || S.pendingRequestId || "";
+  const id = raw ? String(raw).slice(0, 96) : "";
+  return id ? base + " " + t("turn.supportId", id) : base;
+}
+function turnDone(status, detail) {
   S.running = false; enableComposer(true); $("#cancel-btn").classList.add("hidden");  clearTimeout(S._resumeTimer); S._resumeTok = (S._resumeTok || 0) + 1;  // retire the resume-watchdog (incl. any in-flight tick) so it can't bleed into the next turn
   if (S.stream) { flushRender(S.stream, true); S.stream.md.classList.remove("cursor"); addMsgActions(S.stream.wrap, S.stream.full || S.stream.text); }
   // Belt-and-suspenders: a completed turn must leave nothing blinking, even on
   // text blocks orphaned earlier by a tool/step that started mid-stream.
   const mm = $("#messages"); if (mm) mm.querySelectorAll(".md.cursor").forEach(n => n.classList.remove("cursor"));
-  hint(status === "failed" ? t("turn.failed") : "", status === "failed");
+  // "please retry" is the wrong advice once output has been committed. The
+  // server sets `output_committed` when the failure happened after bytes were
+  // streamed or a tool ran, and `llm/models.py` calls it the retry veto: a
+  // transparent retry there duplicates visible output or re-fires a side
+  // effect, however retryable the status looks. Saying "retry" anyway is how a
+  // UI turns one failed turn into two executions of the same tool.
+  hint(status === "failed" ? failureHint(detail) : "", status === "failed");
+  // Retired with the turn it belonged to, and the generation moved on so a
+  // 202 still in flight cannot write it back. Kept only as the fallback above,
+  // for a terminal event that arrives without an id.
+  closeTurnTicket();
   invalidateKernelCache();  // the kernel just went turn_running → idle; re-read promptly
   if (S.currentId) { loadArtifacts(S.currentId); loadExecutionLog(S.currentId); }
   S.stream = null; S.liveCells = []; S._liveCell = null;
@@ -3122,6 +5306,14 @@ function planConfLevel(c) {
   if (s.includes("low") || s.includes("低") || (!isNaN(n) && n > 0 && n < 0.4)) return "low";
   return "medium";
 }
+// The same partition `PlanService._SETTLED_STEP_STATUSES` makes, in the one
+// place the UI needs it. The paused footer counted "not completed and not
+// failed" inline, which is a second copy of a rule that had already drifted
+// once -- `skipped` was missing from both.
+const PLAN_SETTLED_STEP_STATUSES = ["completed", "failed", "skipped"];
+function planStepSettled(status) {
+  return PLAN_SETTLED_STEP_STATUSES.includes(status);
+}
 function planStepIcon(status) {
   if (status === "completed") return "check";
   if (status === "in_progress") return "circle-dot";
@@ -3140,7 +5332,7 @@ function renderPlanCard(plan, status) {
   // header: title + confidence badge
   const head = el("div", "pc-head");
   const tt = el("div", "pc-title-wrap");
-  tt.appendChild(el("div", "pc-eyebrow", status === "draft" ? t("plan.eyebrow.draft") : (status === "executing" ? t("plan.eyebrow.executing") : status === "completed" ? t("plan.eyebrow.completed") : status === "failed" ? t("plan.eyebrow.failed") : t("plan.eyebrow.default"))));
+  tt.appendChild(el("div", "pc-eyebrow", status === "draft" ? t("plan.eyebrow.draft") : (status === "executing" ? t("plan.eyebrow.executing") : status === "completed" ? t("plan.eyebrow.completed") : status === "failed" ? t("plan.eyebrow.failed") : status === "paused" ? t("plan.eyebrow.paused") : t("plan.eyebrow.default"))));
   tt.appendChild(el("div", "pc-title", plan.title || t("plan.title.default")));
   head.appendChild(tt);
   if (plan.confidence) {
@@ -3183,8 +5375,19 @@ function renderPlanCard(plan, status) {
     const st = el("div", "pc-status " + status);
     st.textContent = status === "executing" ? t("plan.status.executing", done, total)
       : status === "completed" ? t("plan.status.completed", done, total)
-        : status === "failed" ? t("plan.status.failed", done, total) : "";
+        : status === "failed" ? t("plan.status.failed", done, total)
+          // A paused plan used to render an empty status line and no control:
+          // the backend could hold `paused`, and the only way out of it was to
+          // discard the plan and start over. It reports what is left rather
+          // than what is done, because that is the number the button acts on.
+          : status === "paused" ? t("plan.status.paused", done, total, (plan.steps || []).filter(x => !planStepSettled(x.status)).length) : "";
     card.appendChild(st);
+    if (status === "paused") {
+      const pa = el("div", "pa");
+      const go = el("button", "approve-btn"); go.appendChild(iconEl("check", 15)); go.appendChild(el("span", null, t("plan.resume"))); go.onclick = resumePlan;
+      const no = el("button", "outline-btn small", t("plan.discard")); no.onclick = discardPlan;
+      pa.appendChild(go); pa.appendChild(no); card.appendChild(pa);
+    }
   }
   $("#messages").appendChild(card); down();
 }
@@ -3202,13 +5405,54 @@ function updatePlanProgress(m) {
   if (foot && S.planReady) { const done = (S.planReady.steps || []).filter(s => s.status === "completed").length; const total = (S.planReady.steps || []).length; foot.textContent = t("plan.status.executing", done, total); }
   down();
 }
+// One generation-owned dispatch for every plan turn.
+//
+// Each of these used to lock the UI *after* awaiting its 202 (revise locked
+// first, but took no ticket). A plan can fail before the POST is answered, so
+// the terminal event arrives first, `turnDone` unlocks -- and then the await
+// resolves and locks the composer again against a turn that has already ended.
+// The session is stuck until reload. The mirror case is just as bad: while the
+// await is outstanding another turn can start, and a rejected plan POST then
+// tears *that* turn down.
+//
+// So: take the generation and lock before the POST; commit the 202's ids only
+// if the generation still stands; and let only the owner tear anything down.
+async function dispatchPlanTurn(path, body, runningHint, failedKey) {
+  // Refuse outright while a turn is running -- including this one, if the
+  // user double-clicks. Taking a second ticket makes the newer request the
+  // owner: a 409 then tears down the turn that is actually running, and an
+  // acceptance replaces the running turn's identity with a queued plan's, so
+  // that turn's own terminal event is judged stale and never closes it.
+  if (!S.currentId || S.running) return false;
+  const token = openTurnTicket();
+  S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden");
+  hint(runningHint, false, true);
+  try {
+    const accepted = await api(`/frames/${S.currentId}${path}`, { method: "POST", body: JSON.stringify(body) });
+    // A terminal event that beat the 202 has already closed this generation.
+    // Re-locking, storing its ids or re-arming the watchdog here would revive
+    // a turn that is over.
+    if (!ownsTurnTicket(token)) return true;
+    commitTurnTicket(token, accepted || {});
+    resumeWatch(S.currentId, S._openGen);  // 202 returns at once; only the WS unlocks us
+    return true;
+  } catch (e) {
+    hint(t(failedKey, apiErrorText(e)), true);
+    // Only our own turn. If another one took over while we were awaiting, this
+    // failure is ours to report and not theirs to end.
+    if (ownsTurnTicket(token)) turnDone("failed");
+    return false;
+  }
+}
 async function approvePlan() {
-  if (!S.currentId) return;
-  try { await api(`/frames/${S.currentId}/plan/approve`, { method: "POST", body: JSON.stringify({ model: S.defaultModel }) }); }
-  catch (e) { hint(t("plan.approveFailed", e.message), true); return; }
-  S.planMode = false; const pt = $("#plan-toggle"); if (pt) pt.classList.remove("on");
-  S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint(t("plan.autoExecuting"), false, true);
-  resumeWatch(S.currentId, S._openGen);  // /plan/approve returns 202 immediately — only the WS unlocks us; watchdog covers a missed terminal event
+  // The mode toggle follows acceptance, as it always has: an approved plan is
+  // no longer being drafted.
+  if (await dispatchPlanTurn("/plan/approve", { model: S.defaultModelName }, t("plan.autoExecuting"), "plan.approveFailed")) {
+    S.planMode = false; const pt = $("#plan-toggle"); if (pt) pt.classList.remove("on");
+  }
+}
+async function resumePlan() {
+  await dispatchPlanTurn("/plan/resume", { model: S.defaultModelName }, t("plan.resuming"), "plan.resumeFailed");
 }
 async function discardPlan() {
   if (!S.currentId) return;
@@ -3217,10 +5461,7 @@ async function discardPlan() {
   S.planReady = null; S.planStatus = "discarded"; S.planPending = false; hint(t("toast.planDiscarded"));
 }
 async function revisePlan(changes) {
-  if (!S.currentId) return;
-  S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint(t("toast.planRevising"), false, true);
-  try { await api(`/frames/${S.currentId}/plan/revise`, { method: "POST", body: JSON.stringify({ changes, model: S.defaultModel }) }); resumeWatch(S.currentId, S._openGen); }
-  catch (e) { hint(t("toast.reviseFailed", e.message), true); if (S.running) turnDone("failed"); }
+  await dispatchPlanTurn("/plan/revise", { changes, model: S.defaultModelName }, t("toast.planRevising"), "toast.reviseFailed");
 }
 
 /* ---------- semantic activity steps (plan / search / env / skill / …) ---------- */
@@ -3331,6 +5572,16 @@ function outputBlock(box, text, opts) {
   }
   box.appendChild(out);
 }
+function searchResultHttpUrl(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const lower = raw.toLowerCase();
+  // Rebuild the scheme from a literal so untrusted result data can only reach
+  // the URL suffix. This preserves mixed-case HTTP(S) inputs without allowing
+  // javascript:, data:, or protocol-relative URLs to control the href scheme.
+  if (lower.startsWith("https://")) return "https://" + raw.slice(8);
+  if (lower.startsWith("http://")) return "http://" + raw.slice(7);
+  return "";
+}
 function stepBody(step) {
   const k = step.kind, inp = step.input || {}, out = step.output || {};
   const box = el("div", "s-inner");
@@ -3351,13 +5602,10 @@ function stepBody(step) {
     if (inp.query) box.appendChild(el("div", "s-q", "“" + inp.query + "”"));
     (out.results || []).forEach(r => {
       const row = el("div", "s-res");
-      const u = typeof r.url === "string" ? r.url.trim() : "";
-      // Only turn a result into a link when its scheme is safe to navigate to;
-      // a javascript:/data: URL in an href would run on click (XSS). The scheme
-      // test is inlined at the assignment so it acts as the guard on `u`.
-      const a = el(/^https?:\/\//i.test(u) ? "a" : "div", "s-res-t");
+      const safeUrl = searchResultHttpUrl(r.url);
+      const a = el(safeUrl ? "a" : "div", "s-res-t");
       a.textContent = r.title || r.url || t("step.search.emptyResult");
-      if (/^https?:\/\//i.test(u)) { a.href = u; a.target = "_blank"; a.rel = "noopener noreferrer"; }
+      if (safeUrl) { a.href = safeUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; }
       row.appendChild(a);
       if (r.url) row.appendChild(el("div", "s-res-u", r.url));
       if (r.snippet) row.appendChild(el("div", "s-res-s", r.snippet));
@@ -3551,6 +5799,10 @@ function updateLiveStep(m) {
 function renderStoredStep(s) {
   const handle = buildStepCard(s);
   if (s.step_id) (S.stepEls = S.stepEls || {})[s.step_id] = handle;
+  // Same stamp as a stored message: steps are fetched whole while messages are
+  // paged, so a later page of older messages has to be able to sort against
+  // the step cards already on screen.
+  handle.card.dataset.ts = String(s.created_at || 0);
   $("#messages").appendChild(handle.card);
 }
 
@@ -3570,6 +5822,19 @@ function permActionLine(m) {
   if (t === "delegate") return { mono: false, text: inp.specialist || m.target || "" };
   return { mono: true, text: m.target || "" };
 }
+// How much the card offers to remember by default.
+//
+// It was "conversation" for everything. Combined with a pre-filled pattern and
+// an Allow button, that made a single click on a `restore_artifact_version` or
+// `compute_submit` prompt grant that capability for the rest of the session —
+// and the card gave no sign the two were different, because nothing read the
+// tool's `dangerous` declaration. Now the risky ones default to a grant that
+// covers only this call. Every scope is still offered; the user picks a broader
+// one deliberately rather than by not noticing the selector.
+function defaultRememberScope(m) {
+  return (m && m.dangerous) ? "once" : "conversation";
+}
+
 function renderPermissionCard(m) {
   S.permCards = S.permCards || Object.create(null);  // null-proto: keys like __proto__ can't pollute
   const prev = S.permCards[m.decision_id];
@@ -3581,12 +5846,13 @@ function renderPermissionCard(m) {
   head.appendChild(iconEl("lock", 15, "perm-ic"));
   head.appendChild(el("span", "perm-title", m.title || t("perm.title.run", m.tool)));
   if (m.sub_agent) head.appendChild(el("span", "perm-badge", t("perm.badge.subAgent")));
+  if (m.dangerous) head.appendChild(el("span", "perm-badge danger", t("perm.badge.dangerous")));
   card.appendChild(head);
   card.appendChild(el("div", "perm-sub", t("perm.sub.approvalNeeded")));
   const act = permActionLine(m);
   if (act.text) card.appendChild(el("div", "perm-detail" + (act.mono ? " mono" : ""), act.text));
 
-  let scope = "conversation";
+  let scope = defaultRememberScope(m);
   card.appendChild(el("div", "perm-lbl", t("perm.lbl.rememberScope")));
   const scRow = el("div", "perm-scope");
   const segs = {};
@@ -3597,6 +5863,10 @@ function renderPermissionCard(m) {
     segs[s] = b; scRow.appendChild(b);
   });
   card.appendChild(scRow);
+  // The rule box is meaningless for a "once" grant, and was only ever hidden by
+  // the click handler — so a card that starts at "once" would show an input
+  // that does nothing.
+  patWrap.style.display = (scope === "once") ? "none" : "";
 
   patWrap.appendChild(el("div", "perm-lbl", t("perm.lbl.rememberRule")));
   const patIn = el("input", "perm-in"); patIn.type = "text";
@@ -3625,7 +5895,19 @@ function renderPermissionCard(m) {
       resolution = await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) });
       if (!resolution || resolution.ok !== true) throw new Error((resolution && resolution.error) || "permission decision was not accepted");
     }
-    catch (e) { allow.disabled = deny.disabled = false; hint(t("toast.submitFailed", e.message), true); return; }
+    catch (e) {
+      // Re-enabling is the right default: the decision was refused, so the user
+      // may fix and resubmit. It is wrong for exactly one refusal --
+      // `decision_continuation_failed`, where the approval WAS written and only
+      // its continuation marker failed. Clicking Allow again there submits a
+      // decision that already took effect, which is the dangerous retry P0-4's
+      // `output_committed` exists to suppress. The turn-failure surface already
+      // reads that field; this one did not.
+      const committed = !!(e && e.body && e.body.output_committed);
+      if (!committed) allow.disabled = deny.disabled = false;
+      hint(t("toast.submitFailed", apiErrorText(e)), true);
+      return;
+    }
     markPermCard(m.decision_id, ok, scope, resolution);
   };
   allow.onclick = () => send(true);
@@ -3713,11 +5995,47 @@ function renderDashProjects() {
     pc.appendChild(row);
   });
 }
+// The example analysis, offered rather than performed. It used to run itself
+// on first boot -- six cells, live UniProt/RCSB calls, four artifacts, before
+// the user had typed anything. The work is worth having; doing it unasked was
+// the problem, so it became a button. The hint says what clicking will do,
+// because "run the example" should not be the first time someone learns this
+// app makes outbound calls.
+function exampleSeedCta() {
+  const box = el("div", "dash-example");
+  const btn = el("button", "btn", t("dash.example.cta"));
+  const note = el("div", "dash-example-hint", t("dash.example.hint"));
+  box.appendChild(btn); box.appendChild(note);
+  let timer = 0;
+  const stop = () => { if (timer) { clearInterval(timer); timer = 0; } };
+  const paint = (st) => {
+    if (st.running) { btn.disabled = true; btn.textContent = t("dash.example.running"); }
+    else { btn.disabled = false; btn.textContent = t("dash.example.cta"); }
+    // Report a failed seed. Without this the only signal is that the example
+    // never appears, which looks identical to a slow network.
+    if (st.error) note.textContent = t("dash.example.failed") + st.error;
+    if (st.seeded) { stop(); loadDashboard(); }
+  };
+  const poll = () => api("/example/session").then(paint).catch(stop);
+  btn.onclick = () => {
+    btn.disabled = true;
+    // `confirm` is required by the route: it runs code and calls external
+    // APIs, so intent has to be in the body rather than implied by the verb.
+    api("/example/session", { method: "POST", body: JSON.stringify({ confirm: true }) }).then(st => {
+      paint(st);
+      stop(); timer = setInterval(poll, 1500);
+    }).catch(e => { btn.disabled = false; note.textContent = t("dash.example.failed") + apiErrorText(e); });
+  };
+  // Hidden entirely once the example exists, and while a startup-opt-in seed
+  // (OPENAI4S_SEED_DEMO=1) is already doing the same work.
+  api("/example/session").then(st => { if (st.seeded) box.remove(); else paint(st); if (st.running) timer = setInterval(poll, 1500); }).catch(() => box.remove());
+  return box;
+}
 function renderDashRecent(frames) {
   const recent = frames.filter(f => (f.message_count || 0) > 0 || f.name || f.task_summary)
     .sort((a, b) => (new Date(b.updated_at) - new Date(a.updated_at))).slice(0, 10);
   const sc = $("#dash-sessions"); if (!sc) return; sc.innerHTML = "";
-  if (!recent.length) sc.appendChild(el("div", "dash-empty", t("dash.sessions.empty")));
+  if (!recent.length) { sc.appendChild(el("div", "dash-empty", t("dash.sessions.empty"))); sc.appendChild(exampleSeedCta()); }
   recent.forEach(f => {
     const row = el("div", "d-row"); row.appendChild(el("div", f.running ? "d-dot live" : "d-dot"));
     const main = el("div", "d-main"); main.appendChild(el("div", "d-name", f.name || f.task_summary || t("session.untitled")));
@@ -3917,7 +6235,7 @@ async function submitProjectModal() {
       await createProject(name, $("#pm-desc").value, $("#pm-ctx").value);
       closeProjectModal();
     }
-  } catch (e) { hint(t("artifact.save.err", e.message), true); }
+  } catch (e) { hint(t("artifact.save.err", apiErrorText(e)), true); }
   finally { btn.disabled = false; }
 }
 async function deleteProject(id) {
@@ -3927,14 +6245,105 @@ async function deleteProject(id) {
     await loadProjects();
     if (S.project === id) { S.project = null; showDashboard(); }
     else renderProjMenu();
-  } catch (e) { hint(t("toast.deleteFailed", e.message), true); }
+  } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); }
 }
 
 /* ---------- sessions ---------- */
+// Newest-first paging, which the server has supported the whole time.
+//
+// Every message fetch here sent `?from=0&limit=N` — the OLDEST N — so opening a
+// 640-message session showed messages 0 to 299 and the work you came back for
+// was off the end. `newest_first` / `before_seq` / `next_before_seq` went in
+// through the store, the repository and the route, and `app.js` contained
+// neither string; a comment on the route even described "the client asks for
+// the newest page", describing a client nobody had written.
+//
+// The rows come back descending, so they are sorted back into reading order
+// here rather than at each call site.
+const MESSAGE_PAGE_SIZE = 300;       // one page of history per request
+const MESSAGE_WALK_MAX_PAGES = 200;  // 60k messages: a bound on a pathological session, not a feature cap
+async function fetchRecentMessages(fid, limit) {
+  const data = await api(`/frames/${encodeURIComponent(fid)}/messages?newest_first=1&limit=${limit}`);
+  const rows = (data && data.messages) || [];
+  rows.sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  return { ...data, messages: rows };
+}
+// One page OLDER than `beforeSeq`, sorted back into reading order.
+//
+// `before_seq` is a keyset bound on a monotonic `seq`, not an offset, so a
+// message arriving while the reader walks back cannot shift the page under
+// them — with an offset, every arrival would repeat or skip a row.
+async function fetchOlderMessages(fid, beforeSeq, limit) {
+  const data = await api(`/frames/${encodeURIComponent(fid)}/messages?limit=${limit}&before_seq=${encodeURIComponent(beforeSeq)}`);
+  const rows = (data && data.messages) || [];
+  rows.sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  return { ...data, messages: rows };
+}
+// The WHOLE conversation, walked newest page first and returned oldest-first.
+//
+// The Markdown export asked the newest-page helper for 500 messages and wrote
+// the result under a heading naming the session: a 640-message session exported
+// its last 500 messages and said nothing about the first 140. `complete` is
+// reported so the caller can say so when the walk hits its bound, rather than
+// producing a short export that looks whole.
+async function fetchAllMessages(fid) {
+  const first = await fetchRecentMessages(fid, MESSAGE_PAGE_SIZE);
+  let rows = first.messages || [];
+  let cursor = first.next_before_seq, earlier = !!first.has_earlier, pages = 1;
+  while (earlier && cursor != null && pages < MESSAGE_WALK_MAX_PAGES) {
+    const older = await fetchOlderMessages(fid, cursor, MESSAGE_PAGE_SIZE);
+    rows = (older.messages || []).concat(rows);
+    cursor = older.next_before_seq; earlier = !!older.has_earlier; pages += 1;
+  }
+  return { messages: rows, complete: !earlier };
+}
+
+const SESSION_PAGE_SIZE = 100;   // the route's own page cap is 200; this leaves headroom
+const SESSION_MAX_PAGES = 50;    // 5000 sessions held in the sidebar at once
 async function loadSessions() {
-  try { const f = await api("/frames?limit=100"); S.sessions = (f.frames || []).filter(x => !x.parent_frame_id); } catch { S.sessions = []; }
+  // Scoped to the open project, and paged with the cursor the route has always
+  // returned. This fetched the 100 most recent sessions across ALL projects and
+  // filtered by project in the browser, so a project whose sessions sat outside
+  // that global page appeared to have none — and `openProject` reads "none" as
+  // a reason to call `newSession()`. Switching to a quiet project therefore
+  // created a blank session instead of showing the work sitting in SQLite.
+  //
+  // It was also a hard stop at 100: `next_cursor` and `has_more` had no
+  // consumer anywhere in this file, so session 101 of 260 was unreachable by
+  // any control the UI offered.
+  //
+  // A refresh re-walks from the newest page instead of appending, because
+  // `loadSessions()` runs on every `frame_update`. Re-walking is exact:
+  // `(created_at, frame_id)` is a value bound, so a session created — or
+  // deleted — between two page requests cannot make the walk repeat or skip a
+  // row. That is the property an offset does not have, and it is why a live
+  // arrival does not disturb a reader who has paged several pages deep.
+  const scope = S.project ? `&project_id=${encodeURIComponent(S.project)}` : "";
+  if (S._sessionScope !== (S.project || "")) { S._sessionScope = S.project || ""; S.sessionPages = 1; }
+  const want = Math.min(SESSION_MAX_PAGES, Math.max(1, S.sessionPages || 1));
+  const rows = []; const seen = new Set();
+  let cursor = null, hasMore = false, walked = 0;
+  try {
+    while (walked < want) {
+      const f = await api(`/frames?limit=${SESSION_PAGE_SIZE}${scope}` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""));
+      walked += 1;
+      ((f && f.frames) || []).forEach(x => { if (!x.parent_frame_id && !seen.has(x.id)) { seen.add(x.id); rows.push(x); } });
+      hasMore = !!(f && f.has_more); cursor = (f && f.next_cursor) || null;
+      if (!hasMore || !cursor) break;
+    }
+    S.sessions = rows; S.sessionPages = Math.max(1, walked); S.sessionsHasMore = hasMore;
+  } catch { S.sessions = []; S.sessionPages = 1; S.sessionsHasMore = false; }
   await loadFolders();
   renderSessions(); syncCurrentTitle(); if (!$("#dashboard").classList.contains("hidden")) loadDashboard();
+}
+// One more page, by re-walking one page deeper. Guarded because `loadSessions`
+// is also fired by `frame_update`, and two overlapping walks would render the
+// shorter one's result last.
+async function loadMoreSessions() {
+  if (S._sessionsLoadingMore || !S.sessionsHasMore) return;
+  if ((S.sessionPages || 1) >= SESSION_MAX_PAGES) return;
+  S._sessionsLoadingMore = true; S.sessionPages = (S.sessionPages || 1) + 1; renderSessions();
+  try { await loadSessions(); } finally { S._sessionsLoadingMore = false; renderSessions(); }
 }
 // Keep the open conversation's header in sync with the server title (e.g. the
 // background-generated summary that replaces the first-message placeholder).
@@ -3985,11 +6394,25 @@ function renderSessions() {
   const ungrouped = ss.filter(f => !f.folder_id || !(S.folders || []).some(x => x.folder_id === f.folder_id));
   let lastBucket = null;
   ungrouped.forEach(f => { const b = dateBucket(f.updated_at); if (b !== lastBucket) { lastBucket = b; frag.appendChild(el("div", "side-label", b)); } frag.appendChild(sessionRow(f)); });
+  // The control that makes the cursor reachable. Without it `has_more` is a
+  // field nothing acts on, and the list simply ends at the first page with no
+  // sign that it was cut rather than finished.
+  if (S.sessionsHasMore && (S.sessionPages || 1) >= SESSION_MAX_PAGES) {
+    // Say the walk stopped, rather than offer a button that cannot go deeper.
+    // The bound exists because a refresh re-walks every held page, and a dead
+    // control is worse than a sentence — it looks like the feature is broken.
+    frag.appendChild(el("div", "side-label", t("session.loadMoreLimit")));
+  } else if (S.sessionsHasMore) {
+    const more = el("button", "outline-btn small", S._sessionsLoadingMore ? t("common.loading") : t("session.loadMore"));
+    more.id = "session-more"; more.disabled = !!S._sessionsLoadingMore;
+    more.style.margin = "10px 8px"; more.onclick = loadMoreSessions;
+    frag.appendChild(more);
+  }
   list.appendChild(frag);
 }
 async function newFolder() {
   const name = prompt(t("folder.new.prompt")); if (!name || !S.project) return;
-  try { await api(`/projects/${S.project}/folders`, { method: "POST", body: JSON.stringify({ name }) }); invalidateFolders(); await loadFolders(); await loadSessions(); } catch (e) { hint(t("folder.create.failed", e.message), true); }
+  try { await api(`/projects/${S.project}/folders`, { method: "POST", body: JSON.stringify({ name }) }); invalidateFolders(); await loadFolders(); await loadSessions(); } catch (e) { hint(t("folder.create.failed", apiErrorText(e)), true); }
 }
 function folderMenu(anchor, fold) {
   openMenu(anchor, [
@@ -3997,11 +6420,11 @@ function folderMenu(anchor, fold) {
     { label: t("folder.menu.delete"), icon: "trash-2", danger: true, onClick: async () => { if (!confirm(t("folder.delete.confirm", fold.name))) return; try { await api(`/folders/${fold.folder_id}`, { method: "DELETE" }); invalidateFolders(); await loadFolders(); await loadSessions(); } catch {} } },
   ]);
 }
-async function assignFolder(fid, folder_id) { try { await api(`/frames/${fid}/folder`, { method: "POST", body: JSON.stringify({ folder_id }) }); await loadSessions(); hint(folder_id ? t("folder.assigned.in") : t("folder.assigned.out")); } catch (e) { hint(t("folder.move.failed", e.message), true); } }
+async function assignFolder(fid, folder_id) { try { await api(`/frames/${fid}/folder`, { method: "POST", body: JSON.stringify({ folder_id }) }); await loadSessions(); hint(folder_id ? t("folder.assigned.in") : t("folder.assigned.out")); } catch (e) { hint(t("folder.move.failed", apiErrorText(e)), true); } }
 async function newSession() {
-  try { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModel }) });
+  try { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModelName }) });
     await loadSessions(); openConversation(f.id, S.project); $("#composer").focus();
-  } catch (e) { hint(t("folder.create.failed", e.message), true); }
+  } catch (e) { hint(t("folder.create.failed", apiErrorText(e)), true); }
 }
 // Safety net for the "recovering" (resume) state. We lock the composer while a
 // turn keeps running server-side and normally unlock it when that turn's terminal
@@ -4044,14 +6467,17 @@ async function openConversation(fid, pid) {
   showWorkspace(); showConv(); renderProjMenu();
   if (mqMobile.matches) setSidebar(true);  // collapse the mobile drawer so the conversation is visible
   S.currentId = fid; $("#messages").innerHTML = ""; S.stream = null;
+  closeTurnTicket();  // a ticket belongs to the session that issued it
+  S.msgCursor = null; S.msgHasEarlier = false; S._msgEarlierLoading = false;  // the history window restarts at the newest page
   S.running = false; enableComposer(true); $("#cancel-btn").classList.add("hidden");
   clearTimeout(S._resumeTimer);  // stop any resume-watchdog from the previously open session
   const gen = S._openGen = (S._openGen || 0) + 1;  // guard async continuations against fast session-switching
   S.cells = []; S.kernels = []; S.liveCells = []; S._liveCell = null; S.dockArtifact = null; S.kernelFilter = null;
-  S.actionTimeline = null; S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null; S.recoveryActions = null; S.delegationState = null;
+  destroyActionTimelineView(); S.actionTimeline = null; S.actionTimelineSelectedGroupId = null; S.actionTimelineSelectedBranchId = null;
+  S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null; S.recoveryActions = null; S.delegationState = null;
   S.branchState = null; S.branchUndo = null; S.contextState = null; S.securityState = null;
   S.workbenchErrors = {}; S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1; S._timelineHistoryLoading = null;
-  S._recoveryActionLoading = null; S._branchActionLoading = null;
+  S._recoveryActionLoading = null; S._branchActionLoading = null; S._timelineRestoreFocusGroupId = null;
   S.variableInspector = { language: "python", results: {}, loading: null, error: "", request: 0 };
   clearTimeout(S._workbenchTimer); S._workbenchReq = (S._workbenchReq || 0) + 1; S._workbenchLoading = null;
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
@@ -4070,11 +6496,13 @@ async function openConversation(fid, pid) {
   let msgCount = 0;
   try {
     const [d, sd] = await Promise.all([
-      api(`/frames/${fid}/messages?from=0&limit=300`),
+      fetchRecentMessages(fid, MESSAGE_PAGE_SIZE),
       api(`/frames/${fid}/steps`).catch(() => ({ steps: [] })),
     ]);
     if (gen !== S._openGen) return;
     const msgs = (d && d.messages) || []; msgCount = msgs.length;
+    S.msgCursor = (d && d.next_before_seq != null) ? d.next_before_seq : null;
+    S.msgHasEarlier = !!(d && d.has_earlier);
     const steps = (sd && sd.steps) || [];
     // interleave stored messages + activity steps by timestamp (steps carry seq
     // for a stable tie-break) so a reopened session re-renders the full activity.
@@ -4083,10 +6511,19 @@ async function openConversation(fid, pid) {
     steps.forEach(s => items.push({ t: s.created_at || 0, seq: s.seq || 0, kind: "step", v: s }));
     items.sort((a, b) => (a.t - b.t) || (a.seq - b.seq));
     items.forEach(it => { if (it.kind === "msg") renderStored(it.v); else renderStoredStep(it.v); });
+    paintEarlierControl();
   } catch {}
   if (gen !== S._openGen) return;
   if (!msgCount) renderEmptySession();
-  loadArtifacts(fid); loadExecutionLog(fid); loadAnnotations(fid); loadWorkbenchState(fid); down(true); updateJumpPill();
+  loadArtifacts(fid); loadExecutionLog(fid); loadWorkbenchState(fid); down(true); updateJumpPill();
+  // Sequenced, not raced. `reconcileLastAdmission` reads the server's view and
+  // then reloads annotations; firing it alongside `loadAnnotations` meant the
+  // two replies could land in either order, so a reload sometimes showed the
+  // stale pre-turn state and sometimes the reconciled one.
+  (async () => {
+    await loadAnnotations(fid);
+    await reconcileLastAdmission(fid);
+  })();
   // Resume: subscribe AFTER history renders so a replayed in-flight turn streams
   // below it. If a turn is still running server-side (survived our last close),
   // lock the composer and let the WS replay rebuild the live stream + notebook.
@@ -4094,6 +6531,15 @@ async function openConversation(fid, pid) {
     const stt = await api(`/frames/${fid}/status`);
     if (gen !== S._openGen) return;
     if (stt && stt.running) { S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint(t("conv.resuming.hint"), false, true); resumeWatch(fid, gen); }
+    // The global hint is restored ONCE, and only when the session's current
+    // state is a failure -- the frame says so, and the failure is the last
+    // thing in the transcript. Any other reading (any stored failure anywhere,
+    // as an earlier draft had it) would let a turn that has since been
+    // succeeded by three good ones present itself as the state of the session.
+    else if (stt && stt.status === "failed") {
+      const last = lastTerminalFailure();
+      if (last) hint(failureHint(last), true);
+    }
   } catch {}
   // Resume a pending/executing/completed plan review card (drafts survive a reopen).
   try {
@@ -4117,14 +6563,177 @@ function renderEmptySession() {
   STARTERS.forEach(s => { const chip = el("button", "es-chip"); chip.appendChild(el("div", "es-chip-t", s.t)); chip.appendChild(el("div", "es-chip-p", s.p)); chip.onclick = () => { const c = $("#composer"); c.value = s.p; grow(); c.focus(); }; chips.appendChild(chip); });
   wrap.appendChild(chips); m.appendChild(wrap);
 }
-function renderStored(m) {
+function renderStored(m, target) {
   const text = Array.isArray(m.content) ? m.content.map(b => (b && b.text) || "").join("") : (m.content || "");
-  if (!text.trim()) return;
+  if (!text.trim()) return null;
   const w = el("div", "msg " + (m.role === "user" ? "user" : "assistant"));
-  if (m.role === "user") { const b = el("div", "bubble"); b.textContent = text; w.appendChild(b); }
-  else { const md = el("div", "md"); md.innerHTML = renderMd(text); w.appendChild(md); }
-  $("#messages").appendChild(w);
+  if (m.role === "user") { const b = el("div", "bubble"); b.textContent = text; w.appendChild(b); renderMessageRefChips(w, m.artifact_refs); }
+  else {
+    const md = el("div", "md"); md.innerHTML = renderMd(text); w.appendChild(md);
+    // Inline on the message it belongs to, never the global hint. A session
+    // is rendered oldest-first and older pages are prepended later, so calling
+    // hint() here would let any past failure -- including one several
+    // successful turns ago, or one on a page the reader scrolled back to --
+    // become the current state of the whole UI.
+    if (m.failure && m.failure.request_id) w.appendChild(failureMeta(m.failure));
+  }
+  // Stamped with its own time so a page of OLDER messages can be put where it
+  // belongs. Activity steps are fetched whole while messages are paged, so the
+  // column already holds step cards older than the newest message page;
+  // prepending an older page at the very top would put message 0 above a step
+  // from the turn that produced it.
+  w.dataset.ts = String(new Date(m.created_at).getTime() || 0);
+  (target || $("#messages")).appendChild(w);
   if (m.role !== "user") addMsgActions(w, text);
+  return w;
+}
+// Put one restored message in time order among what is already rendered.
+function insertMessageByTime(node) {
+  const host = $("#messages"); if (!host || !node) return;
+  const ts = Number(node.dataset.ts || 0);
+  const kids = host.children;
+  for (let i = 0; i < kids.length; i++) {
+    const kid = kids[i];
+    if (kid.id === "msgs-earlier") continue;  // the control stays pinned to the top
+    const kidTs = Number(kid.dataset && kid.dataset.ts);
+    if (Number.isFinite(kidTs) && kidTs > ts) { host.insertBefore(node, kid); return; }
+  }
+  host.appendChild(node);
+}
+// Reaching the part of a long conversation that is not on screen.
+//
+// `fetchRecentMessages` asks for the NEWEST page and the route answers with
+// `next_before_seq` / `has_earlier` beside it. Nothing in this file read
+// either, so in a 640-message session messages 0-339 existed, were paged for,
+// and could not be reached by scrolling or by any control. This is the half
+// that was missing.
+function paintEarlierControl() {
+  const host = $("#messages"); if (!host) return;
+  let bar = document.getElementById("msgs-earlier");
+  if (!S.msgHasEarlier) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = el("div", "msgs-earlier"); bar.id = "msgs-earlier";
+    bar.style.textAlign = "center"; bar.style.padding = "8px 0";
+    const btn = el("button", "outline-btn small", t("conv.loadEarlier"));
+    btn.onclick = loadEarlierMessages; bar.appendChild(btn);
+  }
+  const btn = bar.querySelector("button");
+  if (btn) { btn.disabled = !!S._msgEarlierLoading; btn.textContent = S._msgEarlierLoading ? t("common.loading") : t("conv.loadEarlier"); }
+  if (host.firstChild !== bar) host.insertBefore(bar, host.firstChild);
+}
+async function loadEarlierMessages() {
+  if (!S.currentId || !S.msgHasEarlier || S.msgCursor == null || S._msgEarlierLoading) return;
+  const host = $("#messages"); if (!host) return;
+  const fid = S.currentId, gen = S._openGen;
+  S._msgEarlierLoading = true; paintEarlierControl();
+  try {
+    const data = await fetchOlderMessages(fid, S.msgCursor, MESSAGE_PAGE_SIZE);
+    if (gen !== S._openGen) return;  // the reader switched sessions mid-request
+    // Hold the reading position. Leaving `scrollTop` alone moves the page by
+    // exactly the height of what was inserted above it, and scrolling to the
+    // top loses the message the reader was on; adding back the height the
+    // prepend introduced keeps the same message under the same pixel.
+    const beforeHeight = host.scrollHeight, beforeTop = host.scrollTop;
+    const holder = document.createDocumentFragment();
+    (data.messages || []).forEach(mm => insertMessageByTime(renderStored(mm, holder)));
+    host.scrollTop = beforeTop + (host.scrollHeight - beforeHeight);
+    S.msgCursor = data.next_before_seq != null ? data.next_before_seq : null;
+    S.msgHasEarlier = !!data.has_earlier;
+  } catch (e) { hint(t("conv.loadEarlierFailed", apiErrorText(e)), true); }
+  finally { S._msgEarlierLoading = false; paintEarlierControl(); }
+}
+
+// The chips a restored message was sent with. Reopening a session used to show
+// only the words the user typed: the `@name#v-id` token is inside that prose,
+// so the reference was there to read but not to see, and after a cross-session
+// copy the token names a version this session cannot resolve — the model read
+// the local one. The server now stores the six fields and the conversation
+// route returns them, so what is drawn here is the record, not a re-parse.
+function renderMessageRefChips(host, refs) {
+  if (!Array.isArray(refs) || !refs.length) return;
+  const row = el("div", "msg-refs");
+  refs.slice(0, 8).forEach(r => {
+    const name = String((r && r.display_name) || "");
+    if (!name) return;
+    const chip = el("span", "msg-ref-chip");
+    chip.appendChild(iconEl("file-text", 11));
+    chip.appendChild(el("span", null, publicText(name, 60)));
+    // Facts, not a sentence: the version actually sent, the head of its digest,
+    // and — when the file was copied in — the session it came from. Deliberately
+    // language-neutral, so this needs no translation key and cannot drift out of
+    // step with one.
+    const parts = [String(r.version_id || "")];
+    if (r.sha256) parts.push("sha256:" + String(r.sha256).slice(0, 12));
+    if (r.materialized_target) parts.push("↗ " + String(r.source_session || "").slice(0, 12));
+    chip.title = parts.filter(Boolean).join(" · ");
+    // Only opens what this client actually has. Synthesising an artifact
+    // object out of the ref would hand the viewer a filename with no content
+    // type and let it guess at the renderer.
+    const full = (S.artifacts || []).find(x => (x.artifact_id || x.id) === r.artifact_id);
+    if (full) { chip.classList.add("clickable"); chip.onclick = () => openViewer(full); }
+    row.appendChild(chip);
+  });
+  if (row.children.length) host.appendChild(row);
+}
+
+// The same six facts as `renderMessageRefChips`, drawn *before* the send.
+//
+// A pinned reference was invisible until the turn came back. The autocomplete
+// inserts `@name#v-...` and then it is prose in a textarea: nothing says which
+// version was pinned, nothing says a file is coming from another conversation
+// and will be copied in, and a token typed or pasted by hand -- or one whose
+// artifact was since deleted -- looks exactly like one that resolves. The user
+// found out by reading the answer.
+//
+// Resolved against the artifacts this client already holds, so this adds no
+// route and no fetch. A token that resolves to nothing is drawn as unresolved
+// rather than dropped: "this will not do what you think" is the whole reason to
+// show it early, and hiding it would put the surprise back where it was.
+function renderComposerRefChips() {
+  const host = $("#composer-refs");
+  if (!host) return;
+  host.innerHTML = "";
+  const text = (($("#composer") || {}).value) || "";
+  // `@name` or `@name#version`, ended by whitespace. Same shape the server's
+  // resolver accepts; deliberately not a second, cleverer grammar.
+  const found = [];
+  const seen = new Set();
+  const re = /(?:^|\s)@([^\s@#]+)(?:#(v-[A-Za-z0-9_-]+))?/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const key = m[1] + "#" + (m[2] || "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push({ name: m[1], version: m[2] || "" });
+    if (found.length >= 8) break;
+  }
+  if (!found.length) { host.classList.add("hidden"); return; }
+  const pool = [...(S.artifacts || []), ...((_acFiles && _acFiles.list) || [])];
+  found.forEach(ref => {
+    const match = pool.find(a => a && a.filename === ref.name
+      && (!ref.version || String(a.version_id || "") === ref.version));
+    const chip = el("span", "msg-ref-chip" + (match ? "" : " unresolved"));
+    chip.appendChild(iconEl(match ? "file-text" : "alert-triangle", 11));
+    chip.appendChild(el("span", null, publicText(ref.name, 60)));
+    if (!match) {
+      chip.title = t("refs.unresolvedChip");
+      host.appendChild(chip);
+      return;
+    }
+    // Facts, not a sentence, and in the same order the message chip uses --
+    // the two are read one above the other and must not disagree.
+    const parts = [String(ref.version || match.version_id || "")];
+    if (match.checksum) parts.push("sha256:" + String(match.checksum).slice(0, 12));
+    const elsewhere = match.root_frame_id && S.currentId
+      && match.root_frame_id !== S.currentId;
+    if (elsewhere) parts.push("\u2197 " + String(match.root_frame_id).slice(0, 12));
+    chip.title = parts.filter(Boolean).join(" \u00b7 ");
+    if (elsewhere) chip.classList.add("elsewhere");
+    chip.classList.add("clickable");
+    chip.onclick = () => openViewer(match);
+    host.appendChild(chip);
+  });
+  host.classList.remove("hidden");
 }
 
 /* ---------- session title / actions ---------- */
@@ -4133,7 +6742,7 @@ async function commitTitle() {
   const name = ($("#conv-title").value || "").trim();
   if (!name || name === S._titleName) { setTitle(S._titleName); return; }
   try { await api("/frames/" + S.currentId, { method: "PATCH", body: JSON.stringify({ name }) }); S._titleName = name; setTitle(name); loadSessions(); }
-  catch (e) { setTitle(S._titleName); hint(t("toast.renameFailed", e.message), true); }
+  catch (e) { setTitle(S._titleName); hint(t("toast.renameFailed", apiErrorText(e)), true); }
 }
 function addToMessageMenu(anchor) {
   openMenu(anchor, [
@@ -4158,7 +6767,7 @@ async function showContextUsage() {
 }
 async function saveCurrentAsSkill() {
   if (!S.currentId) { skillEditor(null); return; }
-  let messages = []; try { const data = await api(`/frames/${S.currentId}/messages?from=0&limit=500`); messages = data.messages || []; } catch {}
+  let messages = []; try { const data = await fetchRecentMessages(S.currentId, 500); messages = data.messages || []; } catch {}
   const latestUser = [...messages].reverse().find(m => m.role === "user");
   const latestAssistant = [...messages].reverse().find(m => m.role === "assistant");
   const title = (S._titleName || "research-workflow").toLowerCase().replace(/[^a-z0-9一-龥]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "research-workflow";
@@ -4209,7 +6818,7 @@ function sessionMenu(anchor, fid) {
   const items = [{ label: t("folder.menu.rename"), icon: "pencil", onClick: () => renameFrame(fid) }];
   if (frame.running || (fid === S.currentId && S.running)) items.push({ label: t("sessionMenu.cancel"), icon: "stop", onClick: async () => {
     try { const result = await scopedExecutionRequest(fid, "cancel", "session menu cancel"); if (result && result.ok && fid === S.currentId) turnDone("cancelled"); }
-    catch (error) { hint(t("nb.action.failed", error.message), true); }
+    catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); }
     loadSessions();
   } });
   items.push(
@@ -4237,10 +6846,10 @@ async function openShareDialog(fid, frame = {}) {
   let shares = { shares: [] };
   try {
     [status, shares] = await Promise.all([
-      fetch("/api/share/status").then(r => r.json()),
-      fetch(`/api/frames/${encodeURIComponent(fid)}/shares`).then(r => r.json()),
+      fetch(`${API}/share/status`).then(r => r.json()),
+      fetch(`${API}/frames/${encodeURIComponent(fid)}/shares`).then(r => r.json()),
     ]);
-  } catch (error) { hint(t("nb.action.failed", error.message), true); return; }
+  } catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); return; }
 
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -4268,7 +6877,7 @@ async function openShareDialog(fid, frame = {}) {
     row.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:16px";
     if (status.configured) {
       row.appendChild(mkBtn(t("share.enable"), async () => {
-        await shareCall("PUT", "/api/share/settings", { enabled: true });
+        await shareCall("PUT", `${API}/share/settings`, { enabled: true });
         close(); openShareDialog(fid, frame);
       }, false, true));
     }
@@ -4306,12 +6915,12 @@ async function openShareDialog(fid, frame = {}) {
     const actions = document.createElement("div");
     actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:16px";
     actions.appendChild(mkBtn(t("share.update"), async () => {
-      await shareCall("PUT", `/api/shares/${encodeURIComponent(active.share_id)}`);
+      await shareCall("PUT", `${API}/shares/${encodeURIComponent(active.share_id)}`);
       hint(t("share.updated")); close();
     }));
     actions.appendChild(mkBtn(t("share.revoke"), async () => {
       if (!confirm(t("share.revokeConfirm"))) return;
-      await shareCall("DELETE", `/api/shares/${encodeURIComponent(active.share_id)}`);
+      await shareCall("DELETE", `${API}/shares/${encodeURIComponent(active.share_id)}`);
       hint(t("share.revoked")); close();
     }, true));
     actions.appendChild(mkBtn(t("share.close"), close));
@@ -4339,7 +6948,7 @@ async function openShareDialog(fid, frame = {}) {
       const body = {};
       const secs = parseInt(sel.value, 10);
       if (secs > 0) body.expires_in = secs;
-      const rec = await shareCall("POST", `/api/frames/${encodeURIComponent(fid)}/shares`, body);
+      const rec = await shareCall("POST", `${API}/frames/${encodeURIComponent(fid)}/shares`, body);
       close();
       if (rec && rec.url) openShareDialog(fid, frame);
     }, false, true));
@@ -4365,9 +6974,9 @@ async function openShareDialog(fid, frame = {}) {
         body: body ? JSON.stringify(body) : undefined,
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (!r.ok) throw new ApiError(j, r.status);
       return j;
-    } catch (error) { hint(t("nb.action.failed", error.message), true); return null; }
+    } catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); return null; }
   }
 }
 function chooseSessionPackage() {
@@ -4378,6 +6987,22 @@ async function importSessionPackage(file) {
   if (!file) return;
   if (file.size > 128 * 1024 * 1024) { hint(t("sessionPackage.tooLarge"), true); return; }
   try {
+    // Verify before importing, not as an optional extra afterwards. The
+    // package arrived from somewhere else; checking it against its own
+    // manifest costs one request and is the whole point of shipping hashes.
+    // A tampered archive must never reach the database.
+    const checked = await fetch(API + "/sessions/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.openai4s.session+zip" },
+      body: file,
+    });
+    const verdict = await checked.json().catch(() => ({}));
+    if (!checked.ok || !verdict.ok) {
+      const first = (verdict.problems || [])[0] || verdict.error || "";
+      hint(t("sessionPackage.verifyFailed", publicText(first, 160)), true);
+      return;
+    }
+    hint(t("sessionPackage.verified", (verdict.files_verified || []).length));
     const response = await fetch(API + "/sessions/import", {
       method: "POST",
       headers: { "Content-Type": "application/vnd.openai4s.session+zip" },
@@ -4385,13 +7010,13 @@ async function importSessionPackage(file) {
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !result.root_frame_id || !result.project_id) {
-      throw new Error(result.error || `HTTP ${response.status}`);
+      throw new ApiError(result, response.status);
     }
     await loadProjects();
     hint(t("sessionPackage.imported"));
     await openConversation(result.root_frame_id, result.project_id);
   } catch (error) {
-    hint(t("toast.importFailed", error.message), true);
+    hint(t("toast.importFailed", apiErrorText(error)), true);
   }
 }
 function downloadArtifactBundle(url, filename) {
@@ -4409,17 +7034,18 @@ function moveToFolderAt(anchor, fid) {
 async function exportSession(fid) {
   try {
     const [d, arts] = await Promise.all([
-      api(`/frames/${fid}/messages?from=0&limit=500`),
+      fetchAllMessages(fid),
       api(`/frames/${fid}/artifacts`).catch(() => []),
     ]);
     const f = S.sessions.find(x => x.id === fid) || {};
     let md = "# " + (f.name || f.task_summary || t("conv.title.default")) + "\n\n";
+    if (d.complete === false) md += "> " + t("conv.exportTruncated") + "\n\n";
     (d.messages || []).forEach(m => { const who = m.role === "user" ? "🧑 User" : "🤖 Assistant"; const txt = Array.isArray(m.content) ? m.content.map(b => b.text || "").join("") : (m.content || ""); md += `## ${who}\n\n${txt}\n\n`; });
     if ((arts || []).length) { md += "## 产物 Artifacts\n\n"; arts.forEach(a => md += `- ${a.filename} (${a.content_type || ""})\n`); }
     const blob = new Blob([md], { type: "text/markdown" }); const url = URL.createObjectURL(blob); const link = document.createElement("a");
     link.href = url; link.download = (f.name || f.task_summary || "session").replace(/[^\w一-龥-]+/g, "_") + ".md"; link.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000); hint(t("toast.exportedMarkdown"));
-  } catch (e) { hint(t("toast.exportFailed", e.message), true); }
+  } catch (e) { hint(t("toast.exportFailed", apiErrorText(e)), true); }
 }
 async function renameFrame(fid) {
   const f = S.sessions.find(x => x.id === fid);
@@ -4427,18 +7053,18 @@ async function renameFrame(fid) {
   const ct = $("#conv-title"); ct.focus(); ct.select();
 }
 async function deleteSession(fid) {
-  try { await api("/frames/" + fid, { method: "DELETE" }); } catch (e) { hint(t("toast.deleteFailed", e.message), true); return; }
+  try { await api("/frames/" + fid, { method: "DELETE" }); } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); return; }
   const wasCurrent = fid === S.currentId; await loadSessions();
   if (wasCurrent) { let ss = S.sessions; if (S.project) ss = ss.filter(f => f.project_id === S.project); if (ss.length) openConversation(ss[0].id, ss[0].project_id); else { S.currentId = null; $("#messages").innerHTML = ""; setTitle(t("conv.title.default")); S.artifacts = []; renderFilesGrid(); } }
 }
 async function duplicateSession(fid) {
   const f = S.sessions.find(x => x.id === fid) || {};
   try {
-    const nf = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: f.project_id || S.project || undefined, model: S.defaultModel }) });
+    const nf = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: f.project_id || S.project || undefined, model: S.defaultModelName }) });
     const nm = (f.name || f.task_summary || t("conv.title.default")) + t("session.duplicateSuffix");
     try { await api("/frames/" + nf.id, { method: "PATCH", body: JSON.stringify({ name: nm }) }); } catch {}
     await loadSessions(); openConversation(nf.id, f.project_id);
-  } catch (e) { hint(t("toast.duplicateFailed", e.message), true); }
+  } catch (e) { hint(t("toast.duplicateFailed", apiErrorText(e)), true); }
 }
 
 /* ---------- context menu ---------- */
@@ -4489,13 +7115,17 @@ function sendFeedback(key, rating) {
 async function cancelTurn() {
   if (!S.currentId) return;
   try { const result = await scopedExecutionRequest(S.currentId, "cancel", "composer cancel"); if (result && result.ok) turnDone("cancelled"); }
-  catch (error) { hint(t("nb.action.failed", error.message), true); }
+  catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); }
 }
 
 /* ---------- send ---------- */
 async function send(text, opts) {
   text = (text || "").trim(); opts = opts || {};
-  if (S.running) return;
+  // Sending mid-turn queues instead of being dropped on the floor. The old
+  // `if (S.running) return;` silently discarded the message — no error, no
+  // hint, just a composer that had already been cleared — even though the
+  // server's FIFO admission has always accepted a follow-up here.
+  const queueing = S.running;
   const runtime = runtimeSummary();
   if (S.currentId && runtime.viewOnly && runtime.trustState === "quarantined") {
     hint(t("runtime.quarantineHint"), true);
@@ -4510,20 +7140,24 @@ async function send(text, opts) {
   // actually loaded — left as plain text the model routinely skips
   // host.load_skill and the skill never runs.
   let skillDirective = "";
-  if (!planNow) {
+  const skillCandidates = [];
+  if (!planNow) text.replace(/(^|\s)\/([A-Za-z0-9][\w:-]*)/g, (m, _p, nm) => { if (!skillCandidates.includes(nm)) skillCandidates.push(nm); return m; });
+  // The full catalog includes lazy collection members, so fetching it can be
+  // noticeable on a cold send. Ordinary prose has nothing to resolve here.
+  if (skillCandidates.length) {
     try {
       const cat = await loadSkillsCatalog();
       const names = new Set((cat || []).map(s => String(s.name).toLowerCase()));
-      const hits = [];
-      text.replace(/(^|\s)\/([A-Za-z0-9][\w:-]*)/g, (m, _p, nm) => { if (names.has(nm.toLowerCase()) && !hits.includes(nm)) hits.push(nm); return m; });
+      const hits = skillCandidates.filter(nm => names.has(nm.toLowerCase()));
       if (hits.length) skillDirective = "\n\n" + hits.map(n => t("skill.invokeDirective", n)).join("\n");
     } catch {}
   }
-  if (!S.currentId) { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModel }) }); S.currentId = f.id; sub(f.id); await loadSessions(); }
+  if (!S.currentId) { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModelName }) }); S.currentId = f.id; sub(f.id); await loadSessions(); }
   const g = $(".generated"); if (g) g.remove();
   const es = $(".empty-session"); if (es) es.remove();
   const w = el("div", "msg user"); const b = el("div", "bubble"); b.textContent = text || t("send.imageAnnotationFallback"); w.appendChild(b);
   if (anns.length) w.appendChild(annotAttachment(anns));
+  if (queueing) w.classList.add("queued");
   $("#messages").appendChild(w); down(true);
   let payload = text;
   if (planNow) {
@@ -4536,9 +7170,47 @@ async function send(text, opts) {
     S.planPending = true;
   }
   if (skillDirective) payload += skillDirective;
-  S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint(t("toast.running"), false, true);
-  $("#composer").value = ""; grow(); const annIds = anns.map(x => x.id);
-  if (annIds.length) { setLocalAnnotationStatus(annIds, "sent"); refreshAllStages(); updateAnnotBadge(); }
+  // Queueing must not restate the turn banner: the running turn owns the hint
+  // and the Stop button, and re-announcing "Running…" here would make the Stop
+  // control read as belonging to the item just typed rather than to the one it
+  // would actually interrupt.
+  // Read AFTER every await above and BEFORE this send touches `S.running`.
+  // The snapshot at the top of `send` is only good enough to decide how the
+  // bubble looks: the skills catalogue and, on a first message, creating the
+  // frame all await, and another tab or a recovered turn can take ownership in
+  // that window. Reading it any later is worse than useless -- by then this
+  // very send has set it to true and every observation says "queued".
+  const sawRunningAtDispatch = S.running;
+  const turnTicket = sawRunningAtDispatch ? null : openTurnTicket();
+  // Declared out here, not inside the `try`: the catch needs it, and a
+  // block-scoped `const` would have made that a ReferenceError.
+  if (!turnTicket) hint(t("queue.accepted"));
+  else { S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint(t("toast.running"), false, true); }
+  $("#composer").value = ""; grow(); renderComposerRefChips();
+  const annIds = anns.map(x => x.id);
+  // The admission id is generated HERE and stored BEFORE the request goes out.
+  //
+  // That ordering is the whole mechanism. The case this exists for is the one
+  // where the client never sees the response -- a dropped connection, a closed
+  // tab, a reload mid-flight -- and a server-minted id is unknown to a browser
+  // in exactly that case, so there is nothing left to ask about. Storing it
+  // after the promise resolves covers only the case that needed no help.
+  //
+  // 128 bits from the platform CSPRNG: it keys a claim on the user's own
+  // unpublished comments, and it has to survive collision across sessions and
+  // restarts.
+  let admissionId = "";
+  if (annIds.length) {
+    const bytes = new Uint8Array(16);
+    (self.crypto || window.crypto).getRandomValues(bytes);
+    admissionId = "resv-" + [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
+    rememberAdmission(S.currentId, admissionId);
+    // Optimistically "pending", never "sent". The server decides whether a pin
+    // was consumed, and it can answer `pending` -- accepted, but the consume
+    // did not confirm -- in which case the comment is neither gone nor
+    // available and must not be shown as either.
+    setLocalAnnotationStatus(annIds, "pending"); refreshAllStages(); updateAnnotBadge();
+  }
   sub(S.currentId);  // guarantee this client is subscribed BEFORE the POST spawns the
                      // turn thread. On the FIRST turn opened via newSession(), S.currentId
                      // is already set so the block above is skipped and openConversation's
@@ -4547,21 +7219,119 @@ async function send(text, opts) {
                      // drops them (server replay is gated on is_running, which is already
                      // false once the blocking POST returns). Idempotent set add.
   try {
-    await api(`/frames/${S.currentId}/message`, { method: "POST", body: JSON.stringify({ input_data: { request: payload }, model: S.defaultModel, plan: planNow, explore: exploreNow, annotation_ids: annIds, wait: false }) });
-    // The optimistic status above clears the badge immediately; reload once the turn POST finishes to reconcile with the server.
-    if (annIds.length) { try { await loadAnnotations(S.currentId); } catch {} refreshAllStages(); updateAnnotBadge(); }
+    // No `model:` field. It carried the header selector's value on every single
+    // message, and the server preferred it over the session's pinned revision --
+    // so provider, endpoint and credential came from the pin while the model name
+    // came from here, a configuration that exists in no profile. Changing model is
+    // now activating a profile (PUT /models/default), which the session then binds.
+    const accepted = await api(`/frames/${S.currentId}/message`, { method: "POST", body: JSON.stringify({ input_data: { request: payload }, plan: planNow, explore: exploreNow, annotation_ids: annIds, annotation_reservation_id: admissionId || undefined, wait: false }) });
+    // Tie the optimistic bubble to the ticket the 202 named, so cancelling that
+    // exact queued item can mark the message the user is looking at. Nothing
+    // else in the transcript carries an execution id.
+    if (accepted && accepted.execution_id) w.dataset.executionId = accepted.execution_id;
+    // The id this turn will be blamed under. `wait:false` means the 202 is the
+    // only synchronous thing the client gets, so this is where the correlation
+    // starts -- the socket event and the job query name the same one. Written
+    // through the generation guard, because this promise can resolve after the
+    // turn it belongs to has already failed and been cleaned up.
+    // Accepted, or retired. A 202 that is not `queue_position: 0` means this
+    // send is not the running turn after all -- it was queued, or the snapshot
+    // could not be read -- so its provisional ticket is dead and its id will
+    // arrive on its own `processing` event instead. Retiring touches nothing
+    // that belongs to another turn.
+    if (!acceptTurnTicket(turnTicket, accepted)) retireTurnTicket(turnTicket);
+    // The server's own answer, not a guess. `annotations` is `sent`, `pending`
+    // or `none`, and `annotation_reservation_id` is what a reconcile asks
+    // about after a reload. Only `sent` is a consumed pin; `none` means this
+    // request claimed nothing (a concurrent turn won the race) and the comment
+    // is still the user's to send.
+    if (annIds.length) {
+      const said = accepted && accepted.annotations;
+      if (said === "none") setLocalAnnotationStatus(annIds, "open");
+      else if (said === "sent") setLocalAnnotationStatus(annIds, "sent");
+      if (accepted && accepted.annotation_reservation_id) {
+        S.lastAnnotationReservation = accepted.annotation_reservation_id;
+      }
+      // The answer arrived, so there is nothing left to reconcile. Removing it
+      // here rather than on the next reload keeps storage to what is genuinely
+      // outstanding -- and only a decided answer removes anything.
+      if (admissionId && admissionSettled(said)) forgetAdmission(S.currentId, admissionId);
+      try { await loadAnnotations(S.currentId); } catch {}
+      refreshAllStages(); updateAnnotBadge();
+    }
   }
   catch (e) {
     if (annIds.length) {
-      // POST failed → annotations were never consumed server-side. Reconcile with the server
-      // if reachable; if that reload also fails, revert the optimistic "sent" flip locally so
-      // the pending comments stay visible for a retry instead of vanishing from the composer.
+      // A POST that failed *synchronously* released its reservation server-side,
+      // so the pins are `open` again and this reload will say so. That is a
+      // narrower claim than the one this comment used to make. It said "the
+      // POST failed, therefore they were never consumed" -- which was false
+      // twice over. The route used to burn them to 'sent' *before*
+      // `submit_message`, where every refusal happens, so a 413/409/429
+      // destroyed them; and a failure with no response at all (a dropped
+      // connection after the server accepted) is not a refusal, so treating it
+      // as one reopens pins the running turn is already carrying.
+      //
+      // Hence: reconcile from the server rather than deciding locally, and the
+      // local revert below is only the fallback for when the server cannot be
+      // reached at all -- where leaving the comments visible is the lesser
+      // wrong, because a duplicate is recoverable and a silent loss is not.
+      // Reconcile with the
+      // server if reachable; if that reload also fails, revert the optimistic
+      // "sent" flip locally so the pending comments stay visible for a retry
+      // instead of vanishing from the composer.
+      // Reopen only on an authoritative *synchronous* refusal -- a status the
+      // server actually answered with, which means the reservation was
+      // released and the pins are the user's again. A transport failure with
+      // no status is not a refusal: the turn may be running and carrying them,
+      // and reopening would offer the user a comment that is already on its
+      // way. Ambiguity stays `pending` and is reconciled from the server.
+      const refused = !!(e && Number.isInteger(e.status) && e.status >= 400);
+      // An authoritative synchronous refusal is an answer: the server released
+      // the reservation and said so, so there is nothing to ask it later. A
+      // transport failure with no status is the ambiguous case this mechanism
+      // exists for, and its id is kept.
+      if (admissionId && refused) forgetAdmission(S.currentId, admissionId);
       const reloaded = await loadAnnotations(S.currentId);
-      if (!reloaded) setLocalAnnotationStatus(annIds, "open");
+      if (!reloaded) setLocalAnnotationStatus(annIds, refused ? "open" : "pending");
       refreshAllStages(); updateAnnotBadge();
     }
-    hint(t("toast.sendFailed", e.message), true);
-    if (S.running) turnDone("failed");
+    // The two 409s a send can end on that the user cannot resolve from
+    // anywhere else in the app. Both say "choose one to continue" and both are
+    // answered by the same rebind: the binding is in no PATCH allowlist and
+    // forking inherits it, so without this the session is unsendable for good.
+    //
+    // `model_revision_ambiguous` was left out. It is raised when a legacy
+    // session's recorded model matches more than one profile -- the server
+    // refuses to guess, which is right, and then the only remedy was
+    // unreachable. Same predicament, same fix, one code away.
+    if (e && (e.code === "model_revision_unavailable"
+              || e.code === "model_revision_ambiguous")) {
+      if (confirm(t("model.rebind.confirm"))) {
+        try {
+          await api(`/frames/${encodeURIComponent(S.currentId)}/model-binding`, { method: "POST" });
+          hint(t("model.rebind.done"));
+          // Ownership, not the dispatch snapshot: the rebind prompt is modal
+          // and the user can sit on it for a long time, which is more than
+          // enough for another turn to start and own the screen.
+          if (ownsTurnTicket(turnTicket)) turnDone("failed");
+          loadSessions();
+          return;
+        } catch (rebindError) { hint(apiErrorText(rebindError), true); }
+      }
+    }
+    hint(t("toast.sendFailed", apiErrorText(e)), true);
+    // A follow-up that was refused (413/409/429) says nothing about the turn
+    // already running. Tearing the turn state down here would report the
+    // running turn as failed because a *different*, never-admitted message was
+    // rejected — and would re-enable Stop against a turn nobody stopped.
+    // Ownership, not the stale snapshot. A send that began idle can be
+    // rejected *after* another turn has started -- the `false -> true` case --
+    // and tearing down there reports someone else's running turn as failed and
+    // re-enables Stop against a turn nobody stopped. If this send no longer
+    // owns the turn, its own bubble is the only thing that changes.
+    if (ownsTurnTicket(turnTicket)) turnDone("failed");
+    else w.classList.add("cancelled");
     loadSessions();
     return;
   }
@@ -4597,10 +7367,15 @@ async function refreshKeyBanner() {
 /* ---------- models ---------- */
 async function loadModels() {
   try { const m = await api("/models"); const groups = (m && m.models) || {}; S.models = Object.values(groups).flat(); S.defaultModel = m.default_model_id || (S.models[0] && S.models[0].id);
+    // The option value is a profile_id now, so the model *name* has to be carried
+    // separately for the display-only `model` field on session creation. Sending
+    // the id there would store a profile id in `frames.model`.
+    const nameFor = id => { const e = S.models.find(x => x.id === id); return (e && (e.model || e.name)) || id; };
+    S.defaultModelName = nameFor(S.defaultModel);
     const sel = $("#model-select"); sel.innerHTML = "";
     if (!S.models.length) { const o = el("option", null, t("models.none")); o.value = ""; sel.appendChild(o); }
     S.models.forEach(md => { const o = el("option", null, md.name || md.id); o.value = md.id; if (md.id === S.defaultModel) o.selected = true; sel.appendChild(o); });
-    sel.onchange = async () => { S.defaultModel = sel.value; try { await api("/models/default", { method: "PUT", body: JSON.stringify({ model_id: sel.value }) }); } catch {} };
+    sel.onchange = async () => { S.defaultModel = sel.value; S.defaultModelName = nameFor(sel.value); try { await api("/models/default", { method: "PUT", body: JSON.stringify({ model_id: sel.value }) }); } catch {} };
   } catch { $("#model-select").innerHTML = "<option>" + t("models.none") + "</option>"; }
 }
 
@@ -4930,7 +7705,7 @@ function renderArtifactDescriptor(body, a, descriptor) {
 }
 function fetchArtifactText(url) {
   return fetch(url).then(response => {
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw new ApiError(null, response.status);
     return response.text();
   });
 }
@@ -4970,8 +7745,39 @@ function renderTableArtifact(container, a, url) {
     else { const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre); }
   }).catch(() => rendererFailure(container, a, url));
 }
+// The true shape of a parsed table: rows, and the union of every row's keys.
+// Not `rows[0]`'s keys, which is what decides the drawn columns -- records
+// parsed from JSON are ragged, so a field appearing only in later rows is
+// invisible in the table and would be uncounted here too.
+function sheetShape(rows) {
+  const keys = new Set();
+  for (const row of rows) { for (const key in row) keys.add(key); }
+  return { rows: rows.length, columns: keys.size };
+}
+// Say the shape out loud, and name whatever the cap dropped.
+//
+// `renderSheet` caps at 5000x100 and used to say nothing at all, so a 5001x101
+// matrix rendered as a table that looked complete: a reader counting 100
+// columns had no way to learn a 101st existed. The Notebook's table path
+// already carries this banner; the Viewer's did not, so the two disagreed
+// about the same file. The `nb.table.*` sentences are reused deliberately
+// rather than translated a second time -- two table paths wording the same
+// fact differently is how they drifted apart to begin with.
+function appendSheetShape(container, rows, shownRows, shownColumns) {
+  const shape = sheetShape(rows);
+  const note = el("div", "renderer-note", t("viewer.table.shape", shape.rows.toLocaleString(), shape.columns.toLocaleString()));
+  const hiddenRows = Math.max(0, shape.rows - shownRows);
+  const hiddenColumns = Math.max(0, shape.columns - shownColumns);
+  let hidden = "";
+  if (hiddenRows && hiddenColumns) hidden = t("nb.table.bothHidden", hiddenRows.toLocaleString(), hiddenColumns.toLocaleString());
+  else if (hiddenRows) hidden = t("nb.table.rowsHidden", hiddenRows.toLocaleString());
+  else if (hiddenColumns) hidden = t("nb.table.colsHidden", hiddenColumns.toLocaleString());
+  if (hidden) note.appendChild(document.createTextNode(" " + hidden));
+  container.appendChild(note);
+}
 function renderSheet(container, rows) {
   const safeRows = rows.slice(0, 5000); const columns = Object.keys(safeRows[0] || {}).slice(0, 100);
+  appendSheetShape(container, rows, safeRows.length, columns.length);
   const table = el("table", "sheet"); const head = el("tr"); columns.forEach(key => head.appendChild(el("th", null, key))); table.appendChild(head);
   safeRows.forEach(row => { const tr = el("tr"); columns.forEach(key => tr.appendChild(el("td", null, String(row[key] ?? "")))); table.appendChild(tr); });
   container.appendChild(table);
@@ -5152,6 +7958,156 @@ async function loadAnnotations(fid) {
   updateAnnotBadge();
   return true;
 }
+/* What happened to the pins this tab last sent, when it never saw the answer.
+   A reload, a closed tab, a dropped connection: the 202 is gone and the client
+   knows only that it sent something. Guessing is the one thing it must not do
+   — "assume sent" silently loses the comments, "assume open" offers the user a
+   comment a running turn is already carrying. So it asks. */
+/* One localStorage key per outstanding admission, never a container.
+
+   Two designs were wrong before this one. A single scalar
+   (`openai4s.admission.<fid>`) meant a second send while the first was still
+   outstanding — the ordinary queued follow-up, and exactly the case where a
+   response goes missing — overwrote the only record of the first: not sent as
+   far as the tab knew, not open as far as the server knew, and with no id left
+   to ask about. Replacing it with a JSON list under the same key fixed the
+   overwrite within one tab and kept it between two: read-modify-write is not
+   atomic across tabs, so both read the same list and the later `setItem` drops
+   the other's id. That list also carried a cap, which silently evicted the
+   *oldest unresolved* id — and the queue accepts far more than the cap was set
+   to, so the eviction was reachable by ordinary use.
+
+   Independent keys have neither problem: a write touches one reservation, so
+   concurrent tabs cannot clobber each other, and there is nothing to bound.
+   Unresolved ids are removed when they are answered, never to make room. */
+const ADMISSION_LEGACY_KEY = fid => "openai4s.admission." + fid;
+const ADMISSION_PREFIX = fid => "openai4s.admission." + fid + ".";
+/* The scalar and the list a tab may still be holding when it reloads into this
+   build — which is precisely a client with something outstanding, so dropping
+   them would lose the comments this whole mechanism exists to recover. */
+function migrateAdmissions(fid) {
+  let raw = null;
+  try { raw = localStorage.getItem(ADMISSION_LEGACY_KEY(fid)); } catch { return; }
+  if (!raw) return;
+  let ids = [];
+  if (raw[0] === "[") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) ids = parsed.filter(x => typeof x === "string" && x);
+    } catch {}
+  } else ids = [raw];
+  for (const id of ids) rememberAdmission(fid, id);
+  try { localStorage.removeItem(ADMISSION_LEGACY_KEY(fid)); } catch {}
+}
+function outstandingAdmissions(fid) {
+  migrateAdmissions(fid);
+  const prefix = ADMISSION_PREFIX(fid);
+  const found = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) found.push([key.slice(prefix.length), localStorage.getItem(key)]);
+    }
+  } catch { return []; }
+  // Oldest first, by the stamp written at mint time. Ties break on the id:
+  // `Date.now()` has millisecond resolution and several sends can share one,
+  // in which case sorting on the stamp alone falls back to storage iteration
+  // order -- which is not defined, so "oldest first" would be a claim the code
+  // does not keep.
+  found.sort((a, b) => (Number(a[1]) || 0) - (Number(b[1]) || 0) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return found.map(pair => pair[0]).filter(Boolean);
+}
+/* How long a just-minted admission is protected from another tab's 404.
+
+   The value stored under each key is the mint time, and it doubles as a
+   bounded dispatch lease. The race it closes: tab A writes its key and has not
+   sent the POST yet; tab B opens the same session, asks about that id, and is
+   told 404 because the server has genuinely never heard of it; B deletes the
+   key; A's POST then succeeds and its response is lost, with nothing left to
+   reconcile from. B's 404 was true and acting on it was still wrong -- "not
+   yet" and "never" are the same answer from the server and different facts.
+
+   Bounded, so a key for a request that really never left cannot accumulate
+   forever. Past the grace a 404 is taken at face value. */
+const ADMISSION_GRACE_MS = 60_000;
+function admissionAge(fid, id) {
+  let raw = null;
+  try { raw = localStorage.getItem(ADMISSION_PREFIX(fid) + id); } catch { return null; }
+  const minted = Number(raw);
+  // A missing, unparseable or future stamp is not a lease. Trusting one would
+  // make a corrupted value protect a key permanently.
+  if (!raw || !Number.isFinite(minted) || minted <= 0 || minted > Date.now()) return null;
+  return Date.now() - minted;
+}
+function admissionWithinGrace(fid, id) {
+  const age = admissionAge(fid, id);
+  return age !== null && age < ADMISSION_GRACE_MS;
+}
+function rememberAdmission(fid, id) {
+  // A single independent write. No read, so nothing to lose a race with.
+  try { localStorage.setItem(ADMISSION_PREFIX(fid) + id, String(Date.now())); } catch {}
+}
+function forgetAdmission(fid, id) {
+  try { localStorage.removeItem(ADMISSION_PREFIX(fid) + id); } catch {}
+}
+/* Whether an answer settles an admission. `sent`, `released` and `none` are
+   decided; `pending` is undecided by definition, and an unrecognised state is
+   not evidence of anything — dropping either throws away the only handle the
+   client has on those comments. */
+function admissionSettled(state) {
+  return state === "sent" || state === "released" || state === "none";
+}
+/* What happened to the pins this tab sent, when it never saw the answers.
+   A reload, a closed tab, a dropped connection: the 202s are gone and the
+   client knows only that it sent something. Guessing is the one thing it must
+   not do — "assume sent" silently loses the comments, "assume open" offers the
+   user a comment a running turn is already carrying. So it asks, about every
+   one of them, and keeps the ones that are still undecided. */
+/* One pending retry per session, so N unresolved ids schedule one sweep.
+
+   Without the de-dupe every 404 inside the lease would arm its own timer and a
+   tab with several outstanding sends would re-ask N times per round. */
+const _admissionRetries = new Map();
+function scheduleAdmissionRetry(fid) {
+  if (_admissionRetries.has(fid)) return;
+  _admissionRetries.set(fid, setTimeout(() => {
+    _admissionRetries.delete(fid);
+    // Only if the session is still the one on screen; reconciling a session
+    // the user has left would fight whatever is now open.
+    if (S.currentId === fid) reconcileLastAdmission(fid).catch(() => {});
+  }, 3000));
+}
+async function reconcileLastAdmission(fid) {
+  const outstanding = outstandingAdmissions(fid);
+  if (!outstanding.length) return null;
+  const records = [];
+  for (const reservation of outstanding) {
+    let record = null;
+    try {
+      record = await api(`/frames/${fid}/admissions/${encodeURIComponent(reservation)}`);
+    } catch (e) {
+      // 404 means this session has no such admission. That is true both for a
+      // stale id and for one whose POST has not left another tab yet, and the
+      // second must not be deleted — see ADMISSION_GRACE_MS. Within the lease
+      // the key is kept and re-asked; past it, taken at face value. Anything
+      // else (offline, 5xx) always leaves it for the next attempt rather than
+      // dropping the only handle on the comments.
+      if (e && e.status === 404) {
+        if (admissionWithinGrace(fid, reservation)) scheduleAdmissionRetry(fid);
+        else forgetAdmission(fid, reservation);
+      }
+      continue;
+    }
+    records.push(record);
+    // Only a decided outcome is forgotten.
+    if (admissionSettled(record && record.state)) forgetAdmission(fid, reservation);
+  }
+  await loadAnnotations(fid);
+  refreshAllStages(); updateAnnotBadge();
+  // The most recent decided record, for callers that want one answer; every
+  // record was acted on above regardless.
+  return records.length ? records[records.length - 1] : null;
+}
 /* Render an image the user can pin comments onto, with zoom + pan. Used by the
    dock viewer AND the fullscreen modal. Zoom is WIDTH-BASED (the image element
    physically grows) rather than a CSS transform, so the pin layer scales with
@@ -5247,11 +8203,34 @@ function renderAnnotatableImage(body, a, url) {
     openAnnotDraft(stage, a, x, y);
   });
 }
+/* The one place that decides what a pin's status is for display. `reserved`
+   and `pending` are in-flight: not open (the user cannot act on them) and not
+   sent (they are not consumed yet). Anything unrecognised is `unknown` rather
+   than silently `open`, because "I do not know" and "you may edit this" are
+   different answers. */
+function annotationStatus(an) {
+  const raw = String((an && an.status) || "open");
+  if (raw === "sent" || raw === "resolved" || raw === "dismissed") return raw;
+  if (raw === "reserved" || raw === "pending") return "pending";
+  if (raw === "open") return "open";
+  return "unknown";
+}
+function annotationIsHeld(an) {
+  const shown = annotationStatus(an);
+  return shown === "pending" || shown === "unknown";
+}
 function renderPins(stage, a) {
   const layer = stage.querySelector(".annot-layer"); if (!layer) return;
   layer.querySelectorAll(".annot-pin:not(.draft)").forEach(n => n.remove());
   annotationsFor(a.id).forEach(an => {
-    const pin = el("div", "annot-pin" + (an.status === "sent" ? " sent" : (an.status === "resolved" ? " resolved" : "")));
+    // A held pin is not an open one. `reserved` (a turn is quoting it) and
+    // `pending` (accepted, consume unconfirmed) both used to render as `open`,
+    // which invites the user to edit or delete a comment that is already on its
+    // way -- and `data-annotation-status` exists so a test can assert that
+    // without matching on CSS class soup or translated text.
+    const shown = annotationStatus(an);
+    const pin = el("div", "annot-pin " + shown);
+    pin.dataset.annotationStatus = shown;
     pin.style.left = (an.x * 100) + "%"; pin.style.top = (an.y * 100) + "%";
     pin.textContent = an.number; pin.title = an.body || "";
     pin.onclick = (e) => { e.stopPropagation(); openPinPop(stage, a, an); };
@@ -5299,7 +8278,7 @@ function openAnnotDraft(stage, a, x, y) {
     const text = ta.value.trim(); if (!text) return;
     save.disabled = true; save.textContent = t("common.saving");
     try { await saveAnnotation(a, x, y, text); closeAnnotDraft(); }
-    catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(/404/.test(e.message) ? t("annot.save.err404") : (t("annot.save.err", e.message)), true); }
+    catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(e.status === 404 ? t("annot.save.err404") : (t("annot.save.err", apiErrorText(e))), true); }
   };
   foot.appendChild(spacer); foot.appendChild(cancel); foot.appendChild(save);
   pop.appendChild(ta); pop.appendChild(foot);
@@ -5332,7 +8311,16 @@ function openPinPop(stage, a, an) {
   const pop = el("div", "annot-pop view");
   const head = el("div", "annot-pop-head");
   head.appendChild(el("span", "annot-pop-num", "#" + an.number));
-  const st = el("span", "annot-pop-status " + (an.status || "open"), an.status === "sent" ? t("annot.status.sent") : (an.status === "resolved" ? t("annot.status.resolved") : t("annot.status.open")));
+  const shown = annotationStatus(an);
+  const label = {
+    sent: t("annot.status.sent"),
+    resolved: t("annot.status.resolved"),
+    dismissed: t("annot.status.resolved"),
+    pending: t("annot.status.pending"),
+    unknown: t("annot.status.unknown"),
+  }[shown] || t("annot.status.open");
+  const st = el("span", "annot-pop-status " + shown, label);
+  st.dataset.annotationStatus = shown;
   head.appendChild(st);
   const bodyEl = el("div", "annot-pop-body", an.body || "");
   const foot = el("div", "annot-foot");
@@ -5340,8 +8328,16 @@ function openPinPop(stage, a, an) {
   const del = el("button", "annot-btn ghost danger", t("common.delete")); del.onclick = async () => {
     del.disabled = true;
     try { await deleteAnnotations([annotationId(an)]); closeAnnotPop(); hint(t("annot.deleted")); }
-    catch (e) { del.disabled = false; hint(t("toast.deleteFailed", e.message), true); }
+    catch (e) { del.disabled = false; hint(t("toast.deleteFailed", apiErrorText(e)), true); }
   };
+  // A held pin is not the user's to delete: a turn is quoting it, and the
+  // server answers 409 for exactly this. Offering the button and then showing
+  // an error is a worse version of not offering it.
+  if (annotationIsHeld(an)) {
+    del.disabled = true;
+    del.title = t("annot.status.pending");
+    del.dataset.heldByTurn = "1";
+  }
   const close = el("button", "annot-btn solid", t("common.close")); close.onclick = () => closeAnnotPop();
   foot.appendChild(del); foot.appendChild(close);
   pop.appendChild(head); pop.appendChild(bodyEl); pop.appendChild(foot);
@@ -5369,7 +8365,7 @@ function updateAnnotBadge() {
       hint(t("annot.discarded"));
     } catch (err) {
       cancel.disabled = false;
-      hint(t("annot.remove.err", err.message), true);
+      hint(t("annot.remove.err", apiErrorText(err)), true);
     }
   };
   chip.appendChild(main); chip.appendChild(cancel);
@@ -5389,7 +8385,7 @@ function toggleAnnotList(anchor) {
     row.appendChild(el("div", "annot-list-body", an.body || ""));
     const acts = el("div", "annot-list-acts");
     const openBtn = el("button", "annot-mini", t("common.view")); openBtn.onclick = () => { pop.remove(); const art = (S.artifacts || []).find(x => x.id === an.artifact_id); if (art) openViewer(art); };
-    const rm = el("button", "annot-mini danger", t("btn.remove")); rm.onclick = async () => { try { await deleteAnnotations([annotationId(an)]); pop.remove(); if (openAnnotations().length && anchor.parentElement) toggleAnnotList(anchor); } catch (e) { hint(t("annot.remove.err", e.message), true); } };
+    const rm = el("button", "annot-mini danger", t("btn.remove")); rm.onclick = async () => { try { await deleteAnnotations([annotationId(an)]); pop.remove(); if (openAnnotations().length && anchor.parentElement) toggleAnnotList(anchor); } catch (e) { hint(t("annot.remove.err", apiErrorText(e)), true); } };
     acts.appendChild(openBtn); acts.appendChild(rm); row.appendChild(acts);
     pop.appendChild(row);
   });
@@ -5435,12 +8431,12 @@ function editArtifact(a) { S._editing = a.id; renderViewer(); }
 async function renameArtifact(a) {
   const name = prompt(t("artifact.rename.prompt"), a.filename || ""); if (!name || name === a.filename) return;
   try { await api(`/artifacts/${a.id}/rename`, { method: "PATCH", body: JSON.stringify({ filename: name }) }); a.filename = name; if (S.currentId) loadArtifacts(S.currentId); renderViewer(); hint(t("artifact.renamed")); }
-  catch (e) { hint(t("toast.renameFailed", e.message), true); }
+  catch (e) { hint(t("toast.renameFailed", apiErrorText(e)), true); }
 }
 async function deleteArtifact(a) {
   if (!confirm(t("artifact.delete.confirm"))) return;
   try { await api(`/artifacts/${a.id}`, { method: "DELETE" }); closeTab(a.id); if (S.currentId) loadArtifacts(S.currentId); hint(t("artifact.deleted", (a.filename || ""))); }
-  catch (e) { hint(t("toast.deleteFailed", e.message), true); }
+  catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); }
 }
 function renderArtifactEditor(body, a) {
   const bar = el("div", "edit-bar");
@@ -5478,7 +8474,7 @@ function renderArtifactEditor(body, a) {
       S._editing = null; (S._artBust = S._artBust || {})[a.id] = Date.now(); hint(t("artifact.saved", (a.filename || "")));
       if (S.currentId) loadArtifacts(S.currentId);
       if (S.provMode) showProvenance(S.dockArtifact || a); else renderViewer();
-    } catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(t("artifact.save.err", e.message), true); }
+    } catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(t("artifact.save.err", apiErrorText(e)), true); }
   };
 }
 function artifactMenu(anchor, a) {
@@ -5499,7 +8495,7 @@ function artifactMenu(anchor, a) {
 }
 async function setArtPriority(a, p, closeAfter) {
   try { await api(`/artifacts/${a.id}/priority`, { method: "POST", body: JSON.stringify({ priority: p }) }); a.priority = p; hint(p > 0 ? t("artifact.starred") : p < 0 ? t("artifact.hidden") : t("artifact.unstarred")); if (S.currentId) loadArtifacts(S.currentId); if (closeAfter && S.dockArtifact === a) closeTab(a.id); }
-  catch (e) { hint(t("artifact.priority.err", e.message), true); }
+  catch (e) { hint(t("artifact.priority.err", apiErrorText(e)), true); }
 }
 async function exportMetadata(a) {
   try {
@@ -5512,7 +8508,7 @@ async function exportMetadata(a) {
     const url = URL.createObjectURL(blob); const link = document.createElement("a");
     link.href = url; link.download = (a.filename || "artifact") + ".metadata.json"; link.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000); hint(t("artifact.metadataExported"));
-  } catch (e) { hint(t("toast.exportFailed", e.message), true); }
+  } catch (e) { hint(t("toast.exportFailed", apiErrorText(e)), true); }
 }
 async function showVersions(a) {
   S._modalMode = "versions:" + a.id;
@@ -5533,8 +8529,15 @@ async function showVersions(a) {
       row.appendChild(info);
       const acts = el("div", "ver-acts");
       const view = el("a", "outline-btn small", t("common.view")); view.href = `${API}/artifacts/${v.version_id}`; view.target = "_blank"; acts.appendChild(view);
-      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { const restored = await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); syncArtifactVersion((restored && restored.artifact) || { id: a.id, version_id: v.version_id }, true); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact && S.dockArtifact.id === a.id) { if (S.provMode) showProvenance(S.dockArtifact); else renderViewer(); } render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", e.message), true); } }; acts.appendChild(rb); }
+      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { const restored = await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); syncArtifactVersion((restored && restored.artifact) || { id: a.id, version_id: v.version_id }, true); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact && S.dockArtifact.id === a.id) { if (S.provMode) showProvenance(S.dockArtifact); else renderViewer(); } render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", apiErrorText(e)), true); } }; acts.appendChild(rb); }
       row.appendChild(acts); wrap.appendChild(row);
+      // Where this version's data came from, when it came from anywhere. The
+      // envelope has been recorded on every retrieved version since retrieval
+      // provenance existed and read by nothing, so a figure built on a live
+      // API fetch looked exactly like one computed from thin air. Read-only,
+      // and already allowlisted, bounded and redacted by the server -- the
+      // client renders what it is given and derives nothing.
+      if (v.retrieval_source) wrap.appendChild(retrievalSourcePanel(v.retrieval_source));
     });
     body.appendChild(wrap);
   };
@@ -5596,7 +8599,13 @@ function molecule(container, url, nm) {
   }).catch(() => {});
   const fb = () => fetch(url).then(r => r.text()).then(t => view.innerHTML = "<pre style='padding:16px'>" + esc(t.slice(0, 8000)) + "</pre>").catch(() => {});
   if (window.$3Dmol) return boot();
-  const s = el("script"); s.src = "/static/vendor/3Dmol-min.js"; s.onload = boot; s.onerror = () => { const s2 = el("script"); s2.src = "https://3Dmol.org/build/3Dmol-min.js"; s2.onload = boot; s2.onerror = fb; document.head.appendChild(s2); }; document.head.appendChild(s);
+  // Vendored copy only. A missing local 3Dmol used to fall back to fetching
+  // https://3Dmol.org/build/3Dmol-min.js, which executes third-party script in
+  // the page that holds the session cookie -- and does it silently, on an app
+  // whose whole premise is that it runs locally and makes no call the user did
+  // not ask for. The degraded path below (render the coordinates as text) was
+  // already written; the CDN hop only stood between the failure and it.
+  const s = el("script"); s.src = "/static/vendor/3Dmol-min.js"; s.onload = boot; s.onerror = fb; document.head.appendChild(s);
 }
 
 /* ---------- Notebook tab (F2) ---------- */
@@ -5637,6 +8646,9 @@ function renderTableInto(holder, fname) {
   const build = (rows) => {
     if (!rows || !rows.length) return;
     const view = rows.slice(0, 51);  // header + 50 body rows
+    // The widest row, not the header's width: a ragged file whose header is
+    // short would otherwise under-report how much is being hidden.
+    const width = rows.reduce((most, r) => Math.max(most, (r || []).length), 0);
     const tbl = el("table", "nbc-table");
     const thead = el("thead"), htr = el("tr");
     (view[0] || []).slice(0, 24).forEach(h => htr.appendChild(el("th", null, h)));
@@ -5645,13 +8657,25 @@ function renderTableInto(holder, fname) {
     view.slice(1).forEach(r => { const tr = el("tr"); r.slice(0, 24).forEach(cell => tr.appendChild(el("td", null, cell))); tb.appendChild(tr); });
     tbl.appendChild(tb);
     const scroll = el("div", "nbc-table-scroll"); scroll.appendChild(tbl); holder.appendChild(scroll);
-    if (rows.length > 51) holder.appendChild(el("div", "nbc-table-more", t("nb.table.rowsHidden", (rows.length - 51))));
+    // Both dimensions. Columns beyond 24 were dropped with no notice at all,
+    // so a 101-column table showed 24 and looked complete -- the reader has no
+    // way to tell a narrow table from a truncated view of a wide one.
+    const hiddenRows = Math.max(0, rows.length - 51);
+    const hiddenCols = Math.max(0, width - 24);
+    if (hiddenRows && hiddenCols) {
+      holder.appendChild(el("div", "nbc-table-more", t("nb.table.bothHidden", hiddenRows, hiddenCols)));
+    } else if (hiddenRows) {
+      holder.appendChild(el("div", "nbc-table-more", t("nb.table.rowsHidden", hiddenRows)));
+    } else if (hiddenCols) {
+      holder.appendChild(el("div", "nbc-table-more", t("nb.table.colsHidden", hiddenCols)));
+    }
   };
   S._tbl = S._tbl || {};
   if (S._tbl[url]) { build(S._tbl[url]); return; }
   fetch(url).then(r => r.ok ? r.text() : null).then(text => {
     if (text == null) return;
-    const rows = parseDelimited(text, /\.tsv$/i.test(fname) ? "\t" : ",");
+    const firstLine = text.replace(/\r/g, "").split("\n", 1)[0] || "";
+    const rows = parseDelimited(text, delimiterFor(fname, "", firstLine));
     S._tbl[url] = rows; build(rows);
   }).catch(() => {});
 }
@@ -5825,7 +8849,7 @@ async function kernelCtl(action) {
   if (action === "restart" && !confirm(t("nb.kernel.restartConfirm"))) return;
   if (action === "stop" && !confirm(t("nb.kernel.stopConfirm"))) return;
   try { await api(`/frames/${S.currentId}/kernel/${action}`, { method: "POST" }); }
-  catch (e) { hint(t("nb.kernel.opFailed", e.message), true); }
+  catch (e) { hint(t("nb.kernel.opFailed", apiErrorText(e)), true); }
   invalidateKernelCache();  // force a fresh read so the state chip reflects the action
   if (S.dock.open && S.activeTab === "notebook") renderNotebook();
 }
@@ -5848,7 +8872,7 @@ async function executeNotebookCode(code, language, controls) {
     if (!accepted && S.currentId === frameId) { invalidateKernelCache(); await loadExecutionLog(frameId); loadArtifacts(frameId); scheduleWorkbenchRefresh(); }
     else if (accepted && S.currentId === frameId) scheduleWorkbenchRefresh();
     return true;
-  } catch (error) { hint(t("nb.repl.execFailed", error.message), true); return false; }
+  } catch (error) { hint(t("nb.repl.execFailed", apiErrorText(error)), true); return false; }
   finally {
     if (!accepted && S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null;
     if (!accepted) { if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden"); }
@@ -5965,7 +8989,7 @@ async function nbSwitchEnv(name, envSel) {
       method: "POST", body: JSON.stringify({ env: name }) });
     if (r.error) hint(t("nb.kernel.envSwitchFailed", r.error), true);
     else hint(t("nb.kernel.envSwitched", name));
-  } catch (e) { hint(t("nb.kernel.envSwitchFailed", e.message), true); }
+  } catch (e) { hint(t("nb.kernel.envSwitchFailed", apiErrorText(e)), true); }
   if (envSel) envSel.disabled = false;
   invalidateKernelCache();  // env + generation changed — re-read state/env
   if (S.dock.open && S.activeTab === "notebook") renderNotebook();
@@ -6021,13 +9045,53 @@ function projectNotebookCells(rawEntries) {
     };
   });
 }
+// The export has always produced three things — a Python .ipynb, an R .ipynb,
+// and a zip of both — and the UI could only ever ask for the zip, because the
+// language was hardcoded. Two working formats were unreachable: a user wanting
+// the Python notebook had to unzip a bundle to get at it, and nothing said the
+// other options existed.
+const NOTEBOOK_EXPORTS = [
+  { language: "bundle", key: "prov.exec.downloadNotebook", suffix: "notebooks.zip" },
+  { language: "python", key: "prov.exec.downloadPython", suffix: "python.ipynb" },
+  { language: "r", key: "prov.exec.downloadR", suffix: "r.ipynb" },
+  // The reading form. The three above are for re-running the work; this one is
+  // for pasting it into an issue or a methods section, with both languages in
+  // execution order because the interleaving is the record.
+  { language: "markdown", key: "prov.exec.downloadMarkdown", suffix: "md" },
+];
 function notebookExportLink(frameId) {
+  const wrap = el("div", "prov-dl");
+  // The default action stays exactly what it was, so the common path is one
+  // click and nobody has to learn a menu to get what they used to get.
+  const primary = NOTEBOOK_EXPORTS[0];
   const dl = el("a", "prov-dlbtn");
   dl.appendChild(iconEl("download", 14));
-  dl.appendChild(el("span", null, t("prov.exec.downloadNotebook")));
-  dl.href = `${API}/frames/${encodeURIComponent(frameId)}/notebook/export?language=bundle`;
-  dl.setAttribute("download", `${frameId}.notebooks.zip`);
-  return dl;
+  dl.appendChild(el("span", null, t(primary.key)));
+  dl.href = `${API}/frames/${encodeURIComponent(frameId)}/notebook/export?language=${primary.language}`;
+  dl.setAttribute("download", `${frameId}.${primary.suffix}`);
+  wrap.appendChild(dl);
+
+  const toggle = el("button", "prov-dlmore");
+  toggle.setAttribute("aria-label", t("prov.exec.downloadMore"));
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.appendChild(iconEl("chevron-down", 13));
+  const menu = el("div", "prov-dlmenu hidden");
+  NOTEBOOK_EXPORTS.slice(1).forEach(option => {
+    const item = el("a", "prov-dlitem");
+    item.appendChild(el("span", null, t(option.key)));
+    item.href = `${API}/frames/${encodeURIComponent(frameId)}/notebook/export?language=${option.language}`;
+    item.setAttribute("download", `${frameId}.${option.suffix}`);
+    // A download navigates; the menu should not stay open behind it.
+    item.onclick = () => { menu.classList.add("hidden"); toggle.setAttribute("aria-expanded", "false"); };
+    menu.appendChild(item);
+  });
+  toggle.onclick = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const open = menu.classList.toggle("hidden") === false;
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  wrap.appendChild(toggle); wrap.appendChild(menu);
+  return wrap;
 }
 async function refreshVariableInspector() {
   const inspector = S.variableInspector, frameId = S.currentId;
@@ -6186,7 +9250,7 @@ function renderNotebook() {
   run.disabled = replBusy || !S.currentId;
   const stop = el("button", "repl-stop" + (replBusy ? "" : " hidden")); stop.title = t("nb.repl.interruptTitle"); stop.innerHTML = icon("stop", 15); stop.onclick = async () => {
     try { const result = await scopedExecutionRequest(S.currentId, "kernel/interrupt", "notebook interrupt", "user_repl"); if (result && result.ok) hint(t("nb.repl.interruptSent")); }
-    catch (error) { hint(t("nb.action.failed", error.message), true); }
+    catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); }
   };
   editorActions.appendChild(run); editorActions.appendChild(stop); editorBar.appendChild(editorActions); editor.appendChild(editorBar);
   const inp = el("textarea", "nb-repl-input"); inp.rows = 7; inp.spellcheck = false; inp.placeholder = t("nb.repl.inputPlaceholder"); inp.disabled = !S.currentId || replBusy; inp.value = S._replDrafts[S._replLanguage] || ""; editor.appendChild(inp);
@@ -6300,12 +9364,12 @@ async function forkNotebookCell(cell) {
   try {
     await api(`/frames/${S.currentId}/branches/fork`, { method: "POST", body: JSON.stringify({ from_cell_id: nbCellKey(cell) }) });
     await loadWorkbenchState(S.currentId, true);
-  } catch (error) { hint(t("nb.action.failed", error.message), true); }
+  } catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); }
 }
 async function promoteNotebookCell(cell) {
   if (!S.currentId || !branchCapability("promote")) return;
   try { const art = await api(`/frames/${S.currentId}/artifacts/promote`, { method: "POST", body: JSON.stringify({ cell_id: nbCellKey(cell) }) }); loadArtifacts(S.currentId); scheduleWorkbenchRefresh(); hint(t("nb.action.promoted", (art && art.filename) || "")); }
-  catch (error) { hint(t("nb.action.failed", error.message), true); }
+  catch (error) { hint(t("nb.action.failed", apiErrorText(error)), true); }
 }
 function cellNode(e) {
   const k = e.kernel_id || "python";
@@ -6439,16 +9503,47 @@ async function renderProvEnvironment(body, a) {
   const pkgs = env.packages || [];
   const chips = el("div", "env-chips");
   chips.appendChild(chip("Environment", env.kind || "python"));
-  chips.appendChild(chip(env.implementation || "Python", env.python_version || "?"));
+  // Only claim a Python version when the record has one. An R kernel's
+  // snapshot leaves it null, and "Python ?" would put back exactly the
+  // misattribution the snapshot was fixed to stop telling.
+  if (env.python_version) chips.appendChild(chip(env.implementation || "Python", env.python_version));
+  if (env.environment_name) chips.appendChild(chip("Env", publicText(env.environment_name, 48)));
   chips.appendChild(chip("Packages", String(env.package_count != null ? env.package_count : pkgs.length)));
   body.appendChild(chips);
+  if (env.interpreter) body.appendChild(el("div", "env-plat", publicText(env.interpreter, 160)));
   if (env.platform) body.appendChild(el("div", "env-plat", env.platform));
-  // provenance honesty: say whether this is the recorded production env or a live fallback
+  // Why a package list is empty matters: "none installed" and "this runtime
+  // has no Python distributions" look identical without it.
+  if (env.packages_unavailable) {
+    body.appendChild(el("div", "env-src warn", publicText(env.packages_unavailable, 200)));
+  }
+  // Provenance honesty, in three states rather than two. "Captured or live"
+  // was the only distinction drawn, so a snapshot the STORE labels
+  // `legacy_unverified` — the named generation produced this environment, but
+  // it may not be the only one that did — rendered identically to one whose
+  // address includes its generation and cannot have been shared. So did a row
+  // carrying `provenance: "assumed: no kernel generation on record"`.
+  //
+  // The migration that wrote `generation_confidence` says in its own docstring
+  // that "a reader that needs certainty filters on the label", and no reader
+  // did: 0 occurrences in this file before now. The label was computed,
+  // migrated, stored, shipped over the wire, and ignored — so the UI made the
+  // strong claim on every snapshot regardless of what the data supported.
   const captured = env.source !== "live";
-  const note = el("div", "env-src" + (captured ? " ok" : " warn"));
+  const verified = String(env.generation_confidence || "") === "verified";
+  const note = el("div", "env-src" + (captured && verified ? " ok" : " warn"));
   note.appendChild(iconEl(captured ? "package" : "clock", 13));
-  note.appendChild(el("span", null, captured ? t("prov.env.recorded") : t("prov.env.liveFallback")));
+  note.appendChild(el("span", null,
+    !captured ? t("prov.env.liveFallback")
+      : verified ? t("prov.env.recorded")
+      : t("prov.env.recordedUnverified")));
   body.appendChild(note);
+  // The row's own words about why, when it has any. Rendered rather than
+  // reworded: it is written next to the code that could not establish the
+  // provenance, and that code knows why better than this does.
+  if (captured && !verified && env.provenance) {
+    body.appendChild(el("div", "env-src warn", publicText(env.provenance, 200)));
+  }
   const remote = env.remote || [];
   if (remote.length) {
     const rw = el("div", "env-remote"); rw.appendChild(el("div", "env-remote-h", t("prov.env.remoteTitle")));
@@ -6481,7 +9576,7 @@ async function renderProvEnvironment(body, a) {
 async function renderProvMessages(body) {
   body.appendChild(el("div", "dock-empty", t("prov.msg.loading")));
   let msgs;
-  try { const d = await api(`/frames/${S.currentId}/messages?from=0&limit=500`); msgs = (d && d.messages) || []; }
+  try { const d = await fetchRecentMessages(S.currentId, 500); msgs = (d && d.messages) || []; }
   catch (e) { if (S.provMode && S.provSub === "messages") { body.innerHTML = ""; body.appendChild(el("div", "dock-empty", t("prov.msg.loadFailed", e.message))); } return; }
   if (!S.provMode || S.provSub !== "messages") return;  // tab changed while loading
   body.innerHTML = "";
@@ -6521,10 +9616,10 @@ function openKetcher() { $("#modal-title").textContent = t("ketcher.modalTitle")
 /* ---------- upload ---------- */
 function uploadFiles(files) {
   [...files].forEach(file => { const rd = new FileReader(); rd.onload = async () => { const b64 = (rd.result.split(",")[1]) || "";
-    try { if (!S.currentId) { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModel }) }); S.currentId = f.id; sub(f.id); await loadSessions(); await openConversation(f.id, S.project); }
+    try { if (!S.currentId) { const f = await api("/frames", { method: "POST", body: JSON.stringify({ project_id: S.project || undefined, model: S.defaultModelName }) }); S.currentId = f.id; sub(f.id); await loadSessions(); await openConversation(f.id, S.project); }
       await api("/uploads", { method: "POST", body: JSON.stringify({ filename: file.name, content_base64: b64, project_id: S.project || undefined, frame_id: S.currentId }) });
       loadArtifacts(S.currentId); hint(t("upload.uploaded", file.name));
-    } catch (e) { hint(t("upload.failed", e.message), true); } }; rd.readAsDataURL(file); });
+    } catch (e) { hint(t("upload.failed", apiErrorText(e)), true); } }; rd.readAsDataURL(file); });
 }
 
 /* ---------- notes ---------- */
@@ -6592,6 +9687,48 @@ function palActions() {
     { group: t("palette.group.commands"), label: t("palette.action.backHome"), icon: "arrow-left", run: () => showDashboard() },
   ];
 }
+function dataproPaletteSummary(hit) {
+  const parts = [];
+  if (hit && hit.dataset_type) parts.push(publicText(hit.dataset_type, 60));
+  if (hit && hit.json_pointer) parts.push(publicText(hit.json_pointer, 80));
+  if (hit && hit.content != null) {
+    let content = hit.content;
+    if (typeof content !== "string") {
+      try { content = JSON.stringify(content); } catch { content = String(content); }
+    }
+    if (content) parts.push(publicText(content, 180));
+  }
+  return parts.join(" · ");
+}
+function openDataproSearchHit(hit) {
+  closePalette();
+  if (hit && hit.artifact_id) {
+    const view = {
+      id: String(hit.artifact_id),
+      filename: t("palette.datapro.result") + ".json",
+      content_type: "application/json",
+      root_frame_id: hit.root_frame_id || null,
+      project_id: hit.project_id || null,
+    };
+    // The dock lives inside #workspace, which the dashboard hides, and
+    // openConversation resets S.openTabs/S.dockArtifact -- so the viewer has to
+    // be opened *after* the owning session, exactly like the artifact hit does.
+    // Opening it directly made a click from the dashboard render into a 0x0
+    // node, and a cross-session hit render in the wrong session's dock.
+    if (hit.root_frame_id && hit.root_frame_id !== S.currentId) {
+      openConversation(hit.root_frame_id, hit.project_id).then(() => openViewer(view));
+      return;
+    }
+    if (!hit.root_frame_id && !S.currentId) {
+      // No session to open: the fullscreen modal renders over the dashboard.
+      openArtifact(view);
+      return;
+    }
+    openViewer(view);
+    return;
+  }
+  openCust("connectors");
+}
 async function palSearch(query) {
   const q = (query || "").trim().toLowerCase();
   const gen = (PAL.gen = (PAL.gen || 0) + 1);  // discard out-of-order responses
@@ -6608,6 +9745,13 @@ async function palSearch(query) {
       const r = await api("/search?q=" + encodeURIComponent(q));
       (r.sessions || []).slice(0, 8).forEach(s => items.push({ group: t("conv.title.default"), label: s.name || s.task_summary || t("conv.title.default"), icon: "message-square", run: () => { closePalette(); openConversation(s.id, s.project_id); } }));
       (r.artifacts || []).slice(0, 8).forEach(a => items.push({ group: t("palette.group.artifacts"), label: a.filename, sub: a.content_type || "", icon: "file", run: () => { closePalette(); if (a.root_frame_id) openConversation(a.root_frame_id, a.project_id).then(() => dockTab("files")); } }));
+      (r.datapro || []).slice(0, 8).forEach(hit => items.push({
+        group: t("palette.group.datapro"),
+        label: publicText((hit && hit.query) || t("palette.datapro.result"), 140),
+        sub: dataproPaletteSummary(hit),
+        icon: "search",
+        run: () => openDataproSearchHit(hit),
+      }));
     } catch {}
   }
   if (gen !== PAL.gen) return;  // a newer keystroke superseded this response
@@ -6736,10 +9880,10 @@ function permRuleRow(r, g) {
   row.appendChild(el("span", "perm-rpat mono", r.pattern));
   row.appendChild(permDecSelect(r.decision, async (v) => {
     try { await api("/permissions", { method: "POST", body: JSON.stringify({ scope: g.scope, scope_id: g.scope_id, tool: r.tool, pattern: r.pattern, decision: v }) }); hint(t("toast.perm.ruleUpdated")); }
-    catch (e) { hint(t("toast.perm.updateFailed", e.message), true); }
+    catch (e) { hint(t("toast.perm.updateFailed", apiErrorText(e)), true); }
   }));
   const del = el("button", "icon-ghost"); del.innerHTML = icon("trash-2", 15); del.title = t("common.delete");
-  del.onclick = async () => { try { await api(`/permissions/${r.rule_id}`, { method: "DELETE" }); custTab("permissions"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } };
+  del.onclick = async () => { try { await api(`/permissions/${r.rule_id}`, { method: "DELETE" }); custTab("permissions"); } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); } };
   row.appendChild(del); return row;
 }
 function permAddRow(g) {
@@ -6751,7 +9895,7 @@ function permAddRow(g) {
   add.onclick = async () => {
     if (!tool.value.trim()) { hint(t("toast.perm.enterTool"), true); return; }
     try { await api("/permissions", { method: "POST", body: JSON.stringify({ scope: g.scope, scope_id: g.scope_id, tool: tool.value.trim(), pattern: pat.value.trim() || "*", decision: dec }) }); custTab("permissions"); }
-    catch (e) { hint(t("toast.addFailed", e.message), true); }
+    catch (e) { hint(t("toast.addFailed", apiErrorText(e)), true); }
   };
   row.appendChild(tool); row.appendChild(pat); row.appendChild(sel); row.appendChild(add); return row;
 }
@@ -6760,7 +9904,7 @@ function permResetRow() {
   const info = el("div", "info"); info.appendChild(el("div", "nm", t("cust.perm.resetName"))); info.appendChild(el("div", "ds", t("cust.perm.resetDesc")));
   row.appendChild(info);
   const b = el("button", "outline-btn small", t("cust.perm.resetBtn"));
-  b.onclick = async () => { if (!confirm(t("cust.perm.resetConfirm"))) return; try { await api("/permissions/reset", { method: "POST" }); custTab("permissions"); hint(t("toast.perm.resetDone")); } catch (e) { hint(t("toast.failed", e.message), true); } };
+  b.onclick = async () => { if (!confirm(t("cust.perm.resetConfirm"))) return; try { await api("/permissions/reset", { method: "POST" }); custTab("permissions"); hint(t("toast.perm.resetDone")); } catch (e) { hint(t("toast.failed", apiErrorText(e)), true); } };
   row.appendChild(b); return row;
 }
 // General / global preferences — the dashboard 设置 (settings) entry lands here.
@@ -6796,6 +9940,21 @@ async function custGeneral(c) {
   const kr = el("div", "cust-row"); const ki = el("div", "info"); ki.appendChild(el("div", "nm", t("cust.general.modelKeyName"))); ki.appendChild(el("div", "ds", conf.has_api_key ? (t("cust.general.apiKeyConfigured") + (conf.model ? "（" + conf.model + "）" : "")) : t("cust.models.key.missing"))); kr.appendChild(ki); const go = el("button", "outline-btn small", t("cust.general.configureBtn")); go.onclick = () => custTab("models"); kr.appendChild(go); c.appendChild(kr);
 }
 function setLayout(name) { localStorage.setItem("os-layout", name); applyLayout(name); hint(t("toast.layout", ({ comfortable: t("cust.general.layout.comfortable"), compact: t("cust.general.layout.compact"), wide: t("cust.general.layout.wide") }[name] || name))); }
+// Readiness is computed server-side from local state alone (`nvidia-smi` is
+// looked for on PATH, never run) and the catalogue row had no reader, so a
+// GPU-only Skill rendered identically to one that runs anywhere and the user
+// met the difference mid-task. `ready` adds nothing to a row, so only the two
+// states that cost the user something are drawn.
+function skillReadinessNote(s) {
+  const rd = (s && s.readiness) || {};
+  if (!rd.state || rd.state === "ready") return null;
+  const named = publicList(rd.state === "needs_setup" ? rd.missing : rd.unverifiable, 8);
+  // Falls back to the declared requirements rather than to an empty sentence:
+  // "needs setup" that names nothing is not actionable.
+  const listed = (named.length ? named : publicList(s.requirements, 8)).join(", ");
+  if (!listed) return null;
+  return el("div", "ds prof-warn", t(rd.state === "needs_setup" ? "skill.readiness.needsSetup" : "skill.readiness.unknown", listed));
+}
 async function custSkills(c) {
   try {
     const pid = (typeof effProject === "function" ? effProject() : S.project) || null;
@@ -6811,16 +9970,41 @@ async function custSkills(c) {
     const nb = el("button", "outline-btn small", t("cust.skills.newBtn")); nb.onclick = () => skillEditor(null);
     const ib = el("button", "outline-btn small", t("cust.skills.importBtn")); ib.onclick = () => skillImport();
     acts.appendChild(nb); acts.appendChild(ib); bi.appendChild(el("div", "nm", t("cust.skills.yourSkills"))); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
-    skills.forEach(s => {
+    const skillRow = (s) => {
       const scope = s.scope === "project" ? "project" : (s.scope === "bundled" ? "bundled" : "personal");
       const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm");
       nm.appendChild(el("span", null, s.displayName || s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", t(`skill.scope.${scope}`)));
-      info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info);
+      info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); const rn = skillReadinessNote(s); if (rn) info.appendChild(rn); row.appendChild(info);
       const useBtn = el("button", "icon-ghost"); useBtn.title = t("skill.useInChat"); useBtn.innerHTML = icon("message-square", 15); useBtn.onclick = () => insertSkillMention(s.name); row.appendChild(useBtn);
       if (s.versioned) { const vb = el("button", "icon-ghost"); vb.title = t("skill.historyBtn"); vb.innerHTML = icon("clock", 15); vb.onclick = () => skillVersionHistory(s.name, scope, scope === "project" ? pid : null); row.appendChild(vb); }
-      if (s.editable && scope === "personal") { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); }
+      if (s.editable && scope === "personal") { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); } }; row.appendChild(db); }
       if (scope !== "project") { const tg = el("button", "toggle" + (s.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/skills/catalog/${encodeURIComponent(s.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); }
-      c.appendChild(row);
+      return row;
+    };
+    // `collection` is why the field exists on the wire: a pinned third-party
+    // bundle is one collapsed entry, not hundreds of rows the user has to
+    // scroll past -- and its rows are only built when they ask for them.
+    const collections = new Map();
+    skills.forEach(s => {
+      const cid = s.collection || "";
+      if (!cid) { c.appendChild(skillRow(s)); return; }
+      if (!collections.has(cid)) collections.set(cid, []);
+      collections.get(cid).push(s);
+    });
+    [...collections.keys()].sort().forEach(cid => {
+      const members = collections.get(cid);
+      const head = el("div", "cust-row"); const info = el("div", "info");
+      info.appendChild(el("div", "nm", t("cust.skills.collection", cid, members.length)));
+      info.appendChild(el("div", "ds", t("cust.skills.collectionDesc")));
+      head.appendChild(info);
+      const body = el("div", null); body.classList.add("hidden");
+      const tgl = el("button", "outline-btn small", t("cust.skills.collectionShow"));
+      tgl.onclick = () => {
+        if (!body.childElementCount) members.forEach(s => body.appendChild(skillRow(s)));
+        const open = body.classList.toggle("hidden") === false;
+        tgl.textContent = t(open ? "cust.skills.collectionHide" : "cust.skills.collectionShow");
+      };
+      head.appendChild(tgl); c.appendChild(head); c.appendChild(body);
     });
   } catch (e) { c.textContent = t("versions.load.err", e.message); }
 }
@@ -6853,7 +10037,7 @@ async function skillVersionHistory(name, scope, projectId) {
     const sidecar = manifest.sidecar && manifest.sidecar.present ? String(manifest.sidecar.sha256 || "").slice(0, 12) : "—"; meta.appendChild(el("div", "ds", t("skill.versionSidecar", sidecar)));
     head.appendChild(meta);
     if (version.active) head.appendChild(el("span", "pill", t("skill.versionActive")));
-    else if (!(data.status && data.status.read_only)) { const rollback = el("button", "outline-btn small", t("skill.rollbackBtn")); rollback.onclick = async () => { if (!confirm(t("skill.rollbackConfirm", name, versionId.slice(0, 18)))) return; rollback.disabled = true; try { await api(skillVersionPath(name, scope, projectId) + "/rollback", { method: "POST", body: JSON.stringify({ version_id: versionId }) }); hint(t("skill.rollbackDone", name)); await skillVersionHistory(name, scope, projectId); custTab("skills"); } catch (e) { rollback.disabled = false; hint(t("toast.failed", e.message), true); } }; head.appendChild(rollback); }
+    else if (!(data.status && data.status.read_only)) { const rollback = el("button", "outline-btn small", t("skill.rollbackBtn")); rollback.onclick = async () => { if (!confirm(t("skill.rollbackConfirm", name, versionId.slice(0, 18)))) return; rollback.disabled = true; try { await api(skillVersionPath(name, scope, projectId) + "/rollback", { method: "POST", body: JSON.stringify({ version_id: versionId }) }); hint(t("skill.rollbackDone", name)); await skillVersionHistory(name, scope, projectId); custTab("skills"); } catch (e) { rollback.disabled = false; hint(t("toast.failed", apiErrorText(e)), true); } }; head.appendChild(rollback); }
     card.appendChild(head); list.appendChild(card);
   });
   body.appendChild(list);
@@ -6884,7 +10068,7 @@ async function skillEditor(name, seed) {
   form.appendChild(el("label", "skill-lbl", t("skill.label.desc"))); form.appendChild(descIn);
   form.appendChild(el("label", "skill-lbl", t("skill.label.body"))); form.appendChild(bodyIn);
   const save = el("button", "solid-btn", t("skill.saveBtn"));
-  save.onclick = async () => { const nm = nameIn.value.trim(); if (!nm) { hint(t("toast.skill.enterName"), true); return; } save.disabled = true; save.textContent = t("common.saving"); try { if (name) await api(`/skills/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify({ description: descIn.value, body: bodyIn.value }) }); else await api("/skills", { method: "POST", body: JSON.stringify({ name: nm, description: descIn.value, body: bodyIn.value }) }); S.skillsCatalog = null; closeModalEl($("#modal")); hint(t("toast.skill.saved", nm)); custTab("skills"); } catch (e) { save.disabled = false; save.textContent = t("skill.saveBtn"); hint(t("artifact.save.err", e.message), true); } };
+  save.onclick = async () => { const nm = nameIn.value.trim(); if (!nm) { hint(t("toast.skill.enterName"), true); return; } save.disabled = true; save.textContent = t("common.saving"); try { if (name) await api(`/skills/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify({ description: descIn.value, body: bodyIn.value }) }); else await api("/skills", { method: "POST", body: JSON.stringify({ name: nm, description: descIn.value, body: bodyIn.value }) }); S.skillsCatalog = null; closeModalEl($("#modal")); hint(t("toast.skill.saved", nm)); custTab("skills"); } catch (e) { save.disabled = false; save.textContent = t("skill.saveBtn"); hint(t("artifact.save.err", apiErrorText(e)), true); } };
   const fa = el("div", "form-actions"); fa.appendChild(save); form.appendChild(fa);
   body.appendChild(form); openModalEl($("#modal"));
 }
@@ -6897,7 +10081,7 @@ async function skillImport() {
   const ta = el("textarea", "skill-body"); ta.placeholder = t("skill.importPlaceholder"); ta.style.minHeight = "260px";
   form.appendChild(el("label", "skill-lbl", t("skill.importLabel"))); form.appendChild(ta);
   const save = el("button", "solid-btn", t("skill.importBtn"));
-  save.onclick = async () => { if (!ta.value.trim()) return; save.disabled = true; save.textContent = t("cust.importing"); try { const r = await api("/skills/import", { method: "POST", body: JSON.stringify({ content: ta.value }) }); if (r.error) throw new Error(r.error); S.skillsCatalog = null; closeModalEl($("#modal")); hint(t("toast.skill.imported", (r.name || ""))); custTab("skills"); } catch (e) { save.disabled = false; save.textContent = t("skill.importBtn"); hint(t("toast.importFailed", e.message), true); } };
+  save.onclick = async () => { if (!ta.value.trim()) return; save.disabled = true; save.textContent = t("cust.importing"); try { const r = await api("/skills/import", { method: "POST", body: JSON.stringify({ content: ta.value }) }); S.skillsCatalog = null; closeModalEl($("#modal")); hint(t("toast.skill.imported", (r.name || ""))); custTab("skills"); } catch (e) { save.disabled = false; save.textContent = t("skill.importBtn"); hint(t("toast.importFailed", apiErrorText(e)), true); } };
   const fa = el("div", "form-actions"); fa.appendChild(save); form.appendChild(fa);
   body.appendChild(form); openModalEl($("#modal"));
 }
@@ -6905,7 +10089,7 @@ async function custSpecialists(c) { try {
   const d = await api("/specialists"); const builtin = (d && d.builtin) || []; const custom = (d && d.specialists) || [];
   c.innerHTML = ""; c.appendChild(hdr(t("cust.tab.specialists"), t("cust.specialists.desc")));
   const bar = el("div", "cust-row"); const bi = el("div", "info"); bi.appendChild(el("div", "nm", t("cust.specialists.yours"))); const acts = el("div", "cust-actrow"); const nb = el("button", "outline-btn small", t("cust.specialists.newBtn")); nb.onclick = () => specialistEditor(null); acts.appendChild(nb); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
-  custom.forEach(s => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "custom")); info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info); const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => specialistEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.specialists.deleteConfirm", s.name))) return; try { await api(`/specialists/${encodeURIComponent(s.name)}`, { method: "DELETE" }); custTab("specialists"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); c.appendChild(row); });
+  custom.forEach(s => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "custom")); info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info); const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => specialistEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.specialists.deleteConfirm", s.name))) return; try { await api(`/specialists/${encodeURIComponent(s.name)}`, { method: "DELETE" }); custTab("specialists"); } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); } }; row.appendChild(db); c.appendChild(row); });
   c.appendChild(el("div", "cust-subhead", t("cust.specialists.builtinRoles")));
   builtin.forEach(ag => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, ag.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", ag.mode || "agent")); if (ag.supportsPlanMode) { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "plan")); } info.appendChild(nm); info.appendChild(el("div", "ds", ag.description || "")); row.appendChild(info); const tg = el("button", "toggle" + (ag.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/agents/${encodeURIComponent(ag.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); c.appendChild(row); });
 } catch (e) { c.textContent = t("versions.load.err", e.message); } }
@@ -6919,22 +10103,178 @@ async function specialistEditor(name) {
   const descIn = el("input", "cust-input"); descIn.placeholder = t("specialist.descPlaceholder"); descIn.value = cur.description || "";
   const spIn = el("textarea", "skill-body"); spIn.placeholder = t("specialist.promptPlaceholder"); spIn.value = cur.system_prompt || "";
   form.appendChild(el("label", "skill-lbl", t("cust.connectors.namePlaceholder"))); form.appendChild(nameIn); form.appendChild(el("label", "skill-lbl", t("skill.label.desc"))); form.appendChild(descIn); form.appendChild(el("label", "skill-lbl", t("specialist.label.systemPrompt"))); form.appendChild(spIn);
-  const save = el("button", "solid-btn", t("specialist.saveBtn")); save.onclick = async () => { const nm = nameIn.value.trim(); if (!nm) { hint(t("toast.specialist.enterName"), true); return; } save.disabled = true; save.textContent = t("common.saving"); const b = { name: nm, description: descIn.value, system_prompt: spIn.value }; try { if (name) await api(`/specialists/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(b) }); else await api("/specialists", { method: "POST", body: JSON.stringify(b) }); closeModalEl($("#modal")); hint(t("toast.specialist.saved", nm)); custTab("specialists"); } catch (e) { save.disabled = false; save.textContent = t("specialist.saveBtn"); hint(t("artifact.save.err", e.message), true); } };
+  const save = el("button", "solid-btn", t("specialist.saveBtn")); save.onclick = async () => { const nm = nameIn.value.trim(); if (!nm) { hint(t("toast.specialist.enterName"), true); return; } save.disabled = true; save.textContent = t("common.saving"); const b = { name: nm, description: descIn.value, system_prompt: spIn.value }; try { if (name) await api(`/specialists/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(b) }); else await api("/specialists", { method: "POST", body: JSON.stringify(b) }); closeModalEl($("#modal")); hint(t("toast.specialist.saved", nm)); custTab("specialists"); } catch (e) { save.disabled = false; save.textContent = t("specialist.saveBtn"); hint(t("artifact.save.err", apiErrorText(e)), true); } };
   const fa = el("div", "form-actions"); fa.appendChild(save); form.appendChild(fa); body.appendChild(form); openModalEl($("#modal"));
 }
+
+const DATAPRO_CONNECTOR_ID = "volcengine-datapro";
+function dataproResultText(response) {
+  if (!response || typeof response !== "object") return String(response || "");
+  const result = response.structuredContent != null ? response.structuredContent : response.content;
+  if (typeof result === "string") return result;
+  if (result == null) return "";
+  try { return JSON.stringify(result, null, 2); } catch { return String(result); }
+}
+function dataproResponseCode(response) {
+  const structured = response && response.structuredContent;
+  if (structured && typeof structured.code === "number") return structured.code;
+  return null;
+}
+function dataproIndexComplete(response) {
+  const index = response && response.index;
+  return !!(index && index.complete === true
+    && Number.isInteger(index.entry_count) && index.entry_count >= 0
+    && Number.isInteger(index.source_leaf_count) && index.source_leaf_count >= 0
+    && Number.isInteger(index.indexed_leaf_count) && index.indexed_leaf_count >= 0
+    && index.source_leaf_count === index.indexed_leaf_count
+    && typeof index.source_digest === "string" && index.source_digest.length > 0
+    && index.source_digest === index.indexed_digest);
+}
+function dataproCard(config, configError) {
+  const state = {
+    keyConfigured: !!(config && config.key_configured),
+    arkKeyReused: !!(config && config.ark_key_reused),
+    connectorEnabled: !!(config && config.connector_enabled),
+    skillEnabled: !!(config && config.skill_enabled),
+  };
+  const card = el("section", "datapro-card");
+  const heading = el("div", "datapro-head");
+  const headingText = el("div");
+  headingText.appendChild(el("div", "datapro-title", t("cust.datapro.title")));
+  headingText.appendChild(el("div", "datapro-desc", t("cust.datapro.desc")));
+  heading.appendChild(headingText);
+  const skill = el("button", "outline-btn small", state.skillEnabled ? t("cust.datapro.skillEnabled") : t("cust.datapro.enableSkill"));
+  skill.dataset.action = "datapro-enable-skill";
+  skill.disabled = state.skillEnabled && state.connectorEnabled;
+  skill.onclick = async () => {
+    skill.disabled = true; skill.textContent = t("cust.datapro.enablingSkill");
+    try {
+      if (!state.connectorEnabled) {
+        await api(`/connectors/${encodeURIComponent(DATAPRO_CONNECTOR_ID)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: true }) });
+      }
+      await api(`/skills/catalog/${encodeURIComponent(DATAPRO_CONNECTOR_ID)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: true }) });
+      state.connectorEnabled = true; state.skillEnabled = true; S.skillsCatalog = null;
+      skill.textContent = t("cust.datapro.skillEnabled");
+      hint(t("cust.datapro.skillEnabledToast"));
+    } catch (error) {
+      skill.disabled = false; skill.textContent = t("cust.datapro.enableSkill");
+      hint(t("toast.failed", apiErrorText(error)), true);
+    }
+  };
+  heading.appendChild(skill);
+  // The managed row is filtered out of the connector list below, and DELETE is
+  // refused with 403, so without this toggle a connector seeded enabled on every
+  // boot could not be turned off anywhere in the UI.
+  const power = el("button", "toggle" + (state.connectorEnabled ? " on" : ""));
+  power.dataset.action = "datapro-toggle-connector";
+  power.title = t("cust.datapro.connectorToggle");
+  power.onclick = async () => {
+    const on = power.classList.toggle("on");
+    try {
+      await api(`/connectors/${encodeURIComponent(DATAPRO_CONNECTOR_ID)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) });
+      state.connectorEnabled = on;
+      skill.disabled = state.skillEnabled && on;
+      hint(on ? t("cust.datapro.connectorOn") : t("cust.datapro.connectorOff"));
+    } catch (error) {
+      power.classList.toggle("on", !on);
+      hint(t("toast.failed", apiErrorText(error)), true);
+    }
+  };
+  heading.appendChild(power);
+  card.appendChild(heading);
+
+  const credentials = el("div", "datapro-field");
+  credentials.appendChild(el("label", "skill-lbl", t("cust.datapro.keyLabel")));
+  const credentialRow = el("div", "datapro-input-row");
+  const keyInput = el("input", "cust-input");
+  keyInput.id = "datapro-plan-key"; keyInput.type = "password"; keyInput.autocomplete = "off";
+  keyInput.autocapitalize = "off"; keyInput.spellcheck = false;
+  keyInput.placeholder = state.arkKeyReused ? t("cust.datapro.keyPlaceholderArk") : (state.keyConfigured ? t("cust.datapro.keyPlaceholderSet") : t("cust.datapro.keyPlaceholder"));
+  const saveKey = el("button", "solid-btn small", t("cust.datapro.saveKey"));
+  saveKey.dataset.action = "datapro-save-key";
+  const keyState = el("div", "datapro-credential-state", configError ? t("cust.datapro.requestFailed", apiErrorText(configError)) : (state.arkKeyReused ? t("cust.datapro.keyArkReused") : (state.keyConfigured ? t("cust.datapro.keyConfigured") : t("cust.datapro.keyMissing"))));
+  keyState.classList.toggle("bad", !!configError || (!state.keyConfigured && !state.arkKeyReused));
+  saveKey.onclick = async () => {
+    let secret = keyInput.value.trim();
+    keyInput.value = "";
+    if (!secret) { hint(t("cust.datapro.keyRequired"), true); return; }
+    saveKey.disabled = true; const request = api("/datapro/config", { method: "POST", body: JSON.stringify({ agent_plan_key: secret }) });
+    secret = "";
+    try {
+      const saved = await request;
+      state.keyConfigured = !!(saved && saved.key_configured); state.arkKeyReused = !!(saved && saved.ark_key_reused);
+      keyInput.placeholder = state.arkKeyReused ? t("cust.datapro.keyPlaceholderArk") : t("cust.datapro.keyPlaceholderSet");
+      keyState.textContent = state.arkKeyReused ? t("cust.datapro.keyArkReused") : t("cust.datapro.keyConfigured");
+      keyState.classList.remove("bad"); hint(t("cust.datapro.keySaved"));
+    } catch (error) {
+      keyState.textContent = t("cust.datapro.requestFailed", apiErrorText(error)); keyState.classList.add("bad");
+    } finally {
+      keyInput.value = ""; saveKey.disabled = false;
+    }
+  };
+  keyInput.onkeydown = event => { if (event.key === "Enter") { event.preventDefault(); saveKey.click(); } };
+  credentialRow.appendChild(keyInput); credentialRow.appendChild(saveKey);
+  credentials.appendChild(credentialRow); credentials.appendChild(keyState); card.appendChild(credentials);
+
+  const queryField = el("div", "datapro-field");
+  queryField.appendChild(el("label", "skill-lbl", t("cust.datapro.queryLabel")));
+  const query = el("textarea", "datapro-query"); query.id = "datapro-query"; query.rows = 3; query.maxLength = 10000; query.placeholder = t("cust.datapro.queryPlaceholder");
+  const queryActions = el("div", "datapro-query-actions");
+  const status = el("div", "datapro-status"); status.dataset.dataproStatus = ""; status.setAttribute("aria-live", "polite");
+  const search = el("button", "solid-btn small", t("cust.datapro.search")); search.dataset.action = "datapro-search";
+  queryActions.appendChild(status); queryActions.appendChild(search); queryField.appendChild(query); queryField.appendChild(queryActions); card.appendChild(queryField);
+
+  const output = el("div", "datapro-output"); output.appendChild(el("div", "skill-lbl", t("cust.datapro.result")));
+  const indexStatus = el("div", "datapro-index-status hidden"); indexStatus.dataset.dataproIndexStatus = ""; indexStatus.setAttribute("aria-live", "polite"); output.appendChild(indexStatus);
+  const result = el("pre", "datapro-result", t("cust.datapro.noResult")); result.dataset.dataproResult = ""; output.appendChild(result);
+  const artifact = el("button", "outline-btn small datapro-artifact hidden"); artifact.dataset.dataproArtifact = ""; output.appendChild(artifact); card.appendChild(output);
+  search.onclick = async () => {
+    const text = query.value.trim();
+    if (!text) { hint(t("cust.datapro.queryRequired"), true); return; }
+    search.disabled = true; search.textContent = t("cust.datapro.searching"); status.textContent = t("cust.datapro.searching"); status.className = "datapro-status"; indexStatus.textContent = ""; indexStatus.className = "datapro-index-status hidden"; result.textContent = t("cust.datapro.noResult"); artifact.classList.add("hidden"); artifact.onclick = null;
+    try {
+      const body = { query: text }; if (S.currentId) body.frame_id = S.currentId;
+      const response = await api("/datapro/search", { method: "POST", body: JSON.stringify(body) });
+      const code = dataproResponseCode(response);
+      const indexed = code === 0 && dataproIndexComplete(response);
+      status.textContent = indexed ? t("cust.datapro.available") : (code === 0 ? t("cust.datapro.indexFailed") : (code === 4011 ? t("cust.datapro.auth4011") : (response.message || t("cust.datapro.unavailable", code == null ? "?" : code))));
+      status.className = "datapro-status " + (indexed ? "ok" : "bad");
+      if (indexed) {
+        indexStatus.textContent = t("cust.datapro.indexed", response.index.entry_count, response.index.source_leaf_count);
+        indexStatus.className = "datapro-index-status ok";
+      }
+      result.textContent = dataproResultText(response) || t("cust.datapro.noResult");
+      const savedArtifact = response && response.artifact;
+      if (savedArtifact) {
+        artifact.classList.remove("hidden"); artifact.disabled = !savedArtifact.id;
+        artifact.textContent = t("cust.datapro.artifact", savedArtifact.filename || savedArtifact.id || "artifact");
+        artifact.onclick = savedArtifact.id ? () => openViewer(savedArtifact) : null;
+      } else {
+        artifact.classList.add("hidden"); artifact.onclick = null;
+      }
+    } catch (error) {
+      status.textContent = t("cust.datapro.requestFailed", apiErrorText(error)); status.className = "datapro-status bad"; result.textContent = t("cust.datapro.noResult"); artifact.classList.add("hidden"); artifact.onclick = null;
+    } finally {
+      search.disabled = false; search.textContent = t("cust.datapro.search");
+    }
+  };
+  query.onkeydown = event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); search.click(); } };
+  return card;
+}
 async function custConnectors(c) { try {
-  const d = await api("/connectors"); const conns = (d && d.connectors) || [];
+  const [d, datapro] = await Promise.all([api("/connectors"), api("/datapro/config").then(config => ({ config })).catch(error => ({ config: {}, error }))]); const conns = (d && d.connectors) || [];
   c.innerHTML = ""; c.appendChild(hdr(t("cust.tab.connectors"), t("cust.connectors.desc")));
-  conns.forEach(k => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, k.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", k.connector_id)); info.appendChild(nm); info.appendChild(el("div", "ds", (k.description || "") + "  ·  " + (k.command_display || ""))); row.appendChild(info);
-    const pb = el("button", "outline-btn small", t("cust.connectors.test")); pb.onclick = async () => { pb.disabled = true; pb.textContent = t("cust.connectors.testing"); try { const r = await api(`/connectors/${k.connector_id}/probe`, { method: "POST" }); hint(r.ok ? (t("toast.connectors.probeOk", (r.tools || []).map(t => t.name).join("、"))) : (t("toast.failed", (r.error || "")))); } catch (e) { hint(t("toast.connectors.testFailed", e.message), true); } pb.disabled = false; pb.textContent = t("cust.connectors.test"); }; row.appendChild(pb);
+  c.appendChild(dataproCard(datapro.config, datapro.error));
+  conns.filter(k => k.connector_id !== DATAPRO_CONNECTOR_ID).forEach(k => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, k.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", k.connector_id)); info.appendChild(nm); info.appendChild(el("div", "ds", (k.description || "") + "  ·  " + (k.command_display || ""))); row.appendChild(info);
+    const pb = el("button", "outline-btn small", t("cust.connectors.test")); pb.onclick = async () => { pb.disabled = true; pb.textContent = t("cust.connectors.testing"); try { const r = await api(`/connectors/${k.connector_id}/probe`, { method: "POST" }); hint(r.ok ? (t("toast.connectors.probeOk", (r.tools || []).map(t => t.name).join("、"))) : (t("toast.failed", (r.error || "")))); } catch (e) { hint(t("toast.connectors.testFailed", apiErrorText(e)), true); } pb.disabled = false; pb.textContent = t("cust.connectors.test"); }; row.appendChild(pb);
     const tg = el("button", "toggle" + (k.enabled ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/connectors/${k.connector_id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg);
     const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.connectors.deleteConfirm", k.name))) return; try { await api(`/connectors/${k.connector_id}`, { method: "DELETE" }); custTab("connectors"); } catch {} }; row.appendChild(db); c.appendChild(row); });
   // directory (one-click add)
   c.appendChild(el("div", "cust-subhead", t("cust.connectors.fromDirectory")));
   let dir = { directory: [] }; try { dir = await api("/connectors/directory"); } catch {}
-  (dir.directory || []).forEach(item => { if (conns.some(k => k.connector_id === item.id)) return; const row = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", item.name)); info.appendChild(el("div", "ds", item.description || "")); row.appendChild(info); const add = el("button", "outline-btn small", t("common.add")); add.onclick = async () => { try { await api("/connectors", { method: "POST", body: JSON.stringify({ connector_id: item.id, name: item.name, description: item.description, command: item.command }) }); hint(t("toast.connectors.added", item.name)); custTab("connectors"); } catch (e) { hint(t("toast.addFailed", e.message), true); } }; row.appendChild(add); c.appendChild(row); });
+  (dir.directory || []).forEach(item => { if (item.id === DATAPRO_CONNECTOR_ID || conns.some(k => k.connector_id === item.id)) return; const row = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", item.name)); info.appendChild(el("div", "ds", item.description || "")); row.appendChild(info); const add = el("button", "outline-btn small", t("common.add")); add.onclick = async () => { try { await api("/connectors", { method: "POST", body: JSON.stringify({ connector_id: item.id, name: item.name, description: item.description, command: item.command }) }); hint(t("toast.connectors.added", item.name)); custTab("connectors"); } catch (e) { hint(t("toast.addFailed", apiErrorText(e)), true); } }; row.appendChild(add); c.appendChild(row); });
   // custom add
-  const add = el("div", "cust-row"); const ai = el("div", "info"); ai.appendChild(el("div", "nm", t("cust.connectors.customAddName"))); const ad = el("div", "job-submit"); const nameIn = el("input", "cust-input"); nameIn.placeholder = t("cust.connectors.namePlaceholder"); nameIn.style.flex = "0 0 120px"; const cmdIn = el("input", "cust-input"); cmdIn.placeholder = t("cust.connectors.cmdPlaceholder"); const go = el("button", "solid-btn small", t("common.add")); go.onclick = async () => { const nm = nameIn.value.trim(); const cmd = cmdIn.value.trim(); if (!nm || !cmd) return; try { await api("/connectors", { method: "POST", body: JSON.stringify({ name: nm, command: cmd.split(/\s+/) }) }); nameIn.value = cmdIn.value = ""; custTab("connectors"); } catch (e) { hint(t("toast.addFailed", e.message), true); } }; ad.appendChild(nameIn); ad.appendChild(cmdIn); ad.appendChild(go); ai.appendChild(ad); add.appendChild(ai); c.appendChild(add);
+  const add = el("div", "cust-row"); const ai = el("div", "info"); ai.appendChild(el("div", "nm", t("cust.connectors.customAddName"))); const ad = el("div", "job-submit"); const nameIn = el("input", "cust-input"); nameIn.placeholder = t("cust.connectors.namePlaceholder"); nameIn.style.flex = "0 0 120px"; const cmdIn = el("input", "cust-input"); cmdIn.placeholder = t("cust.connectors.cmdPlaceholder"); const go = el("button", "solid-btn small", t("common.add")); go.onclick = async () => { const nm = nameIn.value.trim(); const cmd = cmdIn.value.trim(); if (!nm || !cmd) return; try { await api("/connectors", { method: "POST", body: JSON.stringify({ name: nm, command: cmd.split(/\s+/) }) }); nameIn.value = cmdIn.value = ""; custTab("connectors"); } catch (e) { hint(t("toast.addFailed", apiErrorText(e)), true); } }; ad.appendChild(nameIn); ad.appendChild(cmdIn); ad.appendChild(go); ai.appendChild(ad); add.appendChild(ai); c.appendChild(add);
 } catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function renderRemoteGPU(c) {
   let info; try { info = await api("/compute/remote"); } catch (e) { return; }
@@ -6999,7 +10339,7 @@ const infoRow = (name, detail) => {
   return row;
 };
 
-async function custCompute(c) { try { const gpu = await api("/compute/gpu"); const env = await api("/environments/status").catch(() => ({ environments: [] })); const host = await api("/compute/local/hostinfo").catch(() => ({})); c.innerHTML = ""; c.appendChild(hdr(t("cust.compute.title"), t("cust.compute.desc"))); c.appendChild(infoRow(t("cust.compute.host"), t("cust.compute.hostDetail", host.python || "?", host.machine || "", host.cpu_count || "?", host.ram_gb || "?", host.disk_free_gb || "?"))); c.appendChild(infoRow("GPU", gpu.available ? (gpu.gpu_name || t("cust.compute.gpuAvailable")) : t("cust.compute.gpuUnavailable"))); await renderRemoteGPU(c); const envs = env.environments || []; envs.forEach(e => { const inst = (e.packages || []).filter(p => p.installed); c.appendChild(infoRow(t("cust.compute.kernelLabel", e.language, e.status === "installing" ? t("cust.compute.kernelInstalling") : t("cust.compute.kernelReady")), t("cust.compute.preinstalledDetail", e.package_count, inst.slice(0, 18).map(p => p.name).join("、") + (inst.length > 18 ? " …" : "")))); }); const ins = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", t("cust.compute.installExtraName"))); const dsc = el("div", "ds"); const inp = el("input"); inp.placeholder = t("cust.compute.installPlaceholder"); inp.className = "cust-input"; const btn = el("button", "outline-btn small", t("cust.compute.installBtn")); btn.onclick = async () => { const pkgs = inp.value.trim().split(/\s+/).filter(Boolean); if (!pkgs.length) return; btn.disabled = true; btn.textContent = t("cust.compute.installingBtn"); try { const r = S.currentId ? await api(`/frames/${S.currentId}/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs, restart: true }) }) : await api(`/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs }) }); hint(r.ok ? (t("step.env.installed", (r.installed || []).join("、") + (r.restarted ? t("cust.compute.kernelRestarted") : ""))) : (t("toast.compute.installFailed", ((r.failed && r.failed[0] && r.failed[0].error) || t("toast.compute.installSeeLogs"))))); if (r.ok) S._envSnapById = {}; custTab("compute"); } catch (e) { hint(t("toast.compute.installFailed", e.message), true); } btn.disabled = false; btn.textContent = t("cust.compute.installBtn"); }; dsc.appendChild(inp); dsc.appendChild(btn); info.appendChild(dsc); ins.appendChild(info); c.appendChild(ins); await renderJobs(c); } catch (e) { c.textContent = t("versions.load.err", e.message); } }
+async function custCompute(c) { try { const gpu = await api("/compute/gpu"); const env = await api("/environments/status").catch(() => ({ environments: [] })); const host = await api("/compute/local/hostinfo").catch(() => ({})); c.innerHTML = ""; c.appendChild(hdr(t("cust.compute.title"), t("cust.compute.desc"))); c.appendChild(infoRow(t("cust.compute.host"), t("cust.compute.hostDetail", host.python || "?", host.machine || "", host.cpu_count || "?", host.ram_gb || "?", host.disk_free_gb || "?"))); c.appendChild(infoRow("GPU", gpu.available ? (gpu.gpu_name || t("cust.compute.gpuAvailable")) : t("cust.compute.gpuUnavailable"))); await renderRemoteGPU(c); const envs = env.environments || []; envs.forEach(e => { const inst = (e.packages || []).filter(p => p.installed); c.appendChild(infoRow(t("cust.compute.kernelLabel", e.language, e.status === "installing" ? t("cust.compute.kernelInstalling") : t("cust.compute.kernelReady")), t("cust.compute.preinstalledDetail", e.package_count, inst.slice(0, 18).map(p => p.name).join("、") + (inst.length > 18 ? " …" : "")))); }); const ins = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", t("cust.compute.installExtraName"))); const dsc = el("div", "ds"); const inp = el("input"); inp.placeholder = t("cust.compute.installPlaceholder"); inp.className = "cust-input"; const btn = el("button", "outline-btn small", t("cust.compute.installBtn")); btn.onclick = async () => { const pkgs = inp.value.trim().split(/\s+/).filter(Boolean); if (!pkgs.length) return; btn.disabled = true; btn.textContent = t("cust.compute.installingBtn"); try { const r = S.currentId ? await api(`/frames/${S.currentId}/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs, restart: true }) }) : await api(`/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs }) }); hint(r.ok ? (t("step.env.installed", (r.installed || []).join("、") + (r.restarted ? t("cust.compute.kernelRestarted") : ""))) : (t("toast.compute.installFailed", ((r.failed && r.failed[0] && r.failed[0].error) || t("toast.compute.installSeeLogs"))))); if (r.ok) S._envSnapById = {}; custTab("compute"); } catch (e) { hint(t("toast.compute.installFailed", apiErrorText(e)), true); } btn.disabled = false; btn.textContent = t("cust.compute.installBtn"); }; dsc.appendChild(inp); dsc.appendChild(btn); info.appendChild(dsc); ins.appendChild(info); c.appendChild(ins); await renderJobs(c); } catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function renderJobs(c) {
   c.appendChild(hdr(t("cust.jobs.title"), t("cust.jobs.desc")));
   const sub = el("div", "cust-row"); const si = el("div", "info"); si.appendChild(el("div", "nm", t("cust.jobs.submitName")));
@@ -7007,7 +10347,7 @@ async function renderJobs(c) {
   const sel = el("select", "cust-input"); sel.style.flex = "0 0 92px"; ["bash", "python"].forEach(k => { const o = el("option", null, k); o.value = k; sel.appendChild(o); });
   const cmd = el("input", "cust-input"); cmd.placeholder = t("cust.jobs.cmdPlaceholder");
   const go = el("button", "solid-btn small", t("cust.jobs.runBtn"));
-  go.onclick = async () => { const command = cmd.value.trim(); if (!command) return; go.disabled = true; try { await api("/compute/jobs", { method: "POST", body: JSON.stringify({ command, kind: sel.value }) }); cmd.value = ""; await refreshJobList(list); } catch (e) { hint(t("toast.submitFailed", e.message), true); } go.disabled = false; };
+  go.onclick = async () => { const command = cmd.value.trim(); if (!command) return; go.disabled = true; try { await api("/compute/jobs", { method: "POST", body: JSON.stringify({ command, kind: sel.value }) }); cmd.value = ""; await refreshJobList(list); } catch (e) { hint(t("toast.submitFailed", apiErrorText(e)), true); } go.disabled = false; };
   row.appendChild(sel); row.appendChild(cmd); row.appendChild(go); si.appendChild(row); sub.appendChild(si); c.appendChild(sub);
   const list = el("div", "job-list"); c.appendChild(list);
   await refreshJobList(list);
@@ -7021,7 +10361,10 @@ async function refreshJobList(list) {
     if (j.status === "running" || j.status === "queued") anyRunning = true;
     const row = el("div", "cust-row"); const info = el("div", "info");
     const nm = el("div", "nm"); nm.appendChild(el("span", "job-badge " + j.status, j.status)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "job-cmd", (j.kind + "  " + j.command).slice(0, 80))); info.appendChild(nm);
-    info.appendChild(el("div", "ds", (j.duration_s != null ? j.duration_s + "s" : "") + (j.exit_code != null ? " · exit " + j.exit_code : "")));
+    // The drop, on the row. The job record has carried these counters all
+    // along and the only trace of a cut anywhere in the UI was a notice
+    // prepended inside the output modal, which a reader has to open to see.
+    info.appendChild(el("div", "ds", (j.duration_s != null ? j.duration_s + "s" : "") + (j.exit_code != null ? " · exit " + j.exit_code : "") + (j.truncated ? " " + t("cust.jobs.dropped", (j.dropped_bytes || 0).toLocaleString()) : "")));
     row.appendChild(info);
     const view = el("button", "outline-btn small", t("cust.jobs.viewOutput")); view.onclick = () => showJobOutput(j.id); row.appendChild(view);
     if (j.status === "running" || j.status === "queued") { const cx = el("button", "outline-btn small", t("common.cancel")); cx.onclick = async () => { try { await api(`/compute/jobs/${j.id}/cancel`, { method: "POST" }); await refreshJobList(list); } catch {} }; row.appendChild(cx); }
@@ -7037,7 +10380,98 @@ async function showJobOutput(id) {
   const load = async () => { if (S._modalMode !== mode || $("#modal").classList.contains("hidden")) return; let d; try { d = await api(`/compute/jobs/${id}`); } catch (e) { body.innerHTML = t("job.outputLoadFailed"); return; } if (S._modalMode !== mode) return; body.innerHTML = ""; const pre = el("pre", "job-output", d.output || t("job.outputEmpty")); body.appendChild(pre); if (d.status === "running" || d.status === "queued") setTimeout(load, 1200); };
   load();
 }
-// Global web-search API key (Tavily). The endpoint is fixed; only the key is
+function doubaoSearchResultText(response) {
+  const results = response && Array.isArray(response.results) ? response.results : [];
+  return results.map((item, index) => {
+    const title = item && typeof item.title === "string" ? item.title.trim() : "";
+    const url = item && typeof item.url === "string" ? item.url.trim() : "";
+    const snippet = item && typeof item.snippet === "string" ? item.snippet.trim() : "";
+    return [`${index + 1}. ${title || url}`, url, snippet].filter(Boolean).join("\n");
+  }).filter(Boolean).join("\n\n");
+}
+function doubaoSearchCard(config, configError) {
+  const state = {
+    keyConfigured: !!(config && config.key_configured),
+    arkKeyReused: !!(config && config.ark_key_reused),
+  };
+  const card = el("section", "datapro-card doubao-search-card");
+  const heading = el("div", "datapro-head");
+  const headingText = el("div");
+  const title = el("div", "datapro-title");
+  title.appendChild(document.createTextNode(t("cust.doubao.title") + " "));
+  title.appendChild(el("span", "pill", t("cust.doubao.primary")));
+  headingText.appendChild(title);
+  headingText.appendChild(el("div", "datapro-desc", t("cust.doubao.desc")));
+  heading.appendChild(headingText); card.appendChild(heading);
+
+  const credentials = el("div", "datapro-field");
+  credentials.appendChild(el("label", "skill-lbl", t("cust.doubao.keyLabel")));
+  const credentialRow = el("div", "datapro-input-row");
+  const keyInput = el("input", "cust-input");
+  keyInput.id = "doubao-search-plan-key"; keyInput.type = "password"; keyInput.autocomplete = "off";
+  keyInput.autocapitalize = "off"; keyInput.spellcheck = false;
+  keyInput.placeholder = state.arkKeyReused ? t("cust.doubao.keyPlaceholderArk") : (state.keyConfigured ? t("cust.doubao.keyPlaceholderSet") : t("cust.doubao.keyPlaceholder"));
+  const saveKey = el("button", "solid-btn small", t("cust.doubao.saveKey"));
+  saveKey.dataset.action = "doubao-search-save-key";
+  const keyState = el("div", "datapro-credential-state", configError ? t("cust.doubao.requestFailed", apiErrorText(configError)) : (state.arkKeyReused ? t("cust.doubao.keyArkReused") : (state.keyConfigured ? t("cust.doubao.keyConfigured") : t("cust.doubao.keyMissing"))));
+  keyState.classList.toggle("bad", !!configError || (!state.keyConfigured && !state.arkKeyReused));
+  saveKey.onclick = async () => {
+    let secret = keyInput.value.trim();
+    keyInput.value = "";
+    if (!secret) { hint(t("cust.doubao.keyRequired"), true); return; }
+    saveKey.disabled = true;
+    const request = api("/doubao-search/config", { method: "POST", body: JSON.stringify({ agent_plan_key: secret }) });
+    secret = "";
+    try {
+      const saved = await request;
+      state.keyConfigured = !!(saved && saved.key_configured); state.arkKeyReused = !!(saved && saved.ark_key_reused);
+      keyInput.placeholder = state.arkKeyReused ? t("cust.doubao.keyPlaceholderArk") : t("cust.doubao.keyPlaceholderSet");
+      keyState.textContent = state.arkKeyReused ? t("cust.doubao.keyArkReused") : t("cust.doubao.keyConfigured");
+      keyState.classList.remove("bad"); hint(t("cust.doubao.keySaved"));
+    } catch (error) {
+      keyState.textContent = t("cust.doubao.requestFailed", apiErrorText(error)); keyState.classList.add("bad");
+    } finally {
+      keyInput.value = ""; saveKey.disabled = false;
+    }
+  };
+  keyInput.onkeydown = event => { if (event.key === "Enter") { event.preventDefault(); saveKey.click(); } };
+  credentialRow.appendChild(keyInput); credentialRow.appendChild(saveKey);
+  credentials.appendChild(credentialRow); credentials.appendChild(keyState); card.appendChild(credentials);
+
+  const queryField = el("div", "datapro-field");
+  queryField.appendChild(el("label", "skill-lbl", t("cust.doubao.queryLabel")));
+  const query = el("textarea", "datapro-query"); query.id = "doubao-search-query"; query.rows = 3; query.maxLength = 100; query.placeholder = t("cust.doubao.queryPlaceholder");
+  const queryActions = el("div", "datapro-query-actions");
+  const status = el("div", "datapro-status"); status.dataset.doubaoSearchStatus = ""; status.setAttribute("aria-live", "polite");
+  const search = el("button", "solid-btn small", t("cust.doubao.search")); search.dataset.action = "doubao-search-run";
+  queryActions.appendChild(status); queryActions.appendChild(search); queryField.appendChild(query); queryField.appendChild(queryActions); card.appendChild(queryField);
+
+  const output = el("div", "datapro-output"); output.appendChild(el("div", "skill-lbl", t("cust.doubao.result")));
+  const result = el("pre", "datapro-result", t("cust.doubao.noResult")); result.dataset.doubaoSearchResult = ""; output.appendChild(result); card.appendChild(output);
+  search.onclick = async () => {
+    const text = query.value.trim();
+    if (!text) { hint(t("cust.doubao.queryRequired"), true); return; }
+    search.disabled = true; search.textContent = t("cust.doubao.searching"); status.textContent = t("cust.doubao.searching"); status.className = "datapro-status"; result.textContent = t("cust.doubao.noResult");
+    try {
+      // This product check is intentionally dedicated: the backend must not
+      // satisfy it with Tavily or any keyless fallback engine.
+      const response = await api("/doubao-search/search", { method: "POST", body: JSON.stringify({ query: text }) });
+      const results = response && Array.isArray(response.results) ? response.results : [];
+      const available = !!(response && response.available === true && response.source === "doubao" && Number.isInteger(response.count) && response.count === results.length && results.length > 0);
+      status.textContent = available ? t("cust.doubao.available") : (response.message || t("cust.doubao.empty"));
+      status.className = "datapro-status " + (available ? "ok" : "bad");
+      result.textContent = doubaoSearchResultText(response) || t("cust.doubao.noResult");
+    } catch (error) {
+      status.textContent = t("cust.doubao.requestFailed", apiErrorText(error)); status.className = "datapro-status bad"; result.textContent = t("cust.doubao.noResult");
+    } finally {
+      search.disabled = false; search.textContent = t("cust.doubao.search");
+    }
+  };
+  query.onkeydown = event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); search.click(); } };
+  return card;
+}
+
+// Backup web-search API key (Tavily). The endpoint is fixed; only the key is
 // user-editable. Persisted server-side and read by webtools at search time.
 async function searchKeyRow(c) {
   let sc = {}; try { sc = await api("/search/config"); } catch {}
@@ -7050,19 +10484,129 @@ async function searchKeyRow(c) {
   const sub = el("div", "job-submit"); sub.appendChild(kin); sub.appendChild(sv); info.appendChild(sub);
   row.appendChild(info); c.appendChild(row);
 }
-async function custNetwork(c) { try { const d = await api("/preferences/builtin-allowlist"); c.innerHTML = ""; c.appendChild(hdr(t("cust.network.title"), t("cust.network.desc"))); const master = el("div", "cust-row"); const mi = el("div", "info"); mi.appendChild(el("div", "nm", t("cust.network.allowName"))); mi.appendChild(el("div", "ds", d.enabled ? t("cust.network.enabledDesc") : t("cust.network.disabledDesc"))); master.appendChild(mi); const tg = el("button", "toggle" + (d.enabled ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { const r = await api("/network/status", { method: "PUT", body: JSON.stringify({ enabled: on }) }); hint(r.enabled ? t("toast.network.enabled") : t("toast.network.disabled")); } catch {} }; master.appendChild(tg); c.appendChild(master); await searchKeyRow(c); ((d && d.groups) || []).forEach(g => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, g.name || g.label)); info.appendChild(nm); const box = el("div", "ds"); (g.domains || []).slice(0, 12).forEach(dm => box.appendChild(el("span", "pill", dm))); info.appendChild(box); row.appendChild(info); c.appendChild(row); }); } catch (e) { c.textContent = t("versions.load.err", e.message); } }
+async function custNetwork(c) { try {
+  const [d, doubao] = await Promise.all([
+    api("/preferences/builtin-allowlist"),
+    api("/doubao-search/config").then(config => ({ config })).catch(error => ({ config: {}, error })),
+  ]);
+  c.innerHTML = ""; c.appendChild(hdr(t("cust.network.title"), t("cust.network.desc")));
+  c.appendChild(doubaoSearchCard(doubao.config, doubao.error));
+  const master = el("div", "cust-row"); const mi = el("div", "info");
+  mi.appendChild(el("div", "nm", t("cust.network.allowName")));
+  mi.appendChild(el("div", "ds", d.enabled ? t("cust.network.enabledDesc") : t("cust.network.disabledDesc")));
+  master.appendChild(mi);
+  const tg = el("button", "toggle" + (d.enabled ? " on" : ""));
+  tg.onclick = async () => { const on = tg.classList.toggle("on"); try { const r = await api("/network/status", { method: "PUT", body: JSON.stringify({ enabled: on }) }); hint(r.enabled ? t("toast.network.enabled") : t("toast.network.disabled")); } catch {} };
+  master.appendChild(tg); c.appendChild(master);
+  await searchKeyRow(c);
+  ((d && d.groups) || []).forEach(g => {
+    const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm");
+    nm.appendChild(el("span", null, g.name || g.label)); info.appendChild(nm);
+    const box = el("div", "ds"); (g.domains || []).slice(0, 12).forEach(dm => box.appendChild(el("span", "pill", dm)));
+    info.appendChild(box); row.appendChild(info); c.appendChild(row);
+  });
+  await telemetryRow(c);
+} catch (e) { c.textContent = t("versions.load.err", e.message); } }
+
+async function telemetryRow(c) {
+  let d; try { d = await api("/telemetry/consent"); } catch { return; }
+  const row = el("div", "cust-row"); const info = el("div", "info");
+  info.appendChild(el("div", "nm", t("cust.telemetry.name")));
+  info.appendChild(el("div", "ds", d.env_locked ? t("cust.telemetry.envlock") : (d.enabled ? t("cust.telemetry.on") : t("cust.telemetry.off"))));
+  row.appendChild(info);
+  const tg = el("button", "toggle" + (d.enabled ? " on" : "") + (d.env_locked ? " off" : ""));
+  if (d.env_locked) { tg.disabled = true; }
+  // A privacy toggle must never end up showing a state the server does not
+  // hold. The old handler flipped optimistically, swallowed failures without
+  // restoring, and stayed clickable while a PUT was in flight — so two rapid
+  // clicks raced and whichever response arrived *last* won, regardless of
+  // which click the user made last.
+  //
+  // Two variables instead of reading the DOM: `desired` is what the user has
+  // asked for, `confirmed` is what the server last told us it holds. Clicks
+  // only move `desired`; one drain loop reconciles the difference, never with
+  // two requests in flight. Extra clicks during a round trip are therefore
+  // coalesced rather than dropped — the last one the user made is the one that
+  // ends up applied — and the button stays live instead of going dead mid-
+  // request.
+  else {
+    let running = false;
+    let desired = !!d.enabled;
+    let confirmed = !!d.enabled;
+    const paint = (on) => {
+      tg.classList.toggle("on", !!on);
+      info.lastChild.textContent = on ? t("cust.telemetry.on") : t("cust.telemetry.off");
+    };
+    const drain = async () => {
+      if (running) return;
+      running = true;
+      try {
+        while (desired !== confirmed) {
+          const want = desired;
+          try {
+            const r = await api("/telemetry/consent", { method: "PUT", body: JSON.stringify({ enabled: want }) });
+            confirmed = !!r.enabled;
+            // The server is authoritative: a grant vetoed by the environment
+            // comes back disabled, and retrying it forever would be a spin.
+            // Only overwrite the ask if the user has not since changed it.
+            if (confirmed !== want && desired === want) desired = confirmed;
+            hint(confirmed ? t("toast.telemetry.on") : t("toast.telemetry.off"));
+          } catch (e) {
+            // The server still holds `confirmed`; abandon the ask rather than
+            // leave the control showing a state that was never applied.
+            desired = confirmed;
+            hint(t("toast.telemetry.failed", (e && e.message) || ""));
+          }
+          // Only repaint once the ask and the truth agree. Painting every
+          // round trip would flash the now-stale server state at a user who
+          // has already clicked again, mid-drain.
+          if (desired === confirmed) paint(confirmed);
+        }
+      } finally { running = false; }
+    };
+    tg.onclick = () => { desired = !desired; paint(desired); drain(); };
+  }
+  row.appendChild(tg); c.appendChild(row);
+}
+// Memory has two tiers: "global", which every project inherits, and one
+// project. The Save button used to send neither, so the server stored the
+// literal "default" — a project nothing here creates — while injection reads
+// the session's real project id. Saves listed fine and reached no prompt ever.
+// So the scope is chosen here and always sent, and a row says which tier it is
+// in. Unknown ids (rows left by that older write) render as the raw id rather
+// than as the generic project fallback, so an orphan looks like one.
+function memScopes() {
+  const pid = effProject();
+  const out = [{ id: "global", label: t("cust.memory.scope.global") }];
+  if (pid) out.push({ id: pid, label: memScopeLabel(pid) });
+  return out;
+}
+function memScopeLabel(pid) {
+  if (!pid || pid === "global") return t("cust.memory.scope.global");
+  const p = S.projects.find(x => (x.project_id || x.id) === pid);
+  return (p && p.name) || pid;
+}
 async function custMemory(c) { try {
   const m = await api("/memory/enabled");
   const mem = await api("/memory?project_id=all").catch(() => ({ memories: [] }));
   const cats = await api("/memory/categories?project_id=all").catch(() => ({ categories: [] }));
+  // What the active scope would actually inject, not merely what is stored:
+  // this pane listed every scope's rows and said nothing about which of them
+  // reach a prompt, which is how a write to a dead scope looked healthy.
+  const scopes = memScopes(); const active = scopes[scopes.length - 1].id;
+  const ctx = await api(`/memory/context?project_id=${encodeURIComponent(active)}`).catch(() => null);
   c.innerHTML = ""; c.appendChild(hdr(t("cust.memory.title"), t("cust.memory.desc")));
   const master = el("div", "cust-row"); const mi = el("div", "info"); mi.appendChild(el("div", "nm", t("cust.memory.enableName"))); mi.appendChild(el("div", "ds", m.enabled ? t("cust.memory.enabledDesc") : t("cust.memory.disabledDesc"))); master.appendChild(mi); const tg = el("button", "toggle" + (m.enabled ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api("/memory/enabled", { method: "PUT", body: JSON.stringify({ enabled: on }) }); hint(on ? t("toast.memory.enabled") : t("toast.memory.disabled")); } catch {} }; master.appendChild(tg); c.appendChild(master);
   // add with category
   const add = el("div", "cust-row"); const ai = el("div", "info"); ai.appendChild(el("div", "nm", t("cust.memory.addName"))); const ad = el("div", "job-submit");
   const catSel = el("select", "cust-input"); catSel.style.flex = "0 0 120px"; ["user", "project", "preference", "fact", "general"].forEach(k => { const o = el("option", null, k); o.value = k; catSel.appendChild(o); });
+  const scopeSel = el("select", "cust-input"); scopeSel.style.flex = "0 0 150px"; scopeSel.title = t("cust.memory.scopeName"); scopes.forEach(s => { const o = el("option", null, s.label); o.value = s.id; scopeSel.appendChild(o); }); scopeSel.value = active;
   const inp = el("input", "cust-input"); inp.placeholder = t("cust.memory.contentPlaceholder");
-  const btn = el("button", "solid-btn small", t("common.save")); btn.onclick = async () => { const v = inp.value.trim(); if (!v) return; try { await api("/memory", { method: "POST", body: JSON.stringify({ content: v, block: catSel.value }) }); inp.value = ""; custTab("memory"); } catch (e) { hint(t("artifact.save.err", e.message), true); } };
-  ad.appendChild(catSel); ad.appendChild(inp); ad.appendChild(btn); ai.appendChild(ad); add.appendChild(ai); c.appendChild(add);
+  const btn = el("button", "solid-btn small", t("common.save")); btn.onclick = async () => { const v = inp.value.trim(); if (!v) return; try { await api("/memory", { method: "POST", body: JSON.stringify({ content: v, block: catSel.value, project_id: scopeSel.value }) }); inp.value = ""; custTab("memory"); } catch (e) { hint(t("artifact.save.err", apiErrorText(e)), true); } };
+  ad.appendChild(scopeSel); ad.appendChild(catSel); ad.appendChild(inp); ad.appendChild(btn); ai.appendChild(ad); add.appendChild(ai); c.appendChild(add);
+  // What this scope injects, said out loud. The budgets already report what
+  // they withheld; nothing showed it to the person who saved the item.
+  if (ctx) { const sr = el("div", "cust-row"); const si = el("div", "info"); si.appendChild(el("div", "nm", t("cust.memory.injectedInto", memScopeLabel(active)))); si.appendChild(el("div", "ds", t("cust.memory.injectedCounts", String(ctx.included_count || 0), String((ctx.omitted || []).length), String(ctx.inherited_count || 0), String(ctx.overridden_count || 0)))); sr.appendChild(si); c.appendChild(sr); }
   // category chips
   const catList = (cats.categories || []);
   if (catList.length) { const cr = el("div", "cust-row"); const ci = el("div", "info"); ci.appendChild(el("div", "nm", t("cust.memory.categories"))); const box = el("div", "ds"); catList.forEach(k => box.appendChild(el("span", "pill", (k.block || "general") + " · " + k.count))); ci.appendChild(box); cr.appendChild(ci); c.appendChild(cr); }
@@ -7070,7 +10614,35 @@ async function custMemory(c) { try {
   const groups = {}; (mem.memories || []).forEach(x => { const b = x.block || "general"; (groups[b] = groups[b] || []).push(x); });
   Object.keys(groups).sort().forEach(block => {
     c.appendChild(el("div", "cust-subhead", block));
-    groups[block].forEach(x => { const row = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "ds", x.content || "")); row.appendChild(info); const del = el("button", "icon-ghost"); del.appendChild(iconEl("trash-2", 14)); del.onclick = async () => { try { await api(`/memory/${x.memory_id}`, { method: "DELETE" }); custTab("memory"); } catch {} }; row.appendChild(del); c.appendChild(row); });
+    groups[block].forEach(x => {
+      const row = el("div", "cust-row"); const info = el("div", "info");
+      info.appendChild(el("div", "ds", x.content || ""));
+      const sc = el("div", "ds"); sc.appendChild(el("span", "pill", memScopeLabel(x.project_id)));
+      // Said out loud, because it is what retention measures. A memory nobody
+      // has touched in a year stops being injected, and until there was an
+      // edit the only "touch" a row could have was the day it was written.
+      if (x.updated_at) sc.appendChild(el("span", "pill", t("cust.memory.edited")));
+      info.appendChild(sc); row.appendChild(info);
+      // Edit in place. Correcting standing context used to mean delete and
+      // rewrite: two round trips through a scope that may be at its cap, so
+      // the second can fail and leave the user with neither version.
+      const edit = el("button", "icon-ghost"); edit.title = t("common.edit");
+      edit.appendChild(iconEl("pencil", 14));
+      edit.onclick = async () => {
+        const next = prompt(t("cust.memory.editPrompt"), x.content || "");
+        if (next === null) return;
+        const value = String(next).trim();
+        if (!value || value === (x.content || "")) return;
+        try {
+          await api(`/memory/${x.memory_id}?project_id=${encodeURIComponent(x.project_id || "global")}`, { method: "PATCH", body: JSON.stringify({ content: value }) });
+          custTab("memory");
+        } catch (e) { hint(apiErrorText(e), true); }
+      };
+      row.appendChild(edit);
+      const del = el("button", "icon-ghost"); del.appendChild(iconEl("trash-2", 14));
+      del.onclick = async () => { try { await api(`/memory/${x.memory_id}?project_id=${encodeURIComponent(x.project_id || "global")}`, { method: "DELETE" }); custTab("memory"); } catch (e) { hint(apiErrorText(e), true); } };
+      row.appendChild(del); c.appendChild(row);
+    });
   });
   if (!(mem.memories || []).length) c.appendChild(el("div", "dock-empty", t("cust.memory.empty")));
 } catch (e) { c.textContent = t("versions.load.err", e.message); } }
@@ -7135,20 +10707,42 @@ function renderLocalModelEndpoints(root, discovery, profiles) {
     row.appendChild(add); root.appendChild(row);
   });
 }
+// Which protocols a user may pick is the daemon's answer, not a copy of it kept
+// here. `gemini` and `openai_responses` are both in PROFILE_PROTOCOLS and both
+// accepted by POST/PATCH, while this pane offered a fixed three -- so a user
+// holding a Gemini key had no way to say so. The list has to be *generated* from
+// the served catalogue or the next protocol added server-side is unreachable the
+// same way. Only the label stays client-side: a protocol nobody has translated
+// yet shows its id, which is a usable option rather than a missing one.
+function modelProtocolOptions(served) {
+  const labelKeys = {
+    chatgpt: "cust.models.protocol.openai",
+    claude: "cust.models.protocol.anthropic",
+    ark: "cust.models.protocol.ark",
+    gemini: "cust.models.protocol.gemini",
+    openai_responses: "cust.models.protocol.openaiResponses",
+  };
+  const ids = [];
+  (Array.isArray(served) ? served : []).forEach(value => {
+    const id = typeof value === "string" ? value.trim().slice(0, 64) : "";
+    if (id && !ids.includes(id)) ids.push(id);
+  });
+  // A daemon too old to serve the catalogue still has to leave the form usable;
+  // these three are what shipped before `protocols` was part of the payload.
+  const list = ids.length ? ids : ["chatgpt", "claude", "ark"];
+  // tOptional, not t: a missing translation must not put a dot-key in a menu.
+  return list.map(id => ({ value: id, label: tOptional(labelKeys[id] || "") || id }));
+}
 async function custModels(c) {
   c.innerHTML = ""; c.appendChild(hdr(t("cust.tab.models"), t("cust.models.subtitle2")));
   let data = { profiles: [], active_id: "", protocols: [] };
   try { data = await api("/model-profiles"); } catch (e) { c.appendChild(el("div", "dock-empty", t("versions.load.err", e.message))); return; }
   let editing = null;  // set to a profile object when editing that row
-  const protocols = [
-    ["chatgpt", "cust.models.protocol.openai"],
-    ["claude", "cust.models.protocol.anthropic"],
-    ["ark", "cust.models.protocol.ark"],
-  ];
-  const protocolIds = new Set(protocols.map(item => item[0]));
+  const protocols = modelProtocolOptions(data.protocols);
+  const protocolIds = new Set(protocols.map(item => item.value));
   const protocolLabel = provider => {
-    const match = protocols.find(item => item[0] === provider);
-    return match ? t(match[1]) : provider;
+    const match = protocols.find(item => item.value === provider);
+    return match ? match.label : provider;
   };
 
   // Local discovery is a read-only, fixed-loopback scan. The endpoint must be
@@ -7167,7 +10761,13 @@ async function custModels(c) {
     } finally { scanLocal.disabled = false; scanLocal.textContent = t("cust.models.local.scan"); }
   };
   scanLocal.onclick = () => runLocalScan(true); localActions.appendChild(scanLocal);
-  c.appendChild(localInfo); c.appendChild(localActions); c.appendChild(localResults); runLocalScan(false);
+  c.appendChild(localInfo); c.appendChild(localActions); c.appendChild(localResults);
+  // Opening this pane used to run the scan itself, so every visit -- including
+  // the re-render after every save, activate and delete -- probed four loopback
+  // ports nobody asked it to. Readiness is answered from local state precisely
+  // so that opening Customize costs nothing; the one control here that touches a
+  // socket waits for the button, like the per-profile probe beside it.
+  localResults.appendChild(el("div", "dock-empty", t("cust.models.local.idle")));
 
   // --- add / edit form ---
   const head = el("div", "cust-subhead", t("cust.models.addHeading"));
@@ -7175,7 +10775,7 @@ async function custModels(c) {
   const form = el("div", "skill-form");
   const nameIn = el("input", "cust-input"); nameIn.placeholder = t("cust.models.namePlaceholder");
   const provIn = el("select", "cust-input");
-  protocols.forEach(([value, labelKey]) => { const option = el("option"); option.value = value; option.textContent = t(labelKey); provIn.appendChild(option); });
+  protocols.forEach(({ value, label }) => { const option = el("option"); option.value = value; option.textContent = label; provIn.appendChild(option); });
   const baseIn = el("input", "cust-input"); baseIn.placeholder = t("cust.models.baseUrlPlaceholder");
   const modelIn = el("input", "cust-input"); modelIn.placeholder = t("cust.models.modelPlaceholder2");
   const keyIn = el("input", "cust-input"); keyIn.type = "password"; keyIn.placeholder = "API Key"; keyIn.autocomplete = "off";
@@ -7201,7 +10801,7 @@ async function custModels(c) {
       else { await api("/model-profiles", { method: "POST", body: JSON.stringify(body) }); hint(t("toast.models.added", nm)); }
       if (editing && editing.id === data.active_id) { refreshKeyBanner(); await loadModels(); }
       custTab("models");
-    } catch (e) { save.disabled = false; save.textContent = label; hint(t("artifact.save.err", e.message), true); }
+    } catch (e) { save.disabled = false; save.textContent = label; hint(t("artifact.save.err", apiErrorText(e)), true); }
   };
   const fa = el("div", "form-actions"); fa.appendChild(save); fa.appendChild(cancel); form.appendChild(fa);
   c.appendChild(form);
@@ -7218,10 +10818,43 @@ async function custModels(c) {
     info.appendChild(nm);
     const bits = []; if (p.provider) bits.push(protocolLabel(p.provider)); if (p.model) bits.push(p.model); bits.push(p.has_api_key ? t("cust.models.hasKey") : (loopbackModelBase(p.base_url) ? t("cust.models.local.keyless") : t("cust.models.noKey")));
     info.appendChild(el("div", "ds", bits.join(" · ") + (p.base_url ? "  ·  " + p.base_url : "")));
+    // `readiness` is computed server-side from local state alone — no network,
+    // deliberately — and had no reader: the row derived its own worse version
+    // from `has_api_key`, so "no model named and this protocol has no default"
+    // and "this build cannot dispatch that protocol" both displayed as a
+    // configured profile that simply failed later.
+    const rd = p.readiness || {};
+    if (rd.state && rd.state !== "ready") {
+      info.appendChild(el("div", "ds prof-warn", publicText(rd.detail || rd.state, 200)));
+    }
+    // Where a probe's answer lands. Created empty so the result appears in the
+    // row that was tested rather than as a toast that outlives its context.
+    const probeOut = el("div", "ds prof-probe"); probeOut.style.display = "none";
+    info.appendChild(probeOut);
     row.appendChild(info);
-    if (!isActive) { const use = el("button", "outline-btn small", t("cust.models.setActive")); use.onclick = async () => { use.disabled = true; try { await api(`/model-profiles/${p.id}/activate`, { method: "POST" }); hint(t("toast.models.switched", (p.name || p.id))); S.defaultModel = p.model || S.defaultModel; await loadModels(); refreshKeyBanner(); custTab("models"); } catch (e) { use.disabled = false; hint(t("toast.switchFailed", e.message), true); } }; row.appendChild(use); } else { row.appendChild(el("div", "col-spacer")); }
+    if (!isActive) { const use = el("button", "outline-btn small", t("cust.models.setActive")); use.onclick = async () => { use.disabled = true; try { await api(`/model-profiles/${p.id}/activate`, { method: "POST" }); hint(t("toast.models.switched", (p.name || p.id))); S.defaultModel = p.model || S.defaultModel; await loadModels(); refreshKeyBanner(); custTab("models"); } catch (e) { use.disabled = false; hint(t("toast.switchFailed", apiErrorText(e)), true); } }; row.appendChild(use); } else { row.appendChild(el("div", "col-spacer")); }
+    // The only thing here that spends a request against the user's provider
+    // quota, so it is a button and never a render-time call.
+    const test = el("button", "outline-btn small", t("cust.models.test"));
+    test.onclick = async () => {
+      test.disabled = true;
+      probeOut.style.display = ""; probeOut.className = "ds prof-probe";
+      probeOut.textContent = t("cust.models.testing");
+      try {
+        const r = await api(`/model-profiles/${encodeURIComponent(p.id)}/probe`, { method: "POST" });
+        // "reachable" is not "verified" — the server is careful about that
+        // difference and the wording here keeps it.
+        probeOut.className = "ds prof-probe " + (r.reachable ? "ok" : "bad");
+        probeOut.textContent = (r.reachable ? t("cust.models.reachable") : t("cust.models.unreachable"))
+          + (r.detail ? " — " + publicText(r.detail, 240) : "");
+      } catch (e) {
+        probeOut.className = "ds prof-probe bad";
+        probeOut.textContent = apiErrorText(e);
+      } finally { test.disabled = false; }
+    };
+    row.appendChild(test);
     const edit = el("button", "outline-btn small", t("common.edit")); edit.onclick = () => startEdit(p); row.appendChild(edit);
-    const del = el("button", "icon-ghost"); del.title = t("common.delete"); del.appendChild(iconEl("trash-2", 14)); del.onclick = async () => { if (!confirm(t("model.delete.confirm", (p.name || p.id)))) return; try { await api(`/model-profiles/${p.id}`, { method: "DELETE" }); hint(t("toast.deleted")); if (isActive) { refreshKeyBanner(); await loadModels(); } custTab("models"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(del);
+    const del = el("button", "icon-ghost"); del.title = t("common.delete"); del.appendChild(iconEl("trash-2", 14)); del.onclick = async () => { if (!confirm(t("model.delete.confirm", (p.name || p.id)))) return; try { await api(`/model-profiles/${p.id}`, { method: "DELETE" }); hint(t("toast.deleted")); if (isActive) { refreshKeyBanner(); await loadModels(); } custTab("models"); } catch (e) { hint(t("toast.deleteFailed", apiErrorText(e)), true); } }; row.appendChild(del);
     c.appendChild(row);
   });
 }
@@ -7396,13 +11029,61 @@ function renderMd(src) {
   }
   return html;
 }
-function parseTable(text, a) { const nm = (a.filename || "").toLowerCase(); if (nm.endsWith(".json") || /^\s*[\[{]/.test(text)) { try { let j = JSON.parse(text); if (!Array.isArray(j)) j = j.rows || j.data || j.candidates || j.items || []; if (Array.isArray(j) && j.length && typeof j[0] === "object") return j; } catch {} return null; } const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim()); if (lines.length < 2) return null; const cols = csv(lines[0]); return lines.slice(1).map(l => { const v = csv(l); const o = {}; cols.forEach((c, i) => o[c] = v[i] ?? ""); return o; }); }
-function csv(line) { const o = []; let cur = "", q = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (q) { if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (c === '"') q = false; else cur += c; } else { if (c === '"') q = true; else if (c === ",") { o.push(cur); cur = ""; } else cur += c; } } o.push(cur); return o.map(s => s.trim()); }
+function parseTable(text, a) { const nm = (a.filename || "").toLowerCase(); if (nm.endsWith(".json") || /^\s*[\[{]/.test(text)) { try { let j = JSON.parse(text); if (!Array.isArray(j)) j = j.rows || j.data || j.candidates || j.items || []; if (Array.isArray(j) && j.length && typeof j[0] === "object") return j; } catch {} return null; } const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim()); if (lines.length < 2) return null; const sep = delimiterFor(nm, a && a.content_type, lines[0]); const cols = csv(lines[0], sep); return lines.slice(1).map(l => { const v = csv(l, sep); const o = {}; cols.forEach((c, i) => o[c] = v[i] ?? ""); return o; }); }
+// The delimiter a tabular artifact actually uses.
+//
+// This was decided by `csv()` hardcoding a comma, so every `.tsv` parsed as a
+// single column: the tile for a differential-expression table with three
+// columns reported "1 column", and the column's *name* was the entire header
+// line. Wrong numbers about scientific output, shown with the same confidence
+// as right ones.
+//
+// The extension is checked first because it is a declaration. When there is
+// none to trust -- science writes tab-separated `.txt` and `.dat` constantly --
+// the header is sniffed, and the winner is whichever candidate splits it into
+// the most fields. A file with no delimiter at all yields one field for every
+// candidate, so the comma default is reached only when nothing distinguishes.
+function delimiterFor(filename, contentType, headerLine) {
+  const name = String(filename || "").toLowerCase();
+  const type = String(contentType || "").toLowerCase();
+  if (/\.tsv$/.test(name) || /tab-separated/.test(type)) return "\t";
+  if (/\.csv$/.test(name) || /\bcsv\b/.test(type)) return ",";
+  const header = String(headerLine || "");
+  let best = ",", width = 1;
+  for (const candidate of ["\t", ",", ";", "|"]) {
+    const fields = csvFields(header, candidate).length;
+    if (fields > width) { best = candidate; width = fields; }
+  }
+  return best;
+}
+// One field splitter, parameterised. `sep` defaults to a comma only so that
+// callers predating the parameter keep their behaviour.
+function csvFields(line, sep) {
+  sep = sep || ",";
+  const o = []; let cur = "", q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (c === '"') q = false; else cur += c; }
+    else { if (c === '"') q = true; else if (c === sep) { o.push(cur); cur = ""; } else cur += c; }
+  }
+  o.push(cur); return o.map(s => s.trim());
+}
+function csv(line, sep) { return csvFields(line, sep); }
 function ago(iso) { if (!iso) return ""; const t = new Date(iso).getTime(); if (isNaN(t)) return ""; const d = (Date.now() - t) / 1000; if (d < 60) return "just now"; if (d < 3600) return (d / 60 | 0) + "m"; if (d < 86400) return (d / 3600 | 0) + "h"; return (d / 86400 | 0) + "d"; }
 function bytes(b) { b = b || 0; if (b < 1024) return b + " B"; if (b < 1048576) return (b / 1024).toFixed(1) + " KB"; return (b / 1048576).toFixed(1) + " MB"; }
 function hint(t, err, spin) { const h = $("#composer-hint"); h.innerHTML = ""; if (!t) return; if (spin) { h.appendChild(iconEl("loader", 13, "spin")); h.appendChild(document.createTextNode(" ")); } const s = el("span", null, t); if (err) s.style.color = "var(--danger)"; h.appendChild(s); }
+// `on` no longer means "typable" — it means "the next Enter starts a turn
+// rather than queueing one". The textarea itself is never disabled: the server
+// admits a follow-up sent mid-turn into its FIFO queue and always did, so
+// disabling the box withheld a capability the backend already had. A disabled
+// textarea also drops focus and throws away a half-typed @-mention, which made
+// "wait for the turn to finish" cost the user their draft as well.
 function enableComposer(on) {
-  const c = $("#composer"); if (c) c.disabled = !on;
+  const c = $("#composer"); if (!c) return;
+  c.disabled = false;
+  c.classList.toggle("queueing", !on);
+  c.placeholder = t(on ? "composer.placeholder" : "composer.placeholderQueue");
+  renderQueueStrip();
 }
 function messagesAtBottom(m, pad) { return !m || (m.scrollHeight - m.scrollTop - m.clientHeight) < (pad || 80); }
 function paintJumpPill() { const m = $("#messages"), pill = $("#jump-pill"); if (!m || !pill) return; pill.classList.toggle("hidden", messagesAtBottom(m, 60)); }
@@ -7432,14 +11113,48 @@ async function acProjectFiles() {
     try { const a = await api(`/projects/${pid}/artifacts`); _acFiles.list = Array.isArray(a) ? a : []; _acFiles.pid = pid; _acFiles.at = Date.now(); }
     catch (e) { /* keep last good list */ }
   }
+  // Deduped by artifact identity, not by filename. Keying on the name was
+  // right for the overlap this loop exists for (a project artifact is also a
+  // session artifact) and wrong for everything else: two DIFFERENT artifacts
+  // that happen to share a name -- `results.csv` here and `results.csv` in a
+  // sibling conversation -- collapsed into one row, so the second was
+  // unpickable and there was no way to reference it at all. `artifact_id` is
+  // what the overlap actually is.
   const seen = new Set(); const out = [];
-  for (const a of [...(pid ? _acFiles.list : []), ...(S.artifacts || [])]) { const fn = a && a.filename; if (!fn || seen.has(fn)) continue; seen.add(fn); out.push(a); }
+  for (const a of [...(pid ? _acFiles.list : []), ...(S.artifacts || [])]) {
+    if (!a || !a.filename) continue;
+    const key = a.artifact_id || a.id || a.filename;
+    if (seen.has(key)) continue;
+    seen.add(key); out.push(a);
+  }
   return out;
 }
 async function acUpdate() {
   const d = acDetect(); if (!d) { acClose(); return; }
   let items = [];
-  if (d.trigger === "@") items = (await acProjectFiles()).map(a => ({ label: a.filename || "artifact", insert: a.filename || "artifact", sub: a.content_type || "" }));
+  if (d.trigger === "@") items = (await acProjectFiles()).map(a => {
+    const name = a.filename || "artifact";
+    // Pin the version. Inserting the bare filename is what this menu used to
+    // do, and it had a trap in it: the menu lists artifacts from across the
+    // *project*, while the resolver only ever looked inside the current
+    // session -- so picking a file from another conversation inserted a
+    // reference that silently resolved to nothing. Naming the version makes it
+    // resolvable (it is materialised at send) and makes it mean one thing
+    // forever, rather than whatever a later cell leaves in that filename.
+    const version = a.version_id || "";
+    const elsewhere = a.root_frame_id && S.currentId && a.root_frame_id !== S.currentId;
+    return {
+      label: name,
+      insert: version ? `${name}#${version}` : name,
+      // The provenance matters at pick time: "this comes from another session
+      // and will be copied in" is the one thing a user cannot see from a
+      // filename, and it is what makes the copy unsurprising afterwards.
+      // Two rows may now carry the same label (same name, different artifact),
+      // so the short version id is the only thing that tells them apart.
+      sub: (elsewhere ? t("ac.fromOtherSession") + " · " : "")
+        + (version ? version.slice(2, 8) + " · " : "") + (a.content_type || ""),
+    };
+  });
   else if (d.trigger === "#") items = (S.sessions || []).map(f => ({ label: f.name || f.task_summary || "session", insert: f.name || f.task_summary || "session", sub: "" }));
   else if (d.trigger === "/") { const sk = await loadSkillsCatalog(); items = sk.map(s => ({ label: s.displayName || s.name, insert: s.name, sub: s.description || "" })); }
   const q = (d.query || "").toLowerCase();
@@ -7465,7 +11180,101 @@ function acPick(i) {
   const token = ac.trigger + it.insert + " ";
   c.value = val.slice(0, ac.start) + token + val.slice(pos);
   const np = ac.start + token.length; c.setSelectionRange(np, np);
-  acClose(); grow(); c.focus();
+  // Assigning `value` fires no `input` event, so the chip row has to be told.
+  // Without this the one path that always inserts a *correct* token was the
+  // one path that never drew a chip for it.
+  acClose(); grow(); renderComposerRefChips(); c.focus();
+}
+// Unresolved @references, shown inline above the composer.
+function renderAttachmentProblems(problems) {
+  // The server emits `attachment_problems` to tell the user which pinned
+  // figures were left out of a turn, and nothing here listened for it. The
+  // model is told separately, in a system note, so the assistant usually
+  // mentions it — but only usually, and never with the reason, the limit, or
+  // what to do instead. A pin the user placed and the model never received is
+  // the kind of gap that reads as "the model is broken".
+  //
+  // Not reusable as `renderRefProblems`: these carry {name, reason, limit,
+  // bytes}, not {ref, code, message}. The server sends facts here and the
+  // wording lives in the client, which is the opposite of the ref-problem
+  // card and deliberate — these reasons are a closed set the client can
+  // translate, where a ref problem's message names arbitrary files.
+  if (!Array.isArray(problems) || !problems.length) return;
+  // The refusals that carry no number, so they need no format arguments. They
+  // exist because a pin can fail for reasons that are not a budget: the pinned
+  // figure was re-plotted over, deleted, or is not actually an image. Falling
+  // through to the bare reason code printed `version_changed` at the user,
+  // which is a log line rather than a sentence.
+  const ATTACH_REASONS = {
+    version_changed: "attach.versionChanged",
+    not_found: "attach.notFound",
+    unsupported_type: "attach.unsupported",
+    decode_failed: "attach.decodeFailed",
+  };
+  const messages = $("#messages"); if (!messages) return;
+  const card = el("div", "ref-problems");
+  card.appendChild(el("div", "ref-problems-head", t("attach.problemsTitle", problems.length)));
+  problems.slice(0, 8).forEach(p => {
+    const row = el("div", "ref-problem");
+    row.appendChild(el("code", "ref-problem-ref", publicText((p && p.name) || "", 80)));
+    const reason = String((p && p.reason) || "");
+    const limit = Number(p && p.limit) || 0;
+    const detail = reason === "too_large"
+      ? t("attach.tooLarge", bytes(Number(p.bytes) || 0), bytes(limit))
+      : reason === "budget_exhausted"
+        ? t("attach.budget", bytes(limit))
+        : reason === "too_many"
+          ? t("attach.tooMany", limit)
+          : ATTACH_REASONS[reason] ? t(ATTACH_REASONS[reason]) : reason;
+    row.appendChild(el("span", "ref-problem-msg", detail));
+    card.appendChild(row);
+  });
+  messages.appendChild(card);
+  down();
+}
+function renderRefProblems(problems) {
+  if (!Array.isArray(problems) || !problems.length) return;
+  const messages = $("#messages"); if (!messages) return;
+  const card = el("div", "ref-problems");
+  card.appendChild(el("div", "ref-problems-head", t("refs.problemsTitle", problems.length)));
+  problems.slice(0, 8).forEach(p => {
+    const row = el("div", "ref-problem");
+    row.appendChild(el("code", "ref-problem-ref", "@" + String((p && p.ref) || "")));
+    // The server's message, not a code lookup: it already names the file and
+    // says what to do, and re-deriving it here is how the two drift apart.
+    row.appendChild(el("span", "ref-problem-msg", String((p && p.message) || "")));
+    card.appendChild(row);
+  });
+  messages.appendChild(card);
+  down();
+}
+// Read-only retrieval provenance. Deliberately dumb: every value here has
+// already been through the server's allowlist, length cap and redaction, and
+// re-deriving or re-formatting any of it in the client is how the two ends
+// start disagreeing about what was sent.
+const RETRIEVAL_FIELD_ORDER = [
+  "database", "source", "retrieved_at", "request_url", "query",
+  "normalization_version", "response_sha256", "record_count",
+];
+function retrievalSourcePanel(src) {
+  const box = el("div", "ver-src");
+  box.appendChild(el("div", "ver-src-head", t("versions.retrievalSource")));
+  RETRIEVAL_FIELD_ORDER.forEach(field => {
+    if (src[field] === undefined || src[field] === null || src[field] === "") return;
+    const row = el("div", "ver-src-row");
+    row.appendChild(el("span", "ver-src-k", field));
+    row.appendChild(el("span", "ver-src-v", String(src[field])));
+    box.appendChild(row);
+  });
+  // Both notes matter: a clipped value shown plain reads as the whole value,
+  // and fields withheld without a count read as fields that never existed.
+  if (Array.isArray(src.truncated_fields) && src.truncated_fields.length) {
+    box.appendChild(el("div", "ver-src-note", t("versions.retrievalTruncated", src.truncated_fields.join(", "))));
+  }
+  if (src.undisclosed_field_count) {
+    box.appendChild(el("div", "ver-src-note", t("versions.retrievalWithheld", src.undisclosed_field_count)));
+  }
+  return box;
 }
 function acClose() { ac.open = false; const b = $("#composer-ac"); if (b) b.classList.add("hidden"); }
 
@@ -7741,7 +11550,7 @@ async function init() {
   $("#proj-modal").onclick = (e) => { if (e.target.id === "proj-modal") closeProjectModal(); };
   $("#pm-create").onclick = submitProjectModal;
   const c = $("#composer");
-  c.addEventListener("input", () => { grow(); acUpdate(); });
+  c.addEventListener("input", () => { grow(); acUpdate(); renderComposerRefChips(); });
   c.addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;  // IME composition: Enter commits the candidate, not the message
     if (ac.open) {

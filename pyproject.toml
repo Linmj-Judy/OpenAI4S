@@ -18,6 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
 ]
 
@@ -47,10 +48,29 @@ chemistry = [
 
 [dependency-groups]
 # Dev/test tooling (uv installs these by default with `uv sync`).
+#
+# Floors state what the gate was actually verified against, not merely what
+# once resolved. Every in-repo path goes through `uv sync --locked`, so a loose
+# floor breaks nothing in CI -- it misleads the contributor who installs from
+# this file directly and gets a weaker check than CI runs.
 dev = [
-    "mypy>=1.14,<2",
+    # >=2.3 because mypy 2.0 flipped `local_partial_types` on by default, and
+    # the strict boundary below is only ever checked under 2.x. A range that
+    # still admitted 1.x would make the boundary's semantics depend on which
+    # major the resolver happened to pick.
+    "mypy>=2.3,<3",
     "pytest>=7.4",
-    "pre-commit>=3.0",
+    # The offline suite is ~4800 tests and was the whole critical path of CI:
+    # 1094 of the offline-test job's 1122 seconds were this one command. xdist
+    # splits it across the runner's cores. CI runs it as `-n auto
+    # --maxprocesses=4 --dist loadfile`; the cap and scheduler choice are
+    # argued where they are written, in .github/workflows/ci.yml. >=3.6 is
+    # where the `loadfile` spelling used there is stable.
+    "pytest-xdist>=3.6",
+    # >=3.2 because the pre-commit-hooks and isort hooks pinned in
+    # .pre-commit-config.yaml declare `minimum_pre_commit_version: 3.2.0`,
+    # which pre-commit validates at manifest load -- a hard error, not a skip.
+    "pre-commit>=3.2",
 ]
 
 [project.scripts]
@@ -74,6 +94,11 @@ include = [
     # adding a runtime resource-loader dependency.
     "skills*",
     "envs*",
+    # The benchmark manifests. Without this an installed `openai4s benchmark`
+    # resolved `<site-packages>/workflows`, found nothing, and reported zero
+    # failures across zero workflows with exit code 0 — a silent pass on the
+    # thing that is supposed to decide whether a release is good.
+    "workflows*",
 ]
 
 [tool.setuptools.package-data]
@@ -87,7 +112,15 @@ openai4s = [
     "server/webui/vendor/*.js",
     "server/webui/vendor/fonts/*.woff2",
 ]
-"*" = ["*.html", "*.json", "*.lock", "*.md", "*.yml"]
+# Data-only trees (skills*, envs*, workflows*) ship whole rather than by
+# extension. The enumerated list needed one entry per upstream file type and
+# ended with the literal basename of a single vendored Snakemake file, so a
+# re-pin that renamed it -- or added a `Dockerfile`, `nextflow.config`, or a
+# `.bed` fixture -- would have dropped it from the wheel silently.
+"*" = ["**/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/**", "**/*.py[cod]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -107,6 +140,11 @@ markers = [
     "slow: slow but still offline test",
     "golden: golden-trace comparison test",
     "smoke: minimal smoke test",
+    # A test that replaces a service with a stub must not contribute a shape to
+    # docs/response-schemas.json: that file's whole claim is that it was
+    # captured from real responses, and a fabricated shape published as a
+    # promise is worse than an absent one because it gets believed.
+    "stubbed_backend: drives routes against stubbed services; excluded from response-shape capture",
     # Opt-in markers (EXCLUDED from the default run and from default PR CI;
     # these may require secrets, hardware, or live services).
     "external: requires any live external resource (umbrella marker)",
@@ -118,6 +156,52 @@ markers = [
     "docker: requires a Docker daemon",
     "browser: requires a real browser session",
 ]
+
+[tool.black]
+# Same reason as the [tool.ruff.lint] block below: state the setting instead of
+# inheriting whatever the pinned formatter happens to compute. Until now there
+# was no [tool.black] section at all, so the formatting target was per-file
+# autodetection -- and autodetection is not a property of the repository, it is
+# a property of the interpreter that runs the hook. black 26.5.1 infers a range
+# reaching py315 for files with no version-distinguishing syntax, then reports
+# on the 3.12 lint runner:
+#
+#   Warning: Python 3.12 cannot parse code formatted for Python 3.15. ...
+#   Black's safety check verifies equivalence by parsing the AST, which fails
+#   when the running Python is older than the target version.
+#
+# That is the formatter rewriting 234 files with its AST-equivalence check
+# unable to run. Naming the floor from `requires-python` puts the check back in
+# reach and keeps the target off the interpreter.
+#
+# Pinned separately from, and ahead of, the 23.3.0 -> 26.5.1 bump so the two are
+# not confused: this block changes no output. `--check` is clean under 23.3.0
+# with it, and the 26.5.1 reformat is byte-identical across autodetect@3.12,
+# autodetect@3.14, and target-version py310. line-length is black's own default
+# and is restated here for the same reason as the target.
+target-version = ["py310"]
+line-length = 88
+
+[tool.ruff.lint]
+# State the rule set instead of inheriting whatever the pinned ruff calls its
+# default. Until now there was no [tool.ruff] section at all, so the rule set
+# was whatever the hook's version happened to ship: ruff 0.0.274 defaulted to
+# E + F, and 0.16.0 defaults to 413 rules — turning a version bump into an
+# unreviewed adoption of ~350 rules and 1081 findings across the tree.
+#
+# E + F reproduces the rule set this codebase was actually written against;
+# a normalized-name diff of 0.0.274's default against 0.16.0 under this select
+# differs by exactly one entry, E999/SyntaxError, which modern ruff no longer
+# models as a lint rule at all.
+# Adopting further families (S, UP, RUF, SIM, ...) is real work with real
+# value, but it is a lint-policy decision that belongs in its own PR, one
+# family at a time, where the diff can be read — not a side effect of
+# Dependabot moving a pin.
+#
+# The ignore list stays on the hook's command line so it remains visible at
+# the point of invocation; both E402 and E741 are inside the E family and so
+# are genuinely still doing work here.
+select = ["E", "F"]
 
 [tool.mypy]
 # Start with the orchestration boundary where type mistakes are most costly.
@@ -137,6 +221,11 @@ check_untyped_defs = true
 disallow_untyped_defs = true
 no_implicit_optional = true
 strict_equality = true
+# Both of these are mypy 2.x defaults, stated rather than inherited. What the
+# boundary checks should be readable here, not a function of which mypy major
+# the resolver produced -- `local_partial_types` in particular is off under
+# 1.x, so leaving it implicit made the strictness silently version-dependent.
+local_partial_types = true
 strict_bytes = true
 warn_redundant_casts = true
 warn_unused_configs = true

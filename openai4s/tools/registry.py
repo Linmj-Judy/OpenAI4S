@@ -9,6 +9,7 @@ The dispatcher is always passed in — this module never imports the
 HostDispatcher (or the agent loop / gateway), so it stays importable with zero
 side effects. Pure stdlib.
 """
+
 from __future__ import annotations
 
 import json
@@ -99,6 +100,7 @@ from openai4s.tools.session import (
     SessionStatusTool,
 )
 from openai4s.tools.skills import (
+    ListSkillsTool,
     LoadSkillTool,
     RollbackSkillVersionTool,
     SearchSkillsTool,
@@ -106,6 +108,7 @@ from openai4s.tools.skills import (
     SkillStatusTool,
 )
 from openai4s.tools.taxonomy import READ_ONLY, SIDE_EFFECT_CLASSES
+from openai4s.tools.web_download import WebDownloadTool
 from openai4s.tools.web_fetch import WebFetchTool
 from openai4s.tools.web_search import WebSearchTool
 from openai4s.tools.write_file import WriteFileTool
@@ -125,10 +128,12 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     EnvUseTool,
     EnvCreateTool,
     WebSearchTool,
+    WebDownloadTool,
     WebFetchTool,
     ScienceListDatabasesTool,
     ScienceSearchTool,
     SearchCapabilitiesTool,
+    ListSkillsTool,
     SearchSkillsTool,
     LoadSkillTool,
     SkillStatusTool,

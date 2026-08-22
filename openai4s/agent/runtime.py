@@ -41,9 +41,17 @@ from .compaction import (
     safe_keep_recent,
     should_compact,
 )
-from .control import execute_native_batch, tool_parallel_policy
+from .control import (
+    call_reaches_dispatcher,
+    execute_native_batch,
+    tool_parallel_policy,
+)
 from .events import AgentEvent, OutcomeProduced, ReplyReceived
-from .finalize import execute_finalize_action
+from .finalize import (
+    execute_finalize_action,
+    execution_evidence,
+    note_execution_evidence,
+)
 from .models import ExecutionOutcome, ModelReply, RunState
 
 LogFn = Callable[..., None]
@@ -75,6 +83,7 @@ class ChatModel:
     chat_fn: Callable[..., Mapping[str, Any]]
     tools: Sequence[Any] | Callable[..., Sequence[Any]] = ()
     stream: bool = False
+    cancellation: Any = None
 
     def complete(
         self,
@@ -94,6 +103,11 @@ class ChatModel:
         kwargs: dict[str, Any] = {"tools": tuple(source)}
         if self.stream:
             kwargs["on_delta"] = on_delta
+        if self.cancellation is not None:
+            # The engine checks cancellation between turns, which does nothing
+            # while a rate-limited provider holds this call through a full
+            # retry budget. The transport polls this during backoff.
+            kwargs["should_cancel"] = self.cancellation.cancelled
         return self.chat_fn([dict(message) for message in messages], self.cfg, **kwargs)
 
 
@@ -109,13 +123,13 @@ class CompactionPolicy:
     cfg: Any
     log: LogFn = _null_log
     metadata_provider: Callable[[RunState], Mapping[str, Any] | None] | None = None
-    tool_schema_provider: Callable[
-        [RunState], Sequence[Mapping[str, Any]]
-    ] | None = None
+    tool_schema_provider: Callable[[RunState], Sequence[Mapping[str, Any]]] | None = (
+        None
+    )
     context_budget_provider: Callable[[RunState], int | None] | None = None
-    artifact_archiver: Callable[
-        [Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]
-    ] | None = None
+    artifact_archiver: (
+        Callable[[Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]] | None
+    ) = None
     archive_sink: Callable[[Mapping[str, Any]], Any] | None = None
     minimum_yield_ratio: float = 0.10
     max_low_yield_attempts: int = 2
@@ -268,15 +282,30 @@ class LocalActionExecutor:
         self, action: Action | None, reply: ModelReply, state: RunState
     ) -> ExecutionOutcome:
         if isinstance(action, FinalizeAction):
-            return execute_finalize_action(action)
+            return execute_finalize_action(
+                action, evidence=execution_evidence(state.metadata)
+            )
         if isinstance(action, NativeToolBatch):
-            return self._execute_native(action)
+            return self._execute_native(action, state)
         if isinstance(action, CodeCell):
             return self._execute_code(action, reply, state)
-        return self._execute_legacy_or_nudge(reply)
+        return self._execute_legacy_or_nudge(reply, state)
 
-    def _execute_native(self, batch: NativeToolBatch) -> ExecutionOutcome:
+    def _execute_native(
+        self, batch: NativeToolBatch, state: RunState
+    ) -> ExecutionOutcome:
+        # Evidence counts dispatched calls, not declared ones: the batch
+        # answers parse/validation/limit refusals without invoking anything,
+        # and an unknown tool name reaches invoke but is refused before the
+        # dispatcher — none executed work. Count only calls that actually reach
+        # the dispatcher, so a refused/hallucinated call cannot back a later
+        # execution-shaped finalize claim. list.append is atomic under the GIL,
+        # so parallel read waves count safely.
+        invoked: list[Any] = []
+
         def invoke(call):
+            if call_reaches_dispatcher(call.name, self.tool_catalog, call.arguments):
+                invoked.append(call)
             payload = {"name": call.name, "arguments": call.arguments}
             binder = getattr(self.dispatcher, "bind_action_context", None)
 
@@ -298,19 +327,25 @@ class LocalActionExecutor:
                 return execute()
 
         if self.tool_catalog is None:
-            return execute_native_batch(
+            outcome = execute_native_batch(
                 batch,
                 invoke,
                 parallel_policy=tool_parallel_policy,
             )
-        return execute_native_batch(
-            batch,
-            invoke,
-            validate=lambda name, arguments: tool_validation_error(
-                name, arguments, self.tool_catalog
-            ),
-            parallel_policy=lambda call: tool_parallel_policy(call, self.tool_catalog),
-        )
+        else:
+            outcome = execute_native_batch(
+                batch,
+                invoke,
+                validate=lambda name, arguments: tool_validation_error(
+                    name, arguments, self.tool_catalog
+                ),
+                parallel_policy=lambda call: tool_parallel_policy(
+                    call, self.tool_catalog
+                ),
+            )
+        if invoked:
+            note_execution_evidence(state.metadata, tool_calls=len(invoked))
+        return outcome
 
     def _execute_code(
         self, action: CodeCell, reply: ModelReply, state: RunState
@@ -339,6 +374,13 @@ class LocalActionExecutor:
             else:
                 result = self.kernel.execute(action.code, origin="agent")
             self._record_kernel_generation(state)
+        # Recorded here, after the kernel ran — a safety-gate refusal above
+        # returned already and must never count as finalize-time evidence.
+        # The same goes for the R runner's spawn-failure / pre-execution
+        # soft errors: a kernel-produced result always carries "stdout",
+        # while those synthesized dicts carry only "error".
+        if isinstance(result, dict) and "stdout" in result:
+            note_execution_evidence(state.metadata, cells=1)
         observation = format_observation(result)
         if count_code_blocks(reply.content) > 1 or has_incomplete_code_block(
             reply.content
@@ -358,7 +400,9 @@ class LocalActionExecutor:
             state.metadata["kernel_restarted"] = True
         state.metadata["active_kernel_generation"] = generation
 
-    def _execute_legacy_or_nudge(self, reply: ModelReply) -> ExecutionOutcome:
+    def _execute_legacy_or_nudge(
+        self, reply: ModelReply, state: RunState
+    ) -> ExecutionOutcome:
         if self.tool_catalog is None:
             calls, errors = parse_tool_calls(reply.content)
         else:
@@ -373,6 +417,22 @@ class LocalActionExecutor:
                     errors,
                     self.tool_catalog,
                 )
+            # ``run_tool_calls`` dispatches only the first
+            # MAX_TOOL_CALLS_PER_TURN parsed calls; the remainder never ran.
+            # Of those, count only calls naming a known tool: an unknown name
+            # is refused before the dispatcher and executed nothing, so it must
+            # not back a later execution-shaped finalize claim.
+            executed = sum(
+                1
+                for call in calls[:MAX_TOOL_CALLS_PER_TURN]
+                if call_reaches_dispatcher(
+                    (call or {}).get("name"),
+                    self.tool_catalog,
+                    (call or {}).get("arguments"),
+                )
+            )
+            if executed:
+                note_execution_evidence(state.metadata, tool_calls=executed)
         elif has_incomplete_code_block(reply.content):
             observation = INCOMPLETE_CELL_NUDGE
         else:

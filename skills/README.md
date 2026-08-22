@@ -2,11 +2,13 @@
 
 [中文说明](README_zh.md)
 
-The 33 bundled OpenAI4S Skills live here, one directory each. A Skill is a
-recipe: code plus the operational knowledge needed to run it, not a provider
-JSON Tool. Disclosure is progressive, so the loader shows a name and a one-line
-summary and nothing more until a Skill is selected; only then does it read
-`SKILL.md` and the optional `kernel.py` sidecar.
+This tree exposes 602 bundled Skills: 41 curated OpenAI4S recipes plus the 561
+recipes in the pinned GPTomics/bioSkills collection. A Skill is a recipe—code
+plus the operational knowledge needed to run it—not a provider JSON Tool.
+Disclosure is progressive: curated Skills receive one summary line each, while
+the large third-party collection receives one line total and expands through
+search or exact loading. Only a selected Skill's `SKILL.md` and optional
+`kernel.py` sidecar are loaded.
 
 ## Subdirectories
 
@@ -16,6 +18,7 @@ summary and nothing more until a Skill is selected; only then does it read
 | [`alphafold2/`](alphafold2/) | AF2 and AF2-Multimer through the ColabFold `colabfold_batch` runner, so a prediction is one FASTA and one command instead of a local database mount. The MSA comes from the public MMseqs2 server, which means the sequence is sent there. Proteins only. For ligands or nucleic acids, route to `boltz`, `chai1`, or `openfold3`. |
 | [`audit-dataset/`](audit-dataset/) | The check to run before anything is trained or published: schema drift, missingness, duplicate rows and IDs, target imbalance, and entities shared across train, validation, and test. Pure stdlib. A clean structural audit still says nothing about whether the data is representative or the labels are right. |
 | [`bioprobench/`](bioprobench/) | Scoring a model's protocol reasoning against the BioProBench benchmark: question answering, step ordering, error correction, generation, and LLM-judged error reasoning. The contract is the trap — it scores one file that already merges ground truth into each model response, and a plain model-output file returns zeros under `"status": "failed"`. Check `Failed_Rate`. |
+| [`bioskills/`](bioskills/) | A pinned, read-only import of all 561 MIT-licensed GPTomics/bioSkills recipes across 63 bioinformatics categories. Its bilingual boundary docs, upstream license, and SHA-256 manifest preserve provenance; individual recipes remain searchable/loadable without placing 561 descriptions in every system prompt. |
 | [`boltz/`](boltz/) | Open-weights co-folding of protein, DNA, RNA, and ligand chains, with an optional small-molecule affinity head. Among the four co-folders it is the default for binder-validation campaigns: fully open MIT weights and the fastest sampler. |
 | [`borzoi/`](borzoi/) | DNA in, predicted assay coverage out: RNA-seq, CAGE, DNase, and ChIP tracks over roughly 524 kb windows. Score a non-coding variant by running ref and alt windows and comparing the per-track delta. Reach for `evo2` instead when you want sequence likelihood rather than assay tracks. |
 | [`catalyst_sar_screening/`](catalyst_sar_screening/) | Single-atom-catalyst SAR on graphene M–N–C sites, hard-locked to FAIRChem UMA. Heuristics, lookup tables, and other MLIPs are forbidden, and so is handing the repo's committed demo outputs to a user as a result: every answer must come from a fresh pipeline run. If the weights hub is unreachable it stops and asks rather than substituting a method. |
@@ -23,6 +26,7 @@ summary and nothing more until a Skill is selected; only then does it read
 | [`diffdock/`](diffdock/) | Blind docking. No search box: the diffusion model places the ligand anywhere on the surface, and a confidence head ranks the samples. That confidence tracks pose correctness, not binding free energy, and the values are not comparable across complexes, so pair it with a scorer before triaging hits. |
 | [`esmfold2/`](esmfold2/) | The Biohub ESM release: all-atom co-folding that works from a single sequence, plus the ESMC language models for embeddings, mutation scoring, and contacts. Pick it over the other co-folders when you can live without an MSA. |
 | [`evaluate-model/`](evaluate-model/) | Held-out scoring for binary classification and regression, with tie-aware ROC AUC and a deterministic bootstrap. Half of it is discipline rather than arithmetic: choose the metric before seeing the test set, compare against a baseline, check subgroups. Bootstrap intervals describe sampling variability and do not correct leakage or dataset shift. |
+| [`evidence-walkthrough/`](evidence-walkthrough/) | The reference end-to-end pass, and the one to run first: fixed query, local analysis, versioned artifacts that declare the inputs they were derived from, then a session package a recipient verifies with `openai4s verify-package` and no daemon. The accessions are fixed so two runs are comparable, which is also what makes it usable as a benchmark case. A pass means the package is intact, not authentic — the format carries no signature. |
 | [`evo2/`](evo2/) | A long-context DNA language model. Per-nucleotide likelihoods for variant-effect scoring, embeddings of genomic windows, and generation from a prefix. It gives sequence probability, where `borzoi` predicts the assay tracks. |
 | [`example_stats/`](example_stats/) | The worked example of a user-authored Skill (`origin: personal`), and a usable one: mean, std, median, quantiles, z-scores, and Pearson correlation over plain Python lists, no NumPy or pandas. Read this one when you are about to write your own. |
 | [`fair-esm2/`](fair-esm2/) | Meta's ESM-2 through the `fair-esm` package: per-residue and per-sequence embeddings, masked-LM mutation scoring, contact prediction. Mind the namespace collision. `fair-esm` and the Biohub fork behind `esmfold2` both import as `esm` and are different libraries. |
@@ -38,13 +42,20 @@ summary and nothing more until a Skill is selected; only then does it read
 | [`plan-ml-experiment/`](plan-ml-experiment/) | What gets written down before training starts: hypothesis, baseline, metric, decision rule, and a split boundary that survives grouped or chronological structure. Reproducibility is mechanical here, resting on config fingerprints, dataset checksums, recorded seeds, and artifact manifests. Determinism does not prove validity, and repeating one biased split does not repair it. |
 | [`protein-mutation-enhancement/`](protein-mutation-enhancement/) | An orchestration layer, not a model. It builds deterministic mutant libraries with stable IDs such as `A12V+G47D`, merges sequence, structure, property, and assay scores into one ranking, and decides whether a gain-of-function round stops or expands. The heavy model calls are delegated to `fair-esm2` and `esmfold2`. |
 | [`proteinmpnn/`](proteinmpnn/) | The default inverse-folding step when the design surface is protein only: backbone geometry in, sequence out, small enough to run on CPU for a handful of designs. It writes sequences and nothing else, so use the `ligandmpnn` runner if you need threaded PDBs, and switch skills as soon as a cofactor or soluble expression is in play. |
+| [`reaction-atom-mapping/`](reaction-atom-mapping/) | RXNMapper atom correspondence and changed-bond extraction for a complete reaction. It requires both reaction sides and must not be used as a target-only retrosynthesis model or feasibility test. |
+| [`reaction-condition-recommendation/`](reaction-condition-recommendation/) | Parrot condition hypotheses for a fixed reaction, preserving checkpoint-specific label vocabularies and temperature support while separating model output from literature or ELN evidence. |
+| [`reaction-forward-prediction/`](reaction-forward-prediction/) | ReactionT5v2 forward product prediction and round-trip recovery checks for proposed retrosynthetic steps. Product rank is model agreement, not experimental feasibility. |
+| [`reaction-yield-estimation/`](reaction-yield-estimation/) | Bounded ReactionT5v2 yield screening for fully specified reactions, with an explicit domain gate and no route-wide success-probability claim. |
+| [`rfdiffusion/`](rfdiffusion/) | Backbone generation for de novo binders, hotspot conditioning, and motif scaffolding. The recipe fixes Hydra quoting and contig semantics, preserves `.trb` mappings and batch provenance, and requires downstream sequence design plus independent monomer/complex validation; generation alone is not binding evidence. |
 | [`remote-compute-nvidia/`](remote-compute-nvidia/) | Dispatch to NVIDIA NIM in either of two forms that share one job contract. `self_hosted` runs an nvcr.io container on your own GPU; `hosted` needs no GPU but every job request leaves for NVIDIA's managed gateway. Only the declared key variables are forwarded to the confined helper, and they are scrubbed from the log tails that leave the sandbox. |
 | [`remote-compute-ssh/`](remote-compute-ssh/) | The orchestration half of running on the user's own SSH or SLURM host: partitions, env activation, job scripts, staging, harvest, recovery. Not the science. Each submit puts an approval modal in front of the user and spends their allocation, so the shape of a good run is to read what is already known about the host, ask once for what is not, land the first submit, and write down what you learned. |
-| [`retrosynthesis_planning/`](retrosynthesis_planning/) | AiZynthFinder routes normalized into a stable schema, ranked, and rendered as a dashboard for chemist review and route triage. Conditions, yield ranges, verdicts, and safety notes in the report come from an LLM. They are hypotheses, not experimental validation, and each has to be checked against literature, ELN data, vendor availability, and an expert. |
+| [`retrosynthesis_planning/`](retrosynthesis_planning/) | The multi-step scientific task: AiZynthFinder searches from a target to a declared stock, after which routes are normalized, de-duplicated, ranked, structurally audited, and rendered for chemist review. Single-step, forward, mapping, condition, and yield questions have their own Skills. |
 | [`scgpt/`](scgpt/) | A transformer foundation model for single-cell data: cell embeddings for clustering, zero-shot or fine-tuned cell-type annotation, and gene-level representations for perturbation or GRN work. Checkpoints are raw directories rather than HuggingFace repos. The code is MIT and no source states a license for the weights. |
 | [`scvi-tools/`](scvi-tools/) | The probabilistic counterpart to `scgpt`: scVI for a batch-corrected latent space, scANVI for label transfer from a partly annotated reference, and Bayesian differential expression. It needs raw integer UMI counts. For spatial deconvolution or mapping, use cell2location, DestVI, or Tangram instead. |
 | [`solublempnn/`](solublempnn/) | ProteinMPNN's architecture retrained on a soluble-PDB subset, which shifts the output away from the surface hydrophobics the full-PDB model happily places. Reach for it when designs are aggregating or going to inclusion bodies. It trades a few points of native recovery for that bias, and a sequence-only prior is not a solubility measurement. |
+| [`single-step-retrosynthesis/`](single-step-retrosynthesis/) | RetroChimera one-step precursor proposals through the existing isolated, manifest-checked Syntheseus adapter. It deliberately stops before stock search or recursive route planning. |
 | [`using-model-endpoint/`](using-model-endpoint/) | Documents a planned endpoint-scoped inference workflow: a Python kernel whose egress is scoped to one registered endpoint, with `BASE_URL` preloaded and no job lifecycle. The current Host implements endpoint registration and probes, but does not wire this provider into `ComputeManager` or create the scoped kernel yet. |
+| [`volcengine-datapro/`](volcengine-datapro/) | A deliberately narrow MCP recipe for professional-dataset search: discover `dataPro_search`, make the real query call, and accept only an integer structured result code of zero as usable. Tool discovery alone is never an authentication verdict. |
 
 ## Where this fits
 
@@ -58,6 +69,3 @@ summary and nothing more until a Skill is selected; only then does it read
 - Provider shims are trusted extension code and run across compute or endpoint
   boundaries documented elsewhere. A manifest on its own does not make a
   capability operational.
-
-- [`evidence-walkthrough/`](evidence-walkthrough/) — the reference pass: fixed query, local analysis, artifacts carrying lineage, and a package that verifies in a clean environment.
-- [`bioprobench/`](bioprobench/) — protocol-reasoning evaluation.

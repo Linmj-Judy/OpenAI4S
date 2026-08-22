@@ -1,6 +1,6 @@
 # Configuration
 
-Config is via env vars (all have working defaults), read from the environment or a git-ignored `.env` at the repo root. **You rarely need to touch files** — set your model from the UI (**Customize → Models**). To configure by env instead, copy `.env.example` to `.env`.
+Config is via env vars (all have working defaults), read from the environment or a git-ignored `.env` at the repo root. **You rarely need to touch files** — set your model from the UI (**Customize → Models**). To configure by env instead, copy `.env.example` to `.env`. `OPENAI4S_SKIP_DOTENV=1` skips the `.env` loader entirely — the offline test suite sets it so a developer's real `.env` can never configure the tests.
 
 ## Model providers
 
@@ -17,6 +17,38 @@ One `OPENAI4S_LLM_PROVIDER` selects a wire adapter; each ships a default `base_u
 `ark` is Volcengine's plan/v3 gateway — one endpoint + key serving `doubao-seed-2.0-{pro,code,lite,mini}`, `glm-5.2`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-{pro,flash}`, `minimax-{m3,m2.7}` — all pre-registered as switchable model profiles. Without a key the daemon still starts; the UI shows a *"configure your API key"* banner until you set one.
 
 Each of api_key / base_url / model resolves **per-provider var → generic var → provider default** (e.g. `OPENAI4S_CLAUDE_API_KEY` → `OPENAI4S_LLM_API_KEY` → default). The `openai_responses` provider uses the stateless Responses API wire and preserves function-call/reasoning output items across turns; its current adapter is text/tool-only.
+
+The `openai` and `anthropic` wires stream token by token whenever the caller supplies a delta callback, and fall back to one blocking request if the stream fails before its first event. `responses` is always SSE; `gemini` is always blocking. `OPENAI4S_LLM_STREAM=0` (also `false`/`no`/`off`) forces the blocking path on the two that choose — worth reaching for behind a proxy that mishandles SSE, at the cost of the reply arriving as one blob per turn.
+
+### Extending the provider catalog
+
+Provider identity, model presets, capabilities, and wire transport are separate.
+A deployment or plugin can register another provider over one of the four
+shipped wires without editing the chat router:
+
+```python
+from openai4s.llm import register_model_preset, register_provider
+
+register_provider(
+    "lab_openai",
+    wire="openai",
+    base_url="http://127.0.0.1:11434/v1",
+    model="science-model",
+    tool_calling=False,
+    context_window_tokens=16_384,
+)
+register_model_preset(
+    "lab_openai",
+    "science-model",
+    "Local science model",
+)
+```
+
+Registration is validated, process-local, and limited to the shipped
+`openai`, `responses`, `anthropic`, and `gemini` adapters; it cannot load
+arbitrary transport code. Use a startup plugin or deployment composition layer
+to repeat registrations after restart. `provider_specs()`, `model_presets()`,
+and `get_model_capabilities()` expose detached or immutable catalog views.
 
 ## Kernel environments (conda)
 
@@ -43,9 +75,30 @@ Heavier toolchains live in ready-to-use Conda specs instead, so native dependenc
 
 `OPENAI4S_HOST` (`127.0.0.1`) · `OPENAI4S_PORT` (`8760`) · `OPENAI4S_DATA_DIR` (`~/.openai4s`, holds the SQLite db, artifacts, logs, pidfile). See [Security](security.md) for remote / SSH-tunnel access.
 
-`OPENAI4S_SEED_DEMO` (`1`) — set to `0` to skip the first-boot live
-UniProt/RCSB demo. This is useful for CI, air-gapped deployments, or an
-intentionally empty workbench; it does not affect existing sessions.
+`OPENAI4S_SEED_DEMO` (`0`) — set to `1` to run the bundled example analysis at
+startup. **The default changed and the variable's sense reversed.** It used to
+default to `1`, and on a fresh data dir that meant the daemon bound its port and
+then, on a background thread, started a Python kernel, executed six cells,
+called the UniProt and RCSB REST APIs, spawned the bundled MCP connector and
+wrote four artifacts — before the user had typed anything. A fresh boot now does
+none of that.
+
+The example is still there; it moved behind a button. The dashboard offers *Run
+the example analysis* when a session list is empty, and the button posts
+`{"confirm": true}` to `POST /api/v1/example/session` (see
+[Web app API](webapp-api.md)). Set the variable to `1` on a demo machine that
+should come up pre-populated. Either way the seed runs at most once — the two
+paths share one seeder.
+
+`OPENAI4S_TOKEN` — the daemon access token, for CLI subcommands when the token
+file under the data dir is not readable by the calling user (a daemon running
+under another account). Normally unset: the CLI reads the file.
+
+`OPENAI4S_REQUIRE_TOKEN` (`1`) — `0` turns the local access-token gate off, and
+only on a loopback bind. Kept until the version named by
+`gateway.LEGACY_TOKEN_OPT_OUT_REMOVED_IN`, which a test fails on rather than a
+sentence nobody re-reads; see [Security](security.md) for what the daemon
+exposes to an unauthenticated caller.
 
 `OPENAI4S_NOTEBOOK_REPL` (`off`) — set to `1` to re-enable the web UI's in-Notebook developer REPL (arbitrary kernel code from the right panel); off by default, so the Notebook is a read-only execution trace (see [Security](security.md)).
 
@@ -69,7 +122,10 @@ Host-RPC limitations.
 ## CLI
 
 ```bash
-openai4s serve     # daemon + web UI (foreground)
+openai4s init      # guided first-run model configuration (headless-friendly)
+openai4s serve     # daemon + web UI (foreground; --detached to background,
+                   # plus --host/--port/--no-browser; the detached parent waits
+                   # up to 60s for /health, OPENAI4S_DETACHED_READY_TIMEOUT overrides)
 openai4s status    # is it up?
 openai4s stop      # stop the daemon
 openai4s run "…"   # one Code-as-Action task in-process, no daemon
@@ -80,3 +136,24 @@ openai4s jupyter describe               # inspect optional bridge availability
 openai4s jupyter export ./kernel-specs  # pure-stdlib KernelSpec export
 openai4s jupyter install                # install user KernelSpecs
 ```
+
+`openai4s init` stores the selected provider/model/base URL in the normal
+OpenAI4S settings database. Interactive API-key input is hidden; automation may
+pipe one line to `openai4s init --api-key-stdin --non-interactive`. An API key
+is never accepted as a command-line value or returned by `--json`, keeping it
+out of shell history and structured command output.
+
+## Platform support
+
+The native runtime is supported on Linux and macOS. The current
+persistent-kernel transport, resource accounting, process interruption, and OS
+sandbox adapters depend on Unix primitives; installing the wheel with native
+Windows Python does not imply that scientific Cell execution is supported
+there — the kernel spawn path refuses it outright.
+
+Windows users run the Linux build under WSL2. The release ships
+`OpenAI4S-<version>-windows-<arch>.zip`, which is that Linux build plus a
+launcher that installs it into WSL2 and opens the Windows browser at the
+forwarded port; it is not a native Windows build and does not pretend to be
+one. The full matrix, and what actually ships per platform, is
+[`platforms.md`](platforms.md).

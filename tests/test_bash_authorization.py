@@ -1,7 +1,12 @@
 """Capability authorization for worker-local ``host.bash``."""
+
 from __future__ import annotations
 
 import hashlib
+import os
+import shlex
+import signal
+import sys
 import time
 from pathlib import Path
 
@@ -147,8 +152,11 @@ def test_worker_rejects_tampered_capability_before_subprocess(tmp_path, monkeypa
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI4S_WORKSPACE", str(tmp_path))
     spawned = []
+    # `Popen`, not `run`. The executor was rewritten to drain concurrently and
+    # kill by process group; a stub still guarding `run` would record nothing
+    # and this assertion would pass without testing anything.
     monkeypatch.setattr(
-        "openai4s.sdk.bash.subprocess.run",
+        "openai4s.sdk.bash.subprocess.Popen",
         lambda *args, **kwargs: spawned.append((args, kwargs)),
     )
 
@@ -336,3 +344,140 @@ def test_consumed_unreported_capability_is_eventually_purged(tmp_path):
     second = service.authorize(_proposal(tmp_path, command="echo second"))
     assert second["token"].startswith("test-token-second")
     assert first["token"] not in service._issued
+
+
+def _real_authorizer(tmp_path):
+    service = BashAuthorizationService(
+        workspace=lambda: tmp_path,
+        frame_id=lambda: "frame-sdk",
+        audit=lambda **fields: None,
+    )
+
+    def authorization(method, args):
+        spec = decode_args(args)[0]
+        if method == "authorize_bash":
+            return service.authorize(spec)
+        if method == "consume_bash_authorization":
+            return service.consume(spec)
+        if method == "record_bash_result":
+            return service.record_result(spec)
+        raise AssertionError(method)
+
+    return authorization
+
+
+def test_a_timed_out_command_takes_its_children_with_it(tmp_path, monkeypatch):
+    """`subprocess.run(timeout=)` with `shell=True` kills the shell alone.
+
+    `bash -c "python train.py"` lost the shell and kept the python -- the
+    process actually holding the GPU, the file handles and the memory. The
+    timeout looked honoured and the work carried on, exactly the shape the
+    local Jobs manager already had a process-group ladder for; the kernel-side
+    executor had none, so the two disagreed about the case that matters.
+
+    Real processes throughout: a mocked Popen cannot show a child outliving
+    its parent's signal.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI4S_WORKSPACE", str(tmp_path))
+    marker = tmp_path / "child.pid"
+    host = build_host(
+        lambda method, args: None, bash_authorizer=_real_authorizer(tmp_path)
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        host.bash(
+            f"sleep 120 & echo $! > {marker}; wait",
+            timeout=1.5,
+        )
+
+    assert marker.exists(), "the child never started; the test proves nothing"
+    child_pid = int(marker.read_text().strip())
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        raise AssertionError(
+            "the timeout reached the shell but not the child it started"
+        )
+
+
+def test_a_shell_that_exits_first_does_not_escape_the_deadline(tmp_path, monkeypatch):
+    """The half the test above does not reach: the shell exits, the work does not.
+
+    `sleep 120 & ...; wait` makes the shell outlive its child, so
+    `proc.wait(timeout=)` raises and the group ladder runs. `... & exit 0` does
+    the opposite, and the deadline evaporated: measured before this change, the
+    wait returned in 0.00s with no `TimeoutExpired`, so the group was never
+    signalled, the drain threads stayed blocked on pipes the survivor held --
+    one leaked thread per call -- the work finished six seconds past a
+    two-second deadline, and `host.bash` reported `completed` with rc=0. A
+    terminal state for a job that was still running.
+
+    `start_new_session=True` was already there for exactly this, and
+    `stop_process_group`'s docstring already said "both `proc.poll()` and
+    `proc.wait()` answer about the leader alone". Only the wait was never
+    switched to match.
+
+    Real processes, for the same reason as the test above.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI4S_WORKSPACE", str(tmp_path))
+    marker = tmp_path / "survived.txt"
+    host = build_host(
+        lambda method, args: None, bash_authorizer=_real_authorizer(tmp_path)
+    )
+
+    started = time.time()
+    with pytest.raises(RuntimeError, match="timed out"):
+        host.bash(f"( sleep 6; echo survived > {marker} ) & exit 0", timeout=1.5)
+    elapsed = time.time() - started
+
+    # It waited for the deadline rather than returning the instant the shell
+    # exited, which is what made the old behaviour look like a fast success.
+    assert elapsed >= 1.4, f"returned in {elapsed:.2f}s; the deadline was not held"
+
+    # And the work the shell left behind is gone. Polled rather than slept on
+    # once: the assertion is that it never completes, so give it longer than it
+    # would have needed.
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if marker.exists():
+            raise AssertionError(
+                "the abandoned child outlived the deadline and finished its work"
+            )
+        time.sleep(0.1)
+
+
+def test_command_output_is_bounded_as_it_is_produced(tmp_path, monkeypatch):
+    """`capture_output=True` held both whole streams before any slice ran.
+
+    The `[-30000:]` on the way out described what the caller saw, not what the
+    worker allocated: a command printing a gigabyte put a gigabyte in the
+    kernel's memory first and then showed 30k of it.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI4S_WORKSPACE", str(tmp_path))
+    host = build_host(
+        lambda method, args: None, bash_authorizer=_real_authorizer(tmp_path)
+    )
+
+    result = host.bash(
+        f"{shlex.quote(sys.executable)} -c "
+        + shlex.quote("import sys\nsys.stdout.write('z' * 5_000_000)\n"),
+        timeout=60,
+    )
+
+    assert result["exit_code"] == 0
+    assert len(result["stdout"]) <= 30_000
+    # The tail is what is kept, so the end of the stream survives.
+    assert result["stdout"].endswith("z")

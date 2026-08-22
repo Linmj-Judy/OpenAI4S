@@ -17,12 +17,19 @@ The retry is deliberately narrow, and the two halves matter equally:
 Tests inject `sleep` rather than actually sleeping; the delay is asserted as a
 value, which is also the only way to pin the Retry-After/backoff precedence.
 """
+
 import io
 import urllib.error
 
 import pytest
 
-from openai4s.llm.models import TransportError, parse_retry_after, status_is_retryable
+from openai4s.llm.models import (
+    LLMError,
+    TransportError,
+    llm_failure_code,
+    parse_retry_after,
+    status_is_retryable,
+)
 from openai4s.llm.transport import post_json, post_sse
 
 
@@ -100,6 +107,43 @@ def test_to_dict_is_loggable_and_omits_the_body():
     assert d["status"] == 500
     assert d["retryable"] is True
     assert "body" not in d
+
+
+@pytest.mark.parametrize(
+    ("error_code", "status", "expected"),
+    [
+        ("RequestBurstTooFast", 429, "llm_request_burst"),
+        ("ServerOverloaded", 429, "llm_upstream_overloaded"),
+        ("some_new_provider_code", 429, "llm_rate_limited"),
+    ],
+)
+def test_public_failure_classification_is_a_closed_local_vocabulary(
+    error_code, status, expected
+):
+    exc = TransportError(
+        "private provider detail", status=status, error_code=error_code
+    )
+    assert llm_failure_code(exc) == expected
+    assert llm_failure_code(exc) != error_code
+
+
+def test_failure_classification_never_parses_provider_prose():
+    assert (
+        llm_failure_code(
+            LLMError(
+                "System protection triggered by request burst: RequestBurstTooFast"
+            )
+        )
+        is None
+    )
+    assert (
+        llm_failure_code(
+            TransportError(
+                "anything", error_code="RequestBurstTooFast plus private prose"
+            )
+        )
+        is None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -215,6 +259,38 @@ def test_backoff_is_jittered_when_no_retry_after(monkeypatch):
     assert len(sleeper.slept) == 2
     # Full jitter: within (0, backoff], never the bare deterministic value.
     assert all(0 <= s <= 8 for s in sleeper.slept)
+
+
+def test_request_burst_uses_slower_strictly_positive_exponential_jitter(
+    monkeypatch,
+):
+    attempts = []
+    jitter_ranges = []
+
+    def urlopen(*a, **k):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise _http_error(
+                429,
+                b'{"error":{"code":"RequestBurstTooFast",'
+                b'"message":"private upstream detail"}}',
+            )
+        return _Resp(b"{}")
+
+    def jitter(low, high):
+        jitter_ranges.append((low, high))
+        return (low + high) / 2.0
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("openai4s.llm.transport.random.uniform", jitter)
+    sleeper = _Recorder()
+
+    post_json("https://x.invalid", {}, {}, 5, sleep=sleeper)
+
+    # The generic first two full-jitter windows are [0, 0.5] and [0, 1].
+    # Burst protection instead grows gradually from non-zero [2, 4], [4, 8].
+    assert jitter_ranges == [(2.0, 4.0), (4.0, 8.0)]
+    assert sleeper.slept == [3.0, 6.0]
 
 
 def test_attempts_are_bounded(monkeypatch):
@@ -350,3 +426,74 @@ def test_sse_read_failure_before_any_event_is_retryable(monkeypatch):
     seen = []
     post_sse("https://x.invalid", {}, {}, 5, seen.append, sleep=_Recorder())
     assert seen == [{"delta": "ok"}]
+
+
+# --------------------------------------------------------------------------
+# Stop has to work after the wait has already begun
+# --------------------------------------------------------------------------
+
+
+def test_a_cancel_during_the_backoff_wait_stops_it(monkeypatch):
+    """The regression.
+
+    The cancellation checks sat either side of a single blocking sleep, so a
+    user pressing Stop one millisecond into a 300-second `Retry-After` was
+    parked for the full five minutes with nothing able to interrupt it. The
+    only test for this cancelled *before* the wait began — the case that
+    already worked.
+    """
+    from openai4s.llm import transport as transport_mod
+
+    slept: list[float] = []
+    cancelled = {"now": False}
+
+    def sleeper(seconds):
+        slept.append(seconds)
+        # Stop is pressed after the wait is under way.
+        if len(slept) == 2:
+            cancelled["now"] = True
+
+    attempts = {"n": 0}
+
+    def attempt():
+        attempts["n"] += 1
+        raise transport_mod.TransportError(
+            "429 slow down", retryable=True, retry_after=300.0
+        )
+
+    with pytest.raises(transport_mod.TransportError) as error:
+        transport_mod._retry_loop(
+            attempt,
+            provider="x",
+            operation="chat",
+            max_attempts=3,
+            base_backoff=1.0,
+            max_backoff=600.0,
+            retry_budget=600.0,
+            should_cancel=lambda: cancelled["now"],
+            sleep=sleeper,
+        )
+
+    assert "cancelled" in str(error.value)
+    assert attempts["n"] == 1, "the retry must not be attempted after a stop"
+    assert sum(slept) < 300.0, "the full Retry-After must not have been waited out"
+    assert len(slept) <= 4, "a cancelled wait stops promptly, not after a busy loop"
+
+
+def test_a_wait_with_no_cancel_hook_is_still_a_single_sleep():
+    """Slicing exists to poll for cancellation. With nothing to poll for it
+    would only invent wake-ups — and would break the injected-sleep contract
+    the rest of this file reads."""
+    from openai4s.llm import transport as transport_mod
+
+    slept: list[float] = []
+    assert transport_mod._wait(2.0, slept.append, None) is False
+    assert slept == [2.0]
+
+
+def test_an_uncancelled_wait_sleeps_the_whole_delay():
+    from openai4s.llm import transport as transport_mod
+
+    slept: list[float] = []
+    assert transport_mod._wait(1.0, slept.append, lambda: False) is False
+    assert sum(slept) == pytest.approx(1.0)

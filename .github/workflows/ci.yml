@@ -41,7 +41,17 @@ jobs:
     # Enforces the CONTRIBUTING.md branch-naming table on PR head branches.
     # dependabot branches (dependabot/...) are exempt. `main` is allowed so
     # casual contributors can PR from their fork's main branch.
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    #
+    # Exempt on the *branch*, not on the actor. `github.actor` is whoever
+    # triggered the latest run, so the moment a maintainer clicks "Update
+    # branch" on a Dependabot PR the actor stops being dependabot[bot], this
+    # job starts running, and it fails a branch name it was never meant to
+    # judge. Because this is a required check under a strict-up-to-date
+    # ruleset -- where every Dependabot PR after the first merge must be
+    # updated -- an actor-based exemption makes Dependabot PRs unmergeable
+    # through the front door. The head ref is the thing the policy is about.
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'dependabot/')
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - name: Check head branch name
@@ -60,25 +70,43 @@ jobs:
 
   lint:
     name: Lint (pre-commit)
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
       - name: Install dev dependencies
         run: uv sync --locked
       - name: pre-commit (black, isort, ruff, mypy, hygiene hooks)
         run: uv run pre-commit run --all-files
+
+  # Its own job, not a second step in `lint`. As a step it could only ever run
+  # when pre-commit had already passed, so a branch that failed formatting and
+  # added an undocumented directory reported one problem and hid the other --
+  # and the doc gap is the one a reviewer cannot see in the diff.
+  docs-coverage:
+    name: Bilingual per-directory documentation
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: uv sync --locked
       - name: Verify bilingual per-directory documentation coverage
         run: uv run python scripts/check_directory_readmes.py
 
   type-check:
     name: Type safety (core orchestration boundary)
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
       - name: Install locked development dependencies
@@ -88,10 +116,11 @@ jobs:
 
   source-security:
     name: Source credential scan
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Scan tracked release sources without echoing matches
@@ -99,13 +128,14 @@ jobs:
 
   release-artifacts:
     name: Build and install wheel/sdist
+    timeout-minutes: 25
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Build standards-compliant release artifacts
@@ -127,16 +157,79 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/openai4s-release-venv/bin/python" "${GITHUB_WORKSPACE}/scripts/release_import_smoke.py"
 
+  windows-launcher:
+    name: Windows launcher parses on Windows
+    # The Windows package's launcher is the only shipped file nothing on Linux
+    # or macOS can even parse, so a syntax error in it is invisible to every
+    # other job here and surfaces on the first user's machine. This runner has
+    # no WSL, which also makes it the right place to prove the refusal path
+    # refuses instead of proceeding.
+    runs-on: windows-latest
+    # Every job here carries one. A PowerShell parse that hangs would otherwise
+    # hold a Windows runner for the six-hour default, and this job arrived from
+    # a branch that predated the rule.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Parse the launcher
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD\scripts\windows\openai4s.ps1", [ref] $tokens, [ref] $errors)
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object {
+              Write-Host "::error::$($_.Extent.StartLineNumber): $($_.Message)"
+            }
+            throw "scripts/windows/openai4s.ps1 does not parse"
+          }
+          Write-Host "parsed OK ($($tokens.Count) tokens)"
+      - name: Refuse, with guidance, on a machine that has no WSL
+        shell: pwsh
+        env:
+          OPENAI4S_NONINTERACTIVE: "1"
+        run: |
+          $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File "$PWD\scripts\windows\openai4s.ps1" 2>&1 | Out-String
+          # Captured immediately, and the step ends with an explicit `exit 0`.
+          # A refusal is a NON-ZERO exit -- that is the thing being asserted --
+          # and the pwsh shell appends `exit $LASTEXITCODE`, so leaving it set
+          # fails the step for the launcher behaving correctly.
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -eq 0) {
+            throw "the launcher succeeded on a machine with no WSL"
+          }
+          if ($out -notmatch 'wsl --install') {
+            throw "the refusal does not tell the user how to install WSL"
+          }
+          Write-Host "refused with exit $code and named the way out"
+          exit 0
+
   test:
     name: Offline tests (py${{ matrix.python-version }})
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        # 3.13 is here because the macOS .dmg embeds it: the build that
+        # reaches the most end users was, until this line, the one Python
+        # nothing tested. 3.10 is the floor from requires-python.
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history on exactly one matrix entry. `tests/test_plan_crosswalk.py`
+          # asserts that the crosswalk's `baseline` and `audited_at` are real
+          # commits and that the audit is reachable from HEAD -- and the default
+          # depth-1 checkout does not contain those objects, so the check can
+          # only skip. Deepening one job makes it a check CI actually performs
+          # instead of one that is enforced on developer machines and nowhere
+          # else; deepening all three would pay for the same answer twice more.
+          fetch-depth: ${{ matrix.python-version == '3.12' && 0 || 1 }}
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: ${{ matrix.python-version }}
       # Keep one science-only job to exercise the no-RDKit fallback. Ubuntu's
@@ -147,32 +240,172 @@ jobs:
       - name: Install dev, science, and chemistry dependencies
         if: matrix.python-version == '3.12'
         run: uv sync --locked --extra science --extra chemistry
+      # The .dmg's interpreter. The science extra is not optional here even
+      # though the core is stdlib-only: the science-dependent test modules
+      # importorskip pandas/matplotlib, so without the extra they silently
+      # skip and the job stops validating the interpreter the .dmg ships.
+      - name: Install dev and science dependencies
+        if: matrix.python-version == '3.13'
+        run: uv sync --locked --extra science
       - name: Byte-compile all first-party sources
         run: uv run python -m compileall -q openai4s openai4s_compute_provider harness tests
       - name: Collect tests (strict markers, default deselection)
         run: uv run pytest --collect-only -q
       - name: Run the offline suite (no secrets, no network, no hardware)
         # addopts already passes -q; a second -q would suppress the summary line.
-        run: uv run pytest
+        #
+        # `-n auto` because this one command *was* CI: 1094 of this job's 1122
+        # seconds were spent here, and the other sixteen jobs put together came
+        # to under eight minutes. Nothing else on the critical path was worth
+        # optimising while the suite ran on one core.
+        #
+        # `--dist loadfile`, not the default `load`. The default hands out
+        # individual tests, which asserts that any two tests in a module may run
+        # in different processes -- a property nothing here has ever had to
+        # hold, because nothing here has ever run in parallel. loadfile asserts
+        # only that two *files* are independent, which is the boundary the suite
+        # was actually written to: `tests/conftest.py` redirects `~/.openai4s`
+        # per test, and every test server binds ("127.0.0.1", 0) rather than a
+        # fixed port, so files do not contend. Within a file, ordering and any
+        # module-level state stay exactly as they are today.
+        #
+        # Scaling is linear at this width (1572 worker-seconds over 4 workers in
+        # 393s), so the per-file granularity is costing nothing: no single file
+        # is long enough to be the tail.
+        run: uv run pytest -n auto --maxprocesses=4 --dist loadfile
+      # After the suite, not before it: the pytest gate must never sit behind
+      # a command that can fail it (tests/test_ci_gate_independence.py). The
+      # importorskip guards make a missing science stack a *silent* skip, and
+      # every matrix entry above installs it on purpose — so assert it really
+      # landed, or a lockfile/extras drift turns this job green while it
+      # validates nothing the .dmg ships.
+      - name: Assert the science stack actually installed
+        run: uv run python -c "import matplotlib, pandas"
+
+  # Three gates that used to be steps in `test`, after `pytest`. A step can only
+  # run when every step before it passed, so all three were unreachable whenever
+  # one unrelated test was red — and a run that reported "tests failed" was
+  # indistinguishable from one where the harness goldens had also drifted and
+  # the response contract had also moved. Independent jobs answer three
+  # questions instead of one, and each is legible on its own.
+
+  harness-contracts:
+    name: Harness scenario contracts
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: uv sync --locked
       - name: Run deterministic harness contracts
         run: uv run python -m harness.cli run --tier pr --offline
 
-  browser-smoke:
-    name: Browser workbench E2E (Chromium)
+  # The container image, built and run. `tests/test_container_deployment.py`
+  # keeps the manifests honest against the code, which is a different question
+  # from whether the image works — and a Dockerfile no gate builds is not
+  # evidence of anything. This is the only place that answers the second
+  # question, so it runs on every PR rather than nightly: a source change can
+  # break the image, and the failure would otherwise surface on a user's
+  # machine after a release.
+  #
+  # No Docker setup step: GitHub-hosted Linux runners already have a daemon,
+  # and the script is deliberately the whole gate so it runs identically on a
+  # laptop.
+  container-image:
+    name: Container image builds and serves
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the image and prove the daemon runs inside it
+        run: bash scripts/container_smoke.sh
+
+  # Every route the router can match must have a recorded response *kind* and
+  # status, not only the ones that return JSON. Cheap: it drives the surface
+  # directly rather than rerunning the suite.
+  response-contract:
+    name: Route response contract
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - name: Install dev and science dependencies
+        run: uv sync --locked --extra science
+      - name: Check every route still has a response contract
+        run: uv run python scripts/capture_response_contract.py --check
+
+  # Reruns the suite with the response capture installed and compares what the
+  # routes returned against docs/response-schemas.json. The shapes are the
+  # server's, not the interpreter's, so one interpreter is enough.
+  #
+  # This one genuinely cannot answer while the suite is red — a failing suite
+  # exercises fewer routes, so any drift it reported would be an artefact of the
+  # failures rather than a real change, and the script refuses rather than
+  # guessing. Its own job anyway: "the schema gate did not get to run" and "the
+  # schema gate ran and passed" are different facts, and as a step behind pytest
+  # they looked identical on the summary page.
+  #
+  # This job is a *second* run of the whole suite. Each worker publishes its
+  # share during `pytest_sessionfinish`, before xdist can report that worker as
+  # successful, and records xdist's run id plus expected worker count. Four
+  # workers writing the same destination directly would leave whichever
+  # finished last -- a fraction of the evidence in a document that still
+  # looked complete, which is precisely the wrong-rather-than-absent
+  # provenance the artifact's own note warns about.
+  #
+  # It is split now anyway. Each worker leaves its un-elided shapes beside the
+  # destination and `scripts/capture_response_schemas.py` merges them once
+  # pytest has exited -- after every writer process is gone -- through the same
+  # `merge` call `Recorder.observe` makes. Assembly rejects missing or mixed-run
+  # shares before writing the capture. Equality and completeness are asserted
+  # in tests/test_response_capture_assembly.py, not assumed.
+  response-schemas:
+    name: Frozen response shapes
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install dev, science, and chemistry dependencies
+        run: uv sync --locked --extra science --extra chemistry
+      - name: Check the frozen response shapes still match reality
+        run: uv run python scripts/capture_response_schemas.py --check
+
+  browser-smoke:
+    name: Browser workbench E2E (${{ matrix.engine }})
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    # Chromium is the engine the app is developed against, so it is the one
+    # least likely to surprise anyone. The defects a matrix catches are the
+    # ones a single engine cannot: a WebSocket close code Firefox reports
+    # differently, a fetch abort WebKit surfaces as another error, a DOM API
+    # one engine has and another does not. `fail-fast: false` so one engine's
+    # failure still leaves the other two's results visible.
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chromium, firefox, webkit]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
       - name: Install the zero-dependency server and browser driver
         run: |
           uv sync --locked
           npm install --no-save --ignore-scripts playwright@1.54.1
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps ${{ matrix.engine }}
       - name: Start the daemon and open the real workbench
         env:
           OPENAI4S_DATA_DIR: ${{ runner.temp }}/openai4s-browser-smoke
@@ -200,7 +433,27 @@ jobs:
             fi
             sleep 0.25
           done
-          node tests/browser_smoke.mjs
+          # The full workbench walk stays Chromium-only: it is long, and its
+          # value is depth rather than engine coverage. The matrix file is the
+          # breadth pass — session, artifact, consent, cancel, recovery — and
+          # it runs in every engine.
+          if [ "${{ matrix.engine }}" = "chromium" ]; then
+            node tests/browser_smoke.mjs
+            # The admission fault case: the POST reaches the daemon and
+            # succeeds, the response is destroyed on the way back, and the page
+            # has to reconcile from an id it stored before dispatch. Chromium
+            # only, for the same reason the walk is -- it is depth, not breadth
+            # -- but it has to run somewhere, because a browser file no gate
+            # invokes is not evidence of anything.
+            node tests/browser_admission_fault.mjs
+            # The P1-A/P1-B controls. Chromium-only for the same reason as the
+            # two above, and listed here because the audit's finding was not
+            # "these controls are broken" but "no browser file mentions them" --
+            # a file this job does not invoke would reproduce that finding
+            # exactly, with a green tick on top.
+            node tests/browser_p1_controls.mjs
+          fi
+          node tests/browser_matrix.mjs --browser=${{ matrix.engine }}
       - name: Show daemon log after a failure
         if: failure()
         run: cat "${RUNNER_TEMP}/openai4s-browser.log" || true
@@ -208,10 +461,11 @@ jobs:
   macos-sandbox-smoke:
     name: macOS sandbox enforcement (nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 25
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
       - name: Install the zero-dependency runtime
@@ -220,3 +474,61 @@ jobs:
         env:
           OPENAI4S_KERNEL_SANDBOX: enforce
         run: uv run python -m harness.smoke.macos_sandbox
+
+  # There is deliberately no Linux bubblewrap job here. `harness.smoke.linux_sandbox`
+  # still exists and still passes on a Linux host that permits unprivileged user
+  # namespaces -- but not on a GitHub-hosted runner, where bwrap cannot bring up
+  # the loopback interface inside its new network namespace
+  # (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`). That is the
+  # runner's confinement, not a defect in the sandbox, so the job failed every
+  # single night while telling us nothing about the code. A check that cannot
+  # pass is not evidence; docs/platforms.md now states what is and is not proven
+  # rather than pointing at a job that was always red. Run the smoke by hand on a
+  # permissive Linux host to re-establish the claim.
+
+  linux-bundle-smoke:
+    name: Linux app bundle builds and imports (nightly)
+    # The desktop bundle is only built at release time, so the first sign that
+    # a manifest package lost its manylinux wheel — or that the embedded
+    # interpreter no longer imports the stack — would otherwise be a release
+    # day. Nightly and manual only: it downloads a runtime plus ~1 GB of
+    # wheels, which is not a cost to put on every contributor's PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Build the bundle
+        run: bash scripts/build_linux_bundle.sh
+      - name: Run the embedded interpreter and import the whole science stack
+        # This runner is the only place that check can happen: everything else
+        # in this repository's CI either cannot execute a linux-x86_64 binary
+        # or never builds the bundle at all.
+        run: python3 scripts/verify_linux_bundle.py dist/OpenAI4S-*-linux-x86_64.tar.gz
+      - name: Wrap it as the Windows package and verify that too
+        run: |
+          bash scripts/build_windows_zip.sh
+          python3 scripts/verify_windows_zip.py dist/OpenAI4S-*-windows-x86_64.zip
+
+  connector-canary:
+    name: Science connector canary (nightly)
+    # Schedule and manual only: a public API's outage is not a reason to fail a
+    # contributor's PR, and the script exits non-zero only on real schema drift,
+    # never on an upstream being unreachable. See scripts/connector_canary.py.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install the zero-dependency runtime
+        run: uv sync --locked
+      - name: Ask UniProt, RCSB PDB and OpenAlex whether they still parse
+        env:
+          OPENAI4S_ALLOW_NETWORK: "1"
+        run: uv run python scripts/connector_canary.py

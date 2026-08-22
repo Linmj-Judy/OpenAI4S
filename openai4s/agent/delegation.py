@@ -23,6 +23,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from openai4s.agent.runtime import CompactionPolicy
@@ -657,9 +658,9 @@ class _DelegationTree:
             pass
 
 
-_ACTIVE_DELEGATION: contextvars.ContextVar[
-    tuple[_DelegationTree, str] | None
-] = contextvars.ContextVar("openai4s_active_delegation", default=None)
+_ACTIVE_DELEGATION: contextvars.ContextVar[tuple[_DelegationTree, str] | None] = (
+    contextvars.ContextVar("openai4s_active_delegation", default=None)
+)
 
 
 class _ChildCancellation:
@@ -670,11 +671,50 @@ class _ChildCancellation:
         return self._child.stop_event.is_set()
 
 
+def _child_context_budget(cfg: Config):
+    """A budget provider for one child's model, or None if it cannot be known.
+
+    Returning None restores the previous behaviour deliberately: an unknown
+    model falls back to the configured default rather than to a guess, and a
+    capability lookup that raises must not take the child down with it.
+    """
+
+    def _budget(_state: Any) -> int | None:
+        try:
+            from openai4s.llm import get_model_capabilities
+
+            capabilities = get_model_capabilities(
+                str(getattr(cfg.llm, "provider", "") or ""),
+                str(getattr(cfg.llm, "model", "") or ""),
+                base_url=str(getattr(cfg.llm, "base_url", "") or ""),
+            )
+            return (
+                capabilities.usable_context_tokens
+                or capabilities.context_window_tokens
+                or None
+            )
+        except Exception:  # noqa: BLE001 - an unknown model is not a failure
+            return None
+
+    return _budget
+
+
 class _SteeringContextPolicy:
     """Inject newly delivered parent messages before each child model turn."""
 
     def __init__(self, cfg: Config, child: _Child, tree: _DelegationTree) -> None:
-        self._base = CompactionPolicy(cfg)
+        # The child's OWN model decides when the child compacts. This was a
+        # bare `CompactionPolicy(cfg)`, which falls back to
+        # `cfg.context_window_tokens` -- the daemon default, 262,144 -- while
+        # the Web session path has always derived the budget from the model's
+        # declared capability. A child may run a different model than its
+        # parent (`overrides["model"]`), which is exactly when the two numbers
+        # diverge: a child on a model whose usable window is 136,000 tokens
+        # would compact against 262,144 and sail past its real limit, learning
+        # about it as a provider rejection rather than as a compaction.
+        self._base = CompactionPolicy(
+            cfg, context_budget_provider=_child_context_budget(cfg)
+        )
         self._child = child
         self._tree = tree
 
@@ -719,6 +759,7 @@ class DelegationRunner:
         parent_child_id: str | None = None,
         owner_instance_id: str | None = None,
         runner_instance_id: str | None = None,
+        workspace: str | Path | None = None,
     ) -> None:
         if depth < 0 or depth > MAX_DEPTH:
             raise ValueError(f"delegation depth must be between 0 and {MAX_DEPTH}")
@@ -733,6 +774,12 @@ class DelegationRunner:
         self.parent_frame_id = parent_frame_id
         self.parent_child_id = parent_child_id
         self.store = store
+        # Children run here instead of in os.getcwd(). The Web gateway passes
+        # the parent session's workspace so a delegated child's kernels and
+        # relative file writes land where the parent's artifact capture looks,
+        # never in the daemon's launch directory. None preserves the CLI
+        # contract: each child resolves its own process cwd at run() start.
+        self.workspace = workspace
         self.owner_instance_id = owner_instance_id or DELEGATION_PROCESS_INSTANCE_ID
         self.runner_instance_id = runner_instance_id or f"runner-{uuid.uuid4()}"
         if (
@@ -882,6 +929,7 @@ class DelegationRunner:
                 delegate_depth=child.depth,
                 cancellation=_ChildCancellation(child),
                 context_policy=_SteeringContextPolicy(child_cfg, child, self._tree),
+                workspace=self.workspace,
             )
             agent.dispatcher.set_child_execution_policy(execution_policy)
             if child.attach_agent(agent):
@@ -1190,6 +1238,20 @@ def _normalize_item(item: Any, parent_spec: dict[str, Any]) -> dict[str, Any]:
     if isinstance(item, dict):
         normalized = dict(inherited)
         normalized.update(item)
+        # `update` lets a child REPLACE what it inherited, which for a resource
+        # allowlist means delegating is the way out of it: a child restricted
+        # to one Skill could name three and get three. Narrow instead, so the
+        # child's own list can only ever be a subset of its parent's. `None`
+        # on either side inherits the other, which is what the tri-state means.
+        from openai4s.host import resource_allowlist
+
+        for key in ("skill_names", "connectors"):
+            if key in inherited or key in item:
+                narrowed = resource_allowlist.narrow(inherited.get(key), item.get(key))
+                if narrowed is None:
+                    normalized.pop(key, None)
+                else:
+                    normalized[key] = sorted(narrowed)
         return normalized
     raise DelegationError(
         f"delegate: each request item must be str or dict, got {type(item).__name__}"
@@ -1255,6 +1317,24 @@ def _apply_parent_execution_ceiling(
         combined[key] = decision
     if combined:
         merged["permissions"] = combined
+
+    # Resource allowlists are narrowed here too, not only in `_normalize_item`.
+    # The two narrow against different things and only this one bounds a
+    # grandchild: `_normalize_item` narrows an item against the *delegate()
+    # call's own kwargs*, while this runs on the nested path and narrows
+    # against the parent CHILD's spec. Without it, a child restricted to one
+    # Skill or connector could delegate a grandchild that named three and get
+    # three — the same widening the `_normalize_item` fix closed, one level
+    # further down.
+    from openai4s.host import resource_allowlist
+
+    for key in ("skill_names", "connectors"):
+        if key in merged or key in parent_spec:
+            narrowed = resource_allowlist.narrow(parent_spec.get(key), merged.get(key))
+            if narrowed is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = sorted(narrowed)
     return merged
 
 

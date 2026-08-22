@@ -16,6 +16,13 @@ import sqlite3
 import uuid
 from typing import Any, Callable
 
+# The restore refusal type, imported rather than duplicated: these three
+# raises are author-written refusals on the same restore transaction the
+# service owns, and the caller distinguishes them from an OS-layer failure
+# by type. `artifact_restore` imports nothing from storage, so this is a
+# leaf dependency rather than a cycle.
+from openai4s.artifact_restore import ArtifactRestoreRefused
+
 Clock = Callable[[], int]
 Execute = Callable[[str, tuple], None]
 GetFrame = Callable[[str], dict | None]
@@ -25,6 +32,7 @@ GetArtifact = Callable[[str], dict | None]
 GetEnvironmentSnapshot = Callable[[str], dict | None]
 FileIdentity = Callable[[str], str | None]
 SameFilePath = Callable[[str, str], bool]
+DeleteArtifactRelated = Callable[[str], None]
 
 
 def file_identity(path: str) -> str | None:
@@ -49,6 +57,74 @@ def same_file_path(left: str, right: str) -> bool:
     )
 
 
+def env_snapshot_id(
+    *,
+    kind: Any,
+    python_version: Any,
+    implementation: Any,
+    platform: Any,
+    interpreter: Any,
+    environment_name: Any,
+    generation_id: Any,
+    packages_json: str,
+    remote_json: str,
+) -> str:
+    """The content address of one environment observation.
+
+    The interpreter and environment name are part of the identity, not
+    decoration: without them an R kernel and a Python one in a conda env
+    collapse onto the same row whenever their package lists happen to match --
+    and which environment produced a result is precisely what provenance is
+    for.
+
+    So is the **generation**. ``upsert_env_snapshot`` never updates an existing
+    row, so with the generation left out of the basis, a kernel restarted into
+    an unchanged environment produced the same id — and the row already on disk
+    kept naming the *first* generation. Every artifact from generation 2 then
+    pointed at a snapshot recorded as generation 1, and nothing else on the
+    artifact carries a generation, so there was no second source to catch it:
+    the record was silently, confidently wrong about which kernel lifetime
+    produced the file. Including it costs one row per kernel restart and makes
+    ``generation_id`` mean what it says.
+
+    Shared with the numbered migration that repairs legacy rows, so the two
+    cannot drift.
+    """
+    basis = "|".join(
+        [
+            str(kind or ""),
+            str(python_version or ""),
+            str(implementation or ""),
+            str(platform or ""),
+            str(interpreter or ""),
+            str(environment_name or ""),
+            str(generation_id or ""),
+            packages_json,
+            remote_json,
+        ]
+    )
+    return "env-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _encode_source(source: Any) -> str | None:
+    """Store a retrieval envelope as canonical JSON, or nothing at all.
+
+    Canonical so two versions derived from the same retrieval compare equal as
+    text -- "these came from the same data" should be checkable rather than a
+    matter of key ordering.
+    """
+    if source in (None, "", {}, []):
+        return None
+    if isinstance(source, str):
+        return source
+    try:
+        return json.dumps(
+            source, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 class ArtifactRepository:
     """Own artifacts, versions, environment snapshots, and lineage edges."""
 
@@ -66,6 +142,7 @@ class ArtifactRepository:
         get_env_snapshot: GetEnvironmentSnapshot | None = None,
         identify_file: FileIdentity | None = None,
         paths_match: SameFilePath | None = None,
+        delete_related: DeleteArtifactRelated | None = None,
     ) -> None:
         self._connection = connection
         self._lock = lock
@@ -80,6 +157,7 @@ class ArtifactRepository:
         self._get_env_snapshot = get_env_snapshot or self.get_env_snapshot
         self._identify_file = identify_file or file_identity
         self._paths_match = paths_match or same_file_path
+        self._delete_related = delete_related
 
     def get_artifact(self, artifact_id: str) -> dict | None:
         with self._lock:
@@ -113,35 +191,45 @@ class ArtifactRepository:
                 for path in (row["path"], row["snapshot_path"])
                 if path
             }
-            if version_ids:
-                marks = "(" + ",".join("?" for _ in version_ids) + ")"
+            try:
+                self._connection.execute("SAVEPOINT artifact_delete")
+                if self._delete_related is not None:
+                    self._delete_related(artifact_id)
+                if version_ids:
+                    marks = "(" + ",".join("?" for _ in version_ids) + ")"
+                    self._connection.execute(
+                        "DELETE FROM lineage_edges WHERE input_version_id IN "
+                        f"{marks} OR output_version_id IN {marks}",
+                        version_ids + version_ids,
+                    )
                 self._connection.execute(
-                    "DELETE FROM lineage_edges WHERE input_version_id IN "
-                    f"{marks} OR output_version_id IN {marks}",
-                    version_ids + version_ids,
+                    "DELETE FROM artifact_versions WHERE artifact_id=?", (artifact_id,)
                 )
-            self._connection.execute(
-                "DELETE FROM artifact_versions WHERE artifact_id=?", (artifact_id,)
-            )
-            self._connection.execute(
-                "DELETE FROM artifacts WHERE artifact_id=?", (artifact_id,)
-            )
-            self._connection.execute(
-                "DELETE FROM annotations WHERE artifact_id=?", (artifact_id,)
-            )
-            self._connection.execute(
-                "UPDATE plans SET artifact_id=NULL WHERE artifact_id=?", (artifact_id,)
-            )
-            if env_snapshot_ids:
-                marks = "(" + ",".join("?" for _ in env_snapshot_ids) + ")"
                 self._connection.execute(
-                    "DELETE FROM env_snapshots WHERE snapshot_id IN "
-                    f"{marks} AND NOT EXISTS (SELECT 1 FROM artifact_versions "
-                    "WHERE artifact_versions.env_snapshot_id="
-                    "env_snapshots.snapshot_id)",
-                    env_snapshot_ids,
+                    "DELETE FROM artifacts WHERE artifact_id=?", (artifact_id,)
                 )
-            self._connection.commit()
+                self._connection.execute(
+                    "DELETE FROM annotations WHERE artifact_id=?", (artifact_id,)
+                )
+                self._connection.execute(
+                    "UPDATE plans SET artifact_id=NULL WHERE artifact_id=?",
+                    (artifact_id,),
+                )
+                if env_snapshot_ids:
+                    marks = "(" + ",".join("?" for _ in env_snapshot_ids) + ")"
+                    self._connection.execute(
+                        "DELETE FROM env_snapshots WHERE snapshot_id IN "
+                        f"{marks} AND NOT EXISTS (SELECT 1 FROM artifact_versions "
+                        "WHERE artifact_versions.env_snapshot_id="
+                        "env_snapshots.snapshot_id)",
+                        env_snapshot_ids,
+                    )
+                self._connection.execute("RELEASE SAVEPOINT artifact_delete")
+                self._connection.commit()
+            except Exception:
+                self._connection.execute("ROLLBACK TO SAVEPOINT artifact_delete")
+                self._connection.execute("RELEASE SAVEPOINT artifact_delete")
+                raise
             surviving_rows = self._connection.execute(
                 "SELECT path,snapshot_path FROM artifact_versions"
             ).fetchall()
@@ -196,6 +284,29 @@ class ArtifactRepository:
             ).fetchone()
         return self._get_artifact(row["artifact_id"]) if row else None
 
+    def artifact_by_unique_filename(self, filename: str) -> dict | None:
+        """Resolve a filename only when exactly one artifact carries it.
+
+        The unscoped lookup above answers "the most recently created artifact
+        with this name, anywhere" -- so `GET /artifacts/report.pdf` served
+        whichever *project* last happened to make a `report.pdf`. A caller
+        asking by name got an arbitrary cross-project match, with the right
+        content-type and no indication anything was chosen.
+
+        For a tool whose artifacts are research data, quietly serving the wrong
+        file is worse than serving none. Two matches is an ambiguous question,
+        and the honest answer to an ambiguous question is not one of the
+        candidates.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT artifact_id FROM artifacts WHERE filename=? LIMIT 2",
+                (filename,),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return self._get_artifact(rows[0]["artifact_id"])
+
     def artifact_write_scope(
         self,
         *,
@@ -240,6 +351,7 @@ class ArtifactRepository:
         priority: int = 0,
         env_snapshot_id: str | None = None,
         snapshot_path: str | None = None,
+        source: Any = None,
     ) -> dict:
         (
             explicit_scope,
@@ -281,8 +393,8 @@ class ArtifactRepository:
             self._connection.execute(
                 "INSERT INTO artifact_versions(version_id,artifact_id,filename,"
                 "content_type,size_bytes,checksum,path,snapshot_path,"
-                "producing_cell_id,frame_id,created_at,env_snapshot_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "producing_cell_id,frame_id,created_at,env_snapshot_id,source) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     version_id,
                     artifact_id,
@@ -296,6 +408,7 @@ class ArtifactRepository:
                     frame_id,
                     now,
                     env_snapshot_id,
+                    _encode_source(source),
                 ),
             )
             if new_artifact:
@@ -350,6 +463,7 @@ class ArtifactRepository:
         env_snapshot_id: str | None = None,
         snapshot_path: str | None = None,
         input_version_ids: list[str] | tuple[str, ...] | None = None,
+        source: Any = None,
         preserve_filename: bool = False,
         preserve_content_type: bool = False,
         reuse_policy: str = "any",
@@ -439,7 +553,8 @@ class ArtifactRepository:
                         "UPDATE artifact_versions SET filename=?,"
                         "content_type=COALESCE(?,content_type),size_bytes=?,"
                         "checksum=?,path=?,snapshot_path=COALESCE(snapshot_path,?),"
-                        "env_snapshot_id=COALESCE(env_snapshot_id,?) "
+                        "env_snapshot_id=COALESCE(env_snapshot_id,?),"
+                        "source=COALESCE(source,?) "
                         "WHERE version_id=?",
                         (
                             stored_filename,
@@ -449,6 +564,7 @@ class ArtifactRepository:
                             path,
                             snapshot_path,
                             env_snapshot_id,
+                            _encode_source(source),
                             version_id,
                         ),
                     )
@@ -465,7 +581,8 @@ class ArtifactRepository:
                         "INSERT INTO artifact_versions(version_id,artifact_id,"
                         "filename,content_type,size_bytes,checksum,path,"
                         "snapshot_path,producing_cell_id,frame_id,created_at,"
-                        "env_snapshot_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "env_snapshot_id,source) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             version_id,
                             artifact_id,
@@ -479,6 +596,7 @@ class ArtifactRepository:
                             frame_id,
                             now,
                             env_snapshot_id,
+                            _encode_source(source),
                         ),
                     )
                     if artifact is None:
@@ -561,6 +679,159 @@ class ArtifactRepository:
             "created_at": created_at,
         }
 
+    def materialise_artifact_version(
+        self,
+        *,
+        source_version_id: str,
+        artifact_id: str,
+        version_id: str,
+        filename: str,
+        path: str,
+        snapshot_path: str,
+        frame_id: str | None,
+        root_frame_id: str,
+        project_id: str,
+        producing_cell_id: str | None = None,
+    ) -> dict:
+        """Copy another session's artifact version *into* this one, atomically.
+
+        The third write beside `record_cell_artifact` and
+        `record_artifact_restore`, and it exists so that nothing ever reads
+        another session's file in place. A cross-session read leaves the
+        borrowing session with an analysis whose input has no version in its own
+        history: delete or revert the other session and the provenance of this
+        one silently becomes unresolvable. Materialising gives the target its
+        own Artifact and version, with a lineage edge back to the source, so
+        "where did this come from" keeps an answer that does not depend on the
+        other session still existing.
+
+        Scope is enforced here rather than by the caller. Same project only, and
+        a source in another project raises the same `KeyError` as a source that
+        does not exist -- a distinct "forbidden" would confirm the object is
+        there, which is the one bit a caller outside the project should not be
+        able to read.
+
+        Byte movement is the caller's: the Host service hardlinks (falling back
+        to a copy across devices) before calling, because a version snapshot is
+        immutable by contract and two rows may share the bytes safely. This
+        method owns only the transaction.
+        """
+        if not version_id or version_id == source_version_id:
+            raise ValueError("materialisation requires a fresh version id")
+        now = self._clock_ms()
+        with self._lock:
+            try:
+                source = self._connection.execute(
+                    "SELECT v.*, a.project_id AS src_project, "
+                    "a.root_frame_id AS src_root FROM artifact_versions v "
+                    "JOIN artifacts a ON a.artifact_id=v.artifact_id "
+                    "WHERE v.version_id=?",
+                    (source_version_id,),
+                ).fetchone()
+                # One message for "absent" and for "another project's", and
+                # deliberately the SAME message the Host service raises. The
+                # two checks are independent on purpose, but if they worded the
+                # refusal differently then removing the outer one would turn
+                # the inner one into the disclosure channel both exist to
+                # close: a caller could tell "another project's" from "absent"
+                # by which sentence came back.
+                if source is None or source["src_project"] != project_id:
+                    raise KeyError(
+                        f"no artifact version {source_version_id!r} available"
+                    )
+                if source["src_root"] == root_frame_id:
+                    raise ValueError("artifact version already belongs to this session")
+
+                existing = self._connection.execute(
+                    "SELECT * FROM artifacts WHERE artifact_id=?",
+                    (artifact_id,),
+                ).fetchone()
+                if existing is None:
+                    self._connection.execute(
+                        "INSERT INTO artifacts(artifact_id,filename,content_type,"
+                        "latest_version_id,root_frame_id,project_id,created_at,"
+                        "updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            artifact_id,
+                            filename,
+                            source["content_type"],
+                            version_id,
+                            root_frame_id,
+                            project_id,
+                            now,
+                            now,
+                        ),
+                    )
+                elif (
+                    existing["root_frame_id"] != root_frame_id
+                    or existing["project_id"] != project_id
+                ):
+                    raise ValueError("target artifact belongs to a different scope")
+
+                source_envelope = None
+                try:
+                    source_envelope = source["source"]
+                except (IndexError, KeyError):
+                    source_envelope = None
+                self._connection.execute(
+                    "INSERT INTO artifact_versions(version_id,artifact_id,"
+                    "filename,content_type,size_bytes,checksum,path,"
+                    "snapshot_path,producing_cell_id,frame_id,created_at,"
+                    "env_snapshot_id,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        version_id,
+                        artifact_id,
+                        filename,
+                        source["content_type"],
+                        source["size_bytes"],
+                        source["checksum"],
+                        path,
+                        snapshot_path,
+                        producing_cell_id,
+                        frame_id,
+                        now,
+                        source["env_snapshot_id"],
+                        source_envelope,
+                    ),
+                )
+                self._connection.execute(
+                    "UPDATE artifacts SET latest_version_id=?,updated_at=? "
+                    "WHERE artifact_id=?",
+                    (version_id, now, artifact_id),
+                )
+                # The edge is what makes this materialisation rather than a
+                # copy: the target version knows which version it came from,
+                # and the lineage walk crosses the session boundary even though
+                # no read ever does.
+                self._connection.execute(
+                    "INSERT INTO lineage_edges(edge_id,input_version_id,"
+                    "output_version_id,producing_cell_id,frame_id,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        f"e-{uuid.uuid4().hex[:12]}",
+                        source_version_id,
+                        version_id,
+                        producing_cell_id,
+                        frame_id,
+                        now,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {
+            "artifact_id": artifact_id,
+            "version_id": version_id,
+            "filename": filename,
+            "path": path,
+            "content_type": source["content_type"],
+            "size_bytes": source["size_bytes"],
+            "checksum": source["checksum"],
+            "created_at": now,
+            "materialised_from_version_id": source_version_id,
+        }
+
     def record_artifact_restore(
         self,
         *,
@@ -604,11 +875,15 @@ class ArtifactRepository:
                     (source_version_id, artifact_id),
                 ).fetchone()
                 if artifact is None or source is None:
-                    raise KeyError("artifact restore source not found")
+                    raise ArtifactRestoreRefused("artifact restore source not found")
                 if artifact["latest_version_id"] != expected_latest_version_id:
-                    raise RuntimeError("artifact changed concurrently during restore")
+                    raise ArtifactRestoreRefused(
+                        "artifact changed concurrently during restore"
+                    )
                 if artifact["latest_version_id"] == source_version_id:
-                    raise ValueError("restore source is already the latest version")
+                    raise ArtifactRestoreRefused(
+                        "restore source is already the latest version"
+                    )
                 if source["checksum"] != checksum or (
                     source["size_bytes"] is not None
                     and int(source["size_bytes"]) != int(size_bytes)
@@ -624,11 +899,22 @@ class ArtifactRepository:
 
                 filename = source["filename"] or artifact["filename"]
                 content_type = source["content_type"] or artifact["content_type"]
+                # Carry the retrieval-provenance envelope forward too. A normal
+                # version write persists `source`; the restore insert copied
+                # only `env_snapshot_id`, so a restored retrieval-backed version
+                # lost its request URL, timestamp and response hash in
+                # latest-version exports and evidence checks — the restored bytes
+                # would look unsourced even though the historical row was not.
+                source_envelope = None
+                try:
+                    source_envelope = source["source"]
+                except (IndexError, KeyError):
+                    source_envelope = None
                 self._connection.execute(
                     "INSERT INTO artifact_versions(version_id,artifact_id,"
                     "filename,content_type,size_bytes,checksum,path,"
                     "snapshot_path,producing_cell_id,frame_id,created_at,"
-                    "env_snapshot_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "env_snapshot_id,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         version_id,
                         artifact_id,
@@ -642,6 +928,7 @@ class ArtifactRepository:
                         frame_id,
                         now,
                         source["env_snapshot_id"],
+                        source_envelope,
                     ),
                 )
                 self._connection.execute(
@@ -684,17 +971,17 @@ class ArtifactRepository:
         packages_json = json.dumps(packages, separators=(",", ":"))
         remote = snapshot.get("remote") or []
         remote_json = json.dumps(remote, separators=(",", ":"), sort_keys=True)
-        basis = "|".join(
-            [
-                snapshot.get("kind") or "",
-                snapshot.get("python_version") or "",
-                snapshot.get("implementation") or "",
-                snapshot.get("platform") or "",
-                packages_json,
-                remote_json,
-            ]
+        snapshot_id = env_snapshot_id(
+            kind=snapshot.get("kind"),
+            python_version=snapshot.get("python_version"),
+            implementation=snapshot.get("implementation"),
+            platform=snapshot.get("platform"),
+            interpreter=snapshot.get("interpreter"),
+            environment_name=snapshot.get("environment_name"),
+            generation_id=snapshot.get("generation_id"),
+            packages_json=packages_json,
+            remote_json=remote_json,
         )
-        snapshot_id = "env-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
         with self._lock:
             exists = self._connection.execute(
                 "SELECT 1 FROM env_snapshots WHERE snapshot_id=?", (snapshot_id,)
@@ -703,7 +990,10 @@ class ArtifactRepository:
                 self._connection.execute(
                     "INSERT INTO env_snapshots(snapshot_id,created_at,kind,"
                     "python_version,implementation,platform,package_count,"
-                    "packages_json,remote_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "packages_json,remote_json,interpreter,environment_name,"
+                    "generation_id,generation_confidence,packages_unavailable,"
+                    "provenance) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         snapshot_id,
                         self._clock_ms(),
@@ -714,6 +1004,17 @@ class ArtifactRepository:
                         int(snapshot.get("package_count") or len(packages)),
                         packages_json,
                         remote_json if remote else None,
+                        snapshot.get("interpreter"),
+                        snapshot.get("environment_name"),
+                        snapshot.get("generation_id"),
+                        # Written now means addressed with its generation in
+                        # the basis, so it cannot be shared by a later kernel.
+                        "verified" if snapshot.get("generation_id") else None,
+                        snapshot.get("packages_unavailable"),
+                        # Measured from a kernel generation, or assumed from
+                        # this process? The fallback path has always said so
+                        # and the INSERT dropped it.
+                        snapshot.get("provenance"),
                     ),
                 )
                 self._connection.commit()
@@ -806,6 +1107,20 @@ class ArtifactRepository:
             rows = self._connection.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
+    def list_artifact_names(self) -> list[dict]:
+        """Store-wide ``(filename, artifact_id, latest_version_id)`` rows.
+
+        The submission-evidence gatherer needs exactly these three columns
+        per artifact. ``list_artifacts`` joins versions and sorts by
+        recency for the UI's benefit — work that path discards, on a call
+        that runs while the kernel worker blocks on the host-call lock.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT filename,artifact_id,latest_version_id FROM artifacts"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def resolve_artifact_path(self, ident: str) -> str | None:
         with self._lock:
             row = self._connection.execute(
@@ -823,23 +1138,54 @@ class ArtifactRepository:
             ).fetchone()
         return row["p"] if row else None
 
-    def version_for_path(self, path: str) -> str | None:
+    def version_for_path(
+        self, path: str, *, root_frame_id: str | None, project_id: str
+    ) -> str | None:
+        """The version a path belongs to, within one session.
+
+        Scope is keyword-only and required, so an unscoped call is
+        unrepresentable rather than defaulted. It has to be: `artifact_versions`
+        carries no project column, this was the one artifact read keyed on a
+        filesystem path rather than an id, and the identity fallback below scans
+        *every* row in the database. An agent could hand it any absolute path
+        and learn whether another project held a version for it -- and the id it
+        got back then passed unvalidated into `prov_record`, whose lineage read
+        returns the input version's filename and path. An existence oracle that
+        escalates to disclosure.
+
+        The predicates go into both SELECTs rather than filtering afterwards.
+        Post-filtering is wrong and not merely slower: this returns one best
+        candidate, so discarding a foreign winner would answer None even when an
+        in-scope version for the same path exists further down the list.
+        """
+        root_clause = (
+            "a.root_frame_id=?"
+            if root_frame_id is not None
+            else "a.root_frame_id IS NULL"
+        )
+        root_args: tuple = (root_frame_id,) if root_frame_id is not None else ()
+        scope_args = (project_id, *root_args)
         with self._lock:
             exact = self._connection.execute(
-                "SELECT version_id,created_at,rowid AS version_rowid "
-                "FROM artifact_versions WHERE path=? "
-                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                (str(path),),
+                "SELECT v.version_id,v.created_at,v.rowid AS version_rowid "
+                "FROM artifact_versions v "
+                "JOIN artifacts a ON a.artifact_id=v.artifact_id "
+                f"WHERE a.project_id=? AND {root_clause} AND v.path=? "
+                "ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1",
+                (*scope_args, str(path)),
             ).fetchone()
             identity = self._identify_file(path)
             if identity is None:
                 return exact["version_id"] if exact else None
             if exact:
                 candidates = self._connection.execute(
-                    "SELECT version_id,path FROM artifact_versions WHERE "
-                    "created_at>? OR (created_at=? AND rowid>?) "
-                    "ORDER BY created_at DESC, rowid DESC",
+                    "SELECT v.version_id,v.path FROM artifact_versions v "
+                    "JOIN artifacts a ON a.artifact_id=v.artifact_id "
+                    f"WHERE a.project_id=? AND {root_clause} AND "
+                    "(v.created_at>? OR (v.created_at=? AND v.rowid>?)) "
+                    "ORDER BY v.created_at DESC, v.rowid DESC",
                     (
+                        *scope_args,
                         exact["created_at"],
                         exact["created_at"],
                         exact["version_rowid"],
@@ -847,8 +1193,11 @@ class ArtifactRepository:
                 ).fetchall()
             else:
                 candidates = self._connection.execute(
-                    "SELECT version_id,path FROM artifact_versions "
-                    "ORDER BY created_at DESC, rowid DESC"
+                    "SELECT v.version_id,v.path FROM artifact_versions v "
+                    "JOIN artifacts a ON a.artifact_id=v.artifact_id "
+                    f"WHERE a.project_id=? AND {root_clause} "
+                    "ORDER BY v.created_at DESC, v.rowid DESC",
+                    scope_args,
                 ).fetchall()
         for candidate in candidates:
             if self._identify_file(candidate["path"]) == identity:
@@ -869,9 +1218,15 @@ class ArtifactRepository:
                 (artifact_id,),
             ).fetchone()
             rows = self._connection.execute(
+                # `source` is the retrieval provenance envelope. It was
+                # written on every retrieved version and selected by nothing,
+                # so a figure built on a live API fetch was indistinguishable
+                # from one computed out of thin air. The gateway projects it
+                # through an allowlist before any of it reaches a client.
                 "SELECT version_id,filename,content_type,size_bytes,checksum,"
-                "producing_cell_id,frame_id,created_at FROM artifact_versions "
-                "WHERE artifact_id=? ORDER BY created_at DESC, rowid DESC",
+                "producing_cell_id,frame_id,created_at,source FROM "
+                "artifact_versions WHERE artifact_id=? "
+                "ORDER BY created_at DESC, rowid DESC",
                 (artifact_id,),
             ).fetchall()
         latest_version_id = latest["latest_version_id"] if latest else None
@@ -1005,4 +1360,9 @@ class ArtifactRepository:
             self._connection.commit()
 
 
-__all__ = ["ArtifactRepository", "file_identity", "same_file_path"]
+__all__ = [
+    "ArtifactRepository",
+    "env_snapshot_id",
+    "file_identity",
+    "same_file_path",
+]

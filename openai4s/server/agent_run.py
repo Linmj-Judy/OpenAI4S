@@ -18,7 +18,11 @@ from openai4s.agent.actions import (
     has_incomplete_code_block,
     is_completion_only_cell,
 )
-from openai4s.agent.control import execute_native_batch, tool_parallel_policy
+from openai4s.agent.control import (
+    call_reaches_dispatcher,
+    execute_native_batch,
+    tool_parallel_policy,
+)
 from openai4s.agent.events import (
     ActionRouted,
     AgentEvent,
@@ -27,7 +31,11 @@ from openai4s.agent.events import (
     TextDelta,
     TurnStarted,
 )
-from openai4s.agent.finalize import execute_finalize_action
+from openai4s.agent.finalize import (
+    execute_finalize_action,
+    execution_evidence,
+    note_execution_evidence,
+)
 from openai4s.agent.models import ExecutionOutcome, ModelReply, RunState
 from openai4s.agent.runtime import format_observation
 from openai4s.server.completions import action_narration, outcome_narration
@@ -45,6 +53,47 @@ from openai4s.tools import (
 
 def _never_cancelled() -> bool:
     return False
+
+
+def _env_switch_notice(exc: BaseException) -> str:
+    """What the model is told when a pending environment switch failed.
+
+    This used to interpolate ``{exc}`` and the raiser is not an author writing
+    for a reader: ``apply_pending`` reaches ``_apply_pending_env`` and on to
+    ``_spawn_kernel`` -> ``subprocess.Popen``, so the text is whatever the OS
+    produced -- an interpreter path under someone's home, the argv of a failed
+    spawn, and, when the failure came from a broker or a provider probe, a
+    token. Two sinks carry it out of this process: it is appended to the
+    model's message history, which goes to the provider on the next turn and
+    into the exported session package, and to the observation the Timeline
+    renders.
+
+    An earlier pass sent it through ``redacted_detail`` and called that enough.
+    It is not: redaction is a set of patterns and an exception message is
+    arbitrary, so an ordinary English sentence, a ``/srv`` path and a command
+    with no identity in it all came through every pattern intact. The message
+    is not a bounded thing that happens to need scrubbing; it is unbounded, and
+    the only safe amount of it to forward is none.
+
+    What the agent needs is the *category*, not the prose: whether to try a
+    different environment, re-run, or give up. The exception's class name is
+    that category, it comes from the type rather than from ``__str__``, and it
+    is what this returns.
+    """
+    from openai4s.server.errors import record_diagnostic, safe_type_name
+
+    # Even the class name is not free text: a type created at runtime carries
+    # whatever its creator put in the name, and this string goes to the model.
+    kind = safe_type_name(exc)
+
+    try:
+        record_diagnostic(exc, surface="agent:pending_env")
+    except Exception:  # noqa: BLE001 — a diagnostic must not break the turn
+        pass
+    return (
+        f"pending environment switch failed ({kind}); "
+        "the environment was not changed and the previous one is still active"
+    )
 
 
 def _is_action_fence(fence_char: str, info: str) -> bool:
@@ -407,7 +456,6 @@ class WebActionExecutor:
     def execute(
         self, action: Action | None, reply: ModelReply, state: RunState
     ) -> ExecutionOutcome:
-        del state
         if self.cancelled():
             if isinstance(action, NativeToolBatch):
                 return self._refuse_native(
@@ -423,7 +471,9 @@ class WebActionExecutor:
         if self.plan_mode:
             return self._capture_plan(action, reply)
         if isinstance(action, FinalizeAction):
-            return execute_finalize_action(action)
+            return execute_finalize_action(
+                action, evidence=execution_evidence(state.metadata)
+            )
         if isinstance(action, NativeToolBatch):
             kwargs = {
                 "cancelled": self.cancelled,
@@ -436,17 +486,42 @@ class WebActionExecutor:
                 kwargs["validate"] = lambda name, arguments: tool_validation_error(
                     name, arguments, self.tool_catalog
                 )
-            outcome = execute_native_batch(
-                action,
-                lambda call: self._invoke_native(call, apply_pending=False),
-                **kwargs,
-            )
+            # Count dispatched calls, not declared ones: the batch answers
+            # parse/validation/limit refusals and post-cancel remainders
+            # without ever invoking a tool, and an unknown tool name reaches
+            # invoke but is refused before the dispatcher — none executed work.
+            # Count only calls that actually reach the dispatcher, so a
+            # refused/hallucinated call cannot become finalize-time evidence.
+            # list.append is atomic under the GIL, so the parallel read waves
+            # count safely.
+            invoked: list[Any] = []
+
+            def _counted_invoke(call):
+                if call_reaches_dispatcher(
+                    call.name, self.tool_catalog, call.arguments
+                ):
+                    invoked.append(call)
+                return self._invoke_native(call, apply_pending=False)
+
+            outcome = execute_native_batch(action, _counted_invoke, **kwargs)
+            if invoked:
+                note_execution_evidence(state.metadata, tool_calls=len(invoked))
             if self.cancelled():
                 return outcome
             return self._apply_trailing_pending(outcome)
         if isinstance(action, CodeCell):
             self.apply_pending()
-            result = self.execute_cell(action)
+            cell_outcome = self.execute_cell(action)
+            # ``execute_cell`` returns the gateway's full outcome dict; legacy
+            # fakes (and any embedder) may still hand back the bare kernel
+            # result, which always came from a real execution.
+            if isinstance(cell_outcome, dict) and "result" in cell_outcome:
+                result = cell_outcome["result"]
+                executed = bool(cell_outcome.get("executed", True))
+            else:
+                result, executed = cell_outcome, True
+            if executed:
+                note_execution_evidence(state.metadata, cells=1)
             observation = format_observation(result)
             if count_code_blocks(reply.content) > 1 or has_incomplete_code_block(
                 reply.content
@@ -454,7 +529,7 @@ class WebActionExecutor:
                 observation += MULTI_CELL_NOTE
             completion = getattr(self.dispatcher(), "last_output", None)
             return self._user_observation(observation, completion=completion)
-        return self._legacy_or_nudge(reply)
+        return self._legacy_or_nudge(reply, state)
 
     def _capture_plan(
         self, action: Action | None, reply: ModelReply
@@ -524,7 +599,7 @@ class WebActionExecutor:
             self.apply_pending()
             return outcome
         except Exception as exc:  # noqa: BLE001 — keep native history replayable
-            notice = f"[Tool error] pending environment switch failed: {exc}"
+            notice = f"[Tool error] {_env_switch_notice(exc)}"
             history = [dict(message) for message in outcome.history_messages]
             if history:
                 target = next(
@@ -540,13 +615,14 @@ class WebActionExecutor:
             observation = str(outcome.observation or "") + "\n" + notice
             return ExecutionOutcome(tuple(history), observation=observation)
 
-    def _legacy_or_nudge(self, reply: ModelReply) -> ExecutionOutcome:
+    def _legacy_or_nudge(self, reply: ModelReply, state: RunState) -> ExecutionOutcome:
         if self.tool_catalog is None:
             calls, errors = parse_tool_calls(reply.content)
         else:
             calls, errors = parse_tool_calls(reply.content, self.tool_catalog)
         if calls or errors:
             parts: list[str] = []
+            executed = 0
             for call in calls[:MAX_TOOL_CALLS_PER_TURN]:
                 if self.cancelled():
                     errors.append("remaining legacy tool calls skipped: cancelled")
@@ -554,14 +630,25 @@ class WebActionExecutor:
                 try:
                     text, _ok = self._invoke_native(call)
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"pending environment switch failed: {exc}")
+                    errors.append(_env_switch_notice(exc))
                     break
                 parts.append(text)
+                # Count only calls that reach the dispatcher: an unknown name
+                # or invalid arguments are refused before it and executed
+                # nothing, so they must not back an execution-shaped finalize.
+                if call_reaches_dispatcher(
+                    (call or {}).get("name"),
+                    self.tool_catalog,
+                    (call or {}).get("arguments"),
+                ):
+                    executed += 1
+            if executed:
+                note_execution_evidence(state.metadata, tool_calls=executed)
             if not self.cancelled():
                 try:
                     self.apply_pending()
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"pending environment switch failed: {exc}")
+                    errors.append(_env_switch_notice(exc))
             observation = finalize_tool_batch(parts, len(calls), errors)
         elif has_incomplete_code_block(reply.content):
             observation = INCOMPLETE_CELL_NUDGE

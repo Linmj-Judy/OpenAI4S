@@ -17,20 +17,66 @@ The retry policy is deliberately narrow:
   * a total budget, so a long Retry-After cannot silently park a turn for
     minutes.
 """
+
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import random
 import time
 import urllib.error
 import urllib.request
+from typing import Any
 
-from .models import LLMError, TransportError, parse_retry_after, status_is_retryable
+from .models import (
+    LLMError,
+    TransportError,
+    llm_failure_code,
+    parse_retry_after,
+    status_is_retryable,
+)
+
+
+def bind_call_context(fn, **context):
+    """Attach provider/cancellation to a transport without breaking injection.
+
+    The provider adapters call ``post_json(url, payload, headers, timeout)``
+    positionally, so this binds the context once at the dispatch seam instead
+    of touching all four wire adapters.
+
+    Offline tests inject their own transports at two different depths — the
+    ``openai4s.llm._post_json`` facade hook and ``transport.post_json``
+    itself — and many of those are plain four-argument callables. The
+    documented contract says they keep working, so only keywords the target
+    actually accepts are bound; anything else is dropped rather than raising
+    ``TypeError`` on a call that would otherwise have succeeded.
+    """
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # builtins and other C callables
+        return fn
+    takes_kwargs = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+    accepted: dict[str, Any] = {
+        name: value
+        for name, value in context.items()
+        if takes_kwargs or name in parameters
+    }
+    return functools.partial(fn, **accepted) if accepted else fn
+
 
 # Attempts include the first try: 3 == one initial call plus two retries.
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BASE_BACKOFF = 0.5
 DEFAULT_MAX_BACKOFF = 8.0
+# Ark's burst protector explicitly asks clients to grow traffic gradually.  A
+# full-jitter wait in [0, 0.5] can immediately collide again, so this one exact
+# controlled classification gets a slower, strictly-positive backoff.  It is
+# still governed by the same attempt count, cap, total budget and cancellation
+# polling as every other retryable transport failure.
+REQUEST_BURST_BASE_BACKOFF = 4.0
 # Ceiling on time spent sleeping across a call. A provider may advertise a
 # 300s Retry-After; honouring that inside one turn would look like a hang.
 DEFAULT_RETRY_BUDGET = 30.0
@@ -106,10 +152,45 @@ def _url_error(
     )
 
 
+#: How often a backoff wait looks up to see whether the turn was cancelled.
+#: Short enough that Stop feels immediate, long enough that a five-minute
+#: `Retry-After` costs a bounded number of checks rather than a busy loop.
+CANCEL_POLL_S = 0.25
+
+
+def _wait(delay: float, do_sleep, should_cancel) -> bool:
+    """Wait ``delay`` seconds, returning early if the turn is cancelled.
+
+    Sliced only when there is something to poll for. With no ``should_cancel``
+    the wait is a single call, which keeps the injected-sleep contract the
+    tests rely on — one sleep, one recorded delay — and avoids inventing
+    wake-ups for a caller that cannot be interrupted anyway.
+    """
+    if should_cancel is None:
+        do_sleep(delay)
+        return False
+    remaining = float(delay)
+    while remaining > 0:
+        if should_cancel():
+            return True
+        step = remaining if remaining < CANCEL_POLL_S else CANCEL_POLL_S
+        do_sleep(step)
+        remaining -= step
+    return bool(should_cancel())
+
+
 def _sleep_for(err: TransportError, attempt: int, base: float, cap: float) -> float:
     """Honour Retry-After when present, else exponential backoff with jitter."""
-    if err.retry_after is not None:
+    failure_code = llm_failure_code(err)
+    if err.retry_after is not None and (
+        err.retry_after > 0 or failure_code != "llm_request_burst"
+    ):
         return err.retry_after
+    if failure_code == "llm_request_burst":
+        backoff = min(cap, REQUEST_BURST_BASE_BACKOFF * (2 ** (attempt - 1)))
+        # Equal jitter: unlike full jitter its lower bound is non-zero, while
+        # concurrent clients still do not resynchronise on one fixed delay.
+        return random.uniform(backoff / 2.0, backoff)
     backoff = min(cap, base * (2 ** (attempt - 1)))
     # Full jitter: without it, N clients rate-limited at the same instant all
     # come back at the same instant.
@@ -127,11 +208,17 @@ def _retry_loop(
     retry_budget: float,
     should_cancel=None,
     sleep=None,
-):
+):  # noqa: C901
     # Resolved per call, not captured as a default: a default argument is
     # evaluated once at def time, which would pin the original time.sleep and
     # silently ignore any test that patches it.
     do_sleep = sleep if sleep is not None else time.sleep
+    # A retry that has already begun waiting must still be stoppable. The
+    # cancellation checks used to sit either side of a single blocking sleep,
+    # so pressing Stop one millisecond into a 300-second `Retry-After` left the
+    # turn parked for the full five minutes with nothing able to interrupt it —
+    # and the only test for it cancelled *before* the wait began, which is the
+    # case that already worked.
     spent = 0.0
     for attempt in range(1, max_attempts + 1):
         try:
@@ -168,7 +255,7 @@ def _retry_loop(
                     status=err.status,
                     retryable=False,
                 ) from err
-            do_sleep(delay)
+            _wait(delay, do_sleep, should_cancel)
             spent += delay
             if should_cancel is not None and should_cancel():
                 raise TransportError(

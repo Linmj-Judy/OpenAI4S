@@ -17,6 +17,7 @@ from .models import LLMError
 from .providers import _WIRE_DISPATCH
 from .registry import PROVIDERS, provider_spec
 from .tooling import _canonical_tool_specs
+from .transport import bind_call_context
 
 
 def supports_vision(provider: str) -> bool:
@@ -24,6 +25,25 @@ def supports_vision(provider: str) -> bool:
     # keep provider_spec's historical LLMError for unknown names.
     provider_spec(provider)
     return get_model_capabilities(provider).vision
+
+
+def supports_vision_for(cfg: LLMConfig) -> bool:
+    """Vision for the exact provider+endpoint+model triple a call would use.
+
+    ``supports_vision(provider)`` answers for the provider's *default* model at
+    its *default* endpoint, which is not what a configured session sends. A
+    session pinned to a text-only model on a vision-capable provider therefore
+    passed a caller's pre-flight check and was then refused by ``_guard_vision``
+    below -- which does resolve the triple -- turning a graceful text fallback
+    into a failed turn. Resolved exactly as ``chat`` resolves it, so the
+    pre-flight answer and the guard cannot disagree.
+    """
+    spec = provider_spec(cfg.provider)
+    return get_model_capabilities(
+        cfg.provider,
+        cfg.model or spec["model"],
+        base_url=cfg.base_url or spec["base_url"],
+    ).vision
 
 
 def _guard_vision(provider: str, messages: list[dict], *, capabilities=None) -> None:
@@ -52,6 +72,7 @@ def chat(
     tools: list[Any] | tuple[Any, ...] | None = None,
     tool_choice: Any = None,
     parallel_tool_calls: bool | None = None,
+    should_cancel=None,
     post_json,
     post_sse,
 ) -> dict[str, Any]:
@@ -97,11 +118,19 @@ def chat(
         effective_parallel = capabilities.parallel_tool_calls
     if not canonical_tools:
         effective_parallel = None
-    transport_args = {"post_sse": post_sse}
-    if wire == "openai":
-        transport_args["post_json"] = post_json
-    elif wire in ("anthropic", "gemini"):
-        transport_args = {"post_json": post_json}
+    bound_json = bind_call_context(
+        post_json, provider=cfg.provider, should_cancel=should_cancel
+    )
+    bound_sse = bind_call_context(
+        post_sse, provider=cfg.provider, should_cancel=should_cancel
+    )
+    # `responses` is SSE-only; `gemini` has no streaming adapter. The two wires
+    # that stream *and* keep a blocking fallback need both transports.
+    transport_args = {"post_sse": bound_sse}
+    if wire in ("openai", "anthropic"):
+        transport_args["post_json"] = bound_json
+    elif wire == "gemini":
+        transport_args = {"post_json": bound_json}
     reply = caller(
         messages,
         cfg,

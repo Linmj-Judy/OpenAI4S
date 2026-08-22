@@ -145,10 +145,21 @@ def test_metadata_and_version_list_are_exact_scoped_and_path_free(tmp_path):
 
     other = harness.store.new_frame(kind="turn", project_id="other", status="ready")
     foreign_service = harness.service_for(other)
-    with pytest.raises(PermissionError, match="outside the current session"):
-        foreign_service.artifact_metadata({"artifact_id": first["artifact_id"]})
-    with pytest.raises(PermissionError, match="outside the current session"):
-        foreign_service.artifact_versions({"artifact_id": first["artifact_id"]})
+    # A foreign artifact is reported exactly as an absent one. This asserted
+    # `PermissionError, match="outside the current session"` -- a distinct type
+    # *and* a message saying the object exists somewhere, which is a working
+    # existence oracle and most of what an enumerator wants. `_scoped_version`
+    # already collapsed the two and its docstring explains why; `_scoped_artifact`
+    # did not, so the two helpers disagreed twelve lines apart. See
+    # `tests/test_artifact_scope_closure.py` for the indistinguishability pair.
+    for call in (
+        foreign_service.artifact_metadata,
+        foreign_service.artifact_versions,
+    ):
+        with pytest.raises(KeyError, match="in the current session"):
+            call({"artifact_id": first["artifact_id"]})
+        with pytest.raises(KeyError, match="in the current session"):
+            call({"artifact_id": "a-does-not-exist"})
 
 
 def test_restore_copies_verified_snapshot_to_fresh_version_and_lineage(tmp_path):
@@ -290,3 +301,37 @@ def test_restore_refuses_workspace_drift_and_rolls_back_store_failure(
         harness.store.get_artifact(first["artifact_id"])["latest_version_id"]
         == second["version_id"]
     )
+
+
+def test_a_failed_save_artifact_step_names_the_missing_file(tmp_path):
+    """The activity card for a raised handler carries the reason, not "failed".
+
+    In a real Web session a cell's ``savefig`` landed outside the workspace,
+    and the follow-up save_artifact raised ``no such file: bar_chart.png`` —
+    but the "Saving bar_chart.png" card showed only the word "failed", so the
+    one string that explained the mismatch never reached the user.
+    """
+    harness = ArtifactControlHarness(tmp_path)
+    harness.store.set_permission_rule(
+        scope="conversation",
+        scope_id=harness.root_frame_id,
+        tool="save_artifact",
+        pattern="*",
+        decision="allow",
+    )
+    dispatcher = HostDispatcher(
+        harness.config,
+        frame_id=harness.root_frame_id,
+        workspace=harness.workspace,
+    )
+    steps: list[dict] = []
+    dispatcher.on_step = steps.append
+
+    with pytest.raises(FileNotFoundError):
+        dispatcher("save_artifact", [{"path": "bar_chart.png"}])
+
+    end = next(step for step in steps if step.get("phase") == "end")
+    assert end["status"] == "error"
+    assert "bar_chart.png" in end["summary"]
+    assert end["summary"].startswith("failed: ")
+    assert "bar_chart.png" in end["output"]["error"]

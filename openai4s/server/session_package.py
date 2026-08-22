@@ -29,6 +29,9 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from openai4s.storage.annotations import settle_restored_annotation
+from openai4s.storage.memories import MemoryLimitError
+from openai4s.storage.plans import PLAN_STATUSES
 from openai4s.storage.snapshots import WorkspaceCAS
 
 PACKAGE_FORMAT = "openai4s.session"
@@ -114,6 +117,59 @@ _REDACTED = "[REDACTED]"
 IMPORT_QUARANTINE_SETTING_PREFIX = "session:import-quarantine:"
 
 
+def _imported_plan_status(raw: Any) -> str:
+    """The status an imported plan may claim.
+
+    Two things were wrong with passing it through. It was unvalidated, and the
+    repository did not check on create either, so any string in an uploaded
+    package landed in the column -- and a plan whose status is not a real
+    status shadows every new draft for that session, because `get_by_frame`
+    prefers the newest non-discarded row.
+
+    The second is a domain point rather than a validation one. `executing` is a
+    claim that a turn is running, and no turn from the exporting daemon is
+    running here. Importing it verbatim recreates exactly the stuck row that
+    the `paused` state and the startup sweep exist to eliminate -- and it stays
+    stuck until the next restart, because that sweep only runs at boot. So it
+    arrives `paused`: the steps that finished are still finished, and the user
+    can resume it.
+    """
+    value = str(raw or "draft").strip()
+    if value == "executing":
+        return "paused"
+    return value if value in PLAN_STATUSES else "draft"
+
+
+def package_annotation(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One annotation, as an exported *record* of what happened.
+
+    Two different things were being conflated. The reservation **id** is audit
+    state -- it says which admission this pin belonged to, and dropping it
+    makes the exported history unable to answer that. The reservation **hold**
+    is live process state, and a recipient's machine has no such request: a pin
+    exported as `reserved` would be permanently invisible in their composer,
+    with nothing left to release it.
+
+    So the id travels and the hold does not. `sent` is untouched: that is a
+    fact about a turn that really happened.
+    """
+    projected = dict(row)
+    if projected.get("status") == "reserved":
+        projected["status"] = "open"
+    return projected
+
+
+def restore_annotation(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One annotation, coming back in. Normalises any stale live holder.
+
+    Applied on import and on checkpoint restore, which is where a row can
+    arrive still naming a holder -- from an older export, or from a checkpoint
+    taken mid-flight. The request that held it did not survive the gap, so the
+    only safe state is the one a user can act on.
+    """
+    return settle_restored_annotation(row)
+
+
 class SessionPackageError(ValueError):
     """A Session package is malformed, unsafe, unsupported, or incomplete."""
 
@@ -125,6 +181,174 @@ def _canonical_json(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _rows(value: Any, key: str) -> list[Any]:
+    """A projection's rows, whether it arrives bare or wrapped.
+
+    The exporter wraps most projections (``{"artifacts": [...]}``); a caller
+    holding just the list is equally valid. Accepting both is what keeps a
+    reader of this function from having to know which is which.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, Mapping):
+        inner = value.get(key)
+        if isinstance(inner, list):
+            return inner
+    return []
+
+
+def _environment_lines(snapshots: list[Any]) -> list[str]:
+    """One bullet per distinct environment that produced an artifact.
+
+    Distinct, not "the first": a session that ran a Python cell and an R cell
+    has two, and collapsing them onto one line is how an R artifact came to be
+    described by a Python freeze in the first place.
+    """
+    # Key on the environment's *identity*, not just its runtime shape. Two
+    # distinct conda environments — or kernel generations — with the same
+    # runtime, Python version and platform used to collapse into one bullet,
+    # and two R environments collapse even more readily because their Python
+    # version is empty. The file then claimed one environment and kept only the
+    # larger package count, despite promising one bullet per distinct
+    # environment.
+    seen: dict[tuple, dict[str, Any]] = {}
+    for row in snapshots:
+        if not isinstance(row, Mapping):
+            continue
+        kind = str(row.get("kind") or "unknown")
+        version = str(row.get("python_version") or "")
+        platform_name = str(row.get("platform") or "unknown")
+        environment_name = str(row.get("environment_name") or "")
+        generation_id = str(row.get("generation_id") or "")
+        key = (kind, version, platform_name, environment_name, generation_id)
+        count = row.get("package_count")
+        if not isinstance(count, int):
+            packages = row.get("packages")
+            count = len(packages) if isinstance(packages, list) else 0
+        entry = seen.get(key)
+        if entry is None:
+            seen[key] = {
+                "kind": kind,
+                "version": version,
+                "platform": platform_name,
+                "environment_name": environment_name,
+                "count": count,
+            }
+        else:
+            entry["count"] = max(entry["count"], count)
+    lines = []
+    for _key, entry in sorted(seen.items()):
+        label = f"{entry['kind']} {entry['version']}".strip()
+        if entry["environment_name"]:
+            label += f" ({entry['environment_name']})"
+        lines.append(
+            f"- runtime: {label} on {entry['platform']} — "
+            f"{entry['count']} package(s)"
+        )
+    return lines
+
+
+def _reproduce_notes(
+    *,
+    root_frame_id: str,
+    project_name: str,
+    environment: Any,
+    artifacts: Any,
+    lineage_edges: Any,
+) -> bytes:
+    """The page a recipient reads first.
+
+    A package with per-file hashes is checkable, but only by someone who
+    already knows the command. The proposal asks for reproduction notes
+    alongside the manifest, and this is the difference between an archive
+    somebody can verify and one they actually do.
+
+    Deterministic by construction: everything below is derived from the
+    package's own contents, so exporting the same session twice produces the
+    same bytes and the file's own hash stays meaningful.
+
+    The projections are read in the shape the exporter actually builds them.
+    They were read as a bare artifact list and a single environment dict, but
+    the exporter passes ``{"artifacts": [...]}`` and ``{"generations": [...],
+    "artifact_environment_snapshots": [...]}`` — so every field below resolved
+    to its fallback and a package with complete provenance still printed
+    "runtime python unknown", "packages recorded: 0" and "0 artifact(s)". The
+    one page a recipient reads first was describing an empty archive.
+    """
+    artifact_rows = _rows(artifacts, "artifacts")
+    edges = _rows(lineage_edges, "edges")
+    env = environment if isinstance(environment, dict) else {}
+    snapshots = _rows(env.get("artifact_environment_snapshots"), "snapshots")
+    generations = _rows(env.get("generations"), "generations")
+
+    lines = [
+        f"# Reproducing {project_name or 'this session'}",
+        "",
+        "This archive is a self-contained record of one research session: the",
+        "conversation, every executed cell, the artifacts produced, and the",
+        "lineage connecting them.",
+        "",
+        "## Check it before you trust it",
+        "",
+        "```",
+        "openai4s verify-package <this-file>.openai4s-session.zip",
+        "```",
+        "",
+        "That command reads only the archive. It needs no daemon, no network,",
+        "and no configuration, so a recipient can run it before deciding",
+        "whether to trust the sender's installation at all.",
+        "",
+        "It confirms three things: every file listed in `manifest.json` matches",
+        "its recorded SHA-256, the manifest matches its own digest, and the",
+        "archive contains no file the manifest does not list.",
+        "",
+        "**It does not establish who produced the package.** Anyone able to",
+        "rewrite a payload can recompute the hashes that describe it; only a",
+        "signature would answer authorship, and this format carries none.",
+        "",
+        "## What produced it",
+        "",
+    ]
+    if snapshots:
+        for line in _environment_lines(snapshots):
+            lines.append(line)
+    else:
+        lines.append("- runtime: not recorded for any artifact in this package")
+    if generations:
+        lines.append(f"- kernel generation(s) recorded: {len(generations)}")
+    lines += [
+        f"- source session: `{root_frame_id}`",
+        "",
+        "`environment.json` carries the full package freeze per artifact",
+        "environment, plus every kernel generation this session ran.",
+        "Recreating that environment is what makes a rerun comparable;",
+        "without it, a difference in results has no attributable cause.",
+        "",
+        "## What is inside",
+        "",
+        f"- `{len(artifact_rows)}` artifact(s), with content hashes, in",
+        "  `artifacts.json`",
+        f"- `{len(edges)}` lineage edge(s) in `lineage.json`, each linking an",
+        "  input version to the output derived from it",
+        "- `notebook.json` — every cell that ran, in order",
+        "- `ledger.json` — the action ledger, including attempts that failed",
+        "- `manifest.json` — the hash of every file above",
+        "",
+        "## Rerunning it",
+        "",
+        "1. Verify the archive with the command above.",
+        "2. Recreate the environment from `environment.json`.",
+        "3. Import the package into an OpenAI4S installation, or read",
+        "   `notebook.json` directly — the cells are plain source in order.",
+        "",
+        "An imported session is quarantined read-only until you explicitly",
+        "activate it, so opening someone else's package cannot execute",
+        "anything on your machine.",
+        "",
+    ]
+    return ("\n".join(lines)).encode("utf-8")
 
 
 def _sha256(data: bytes) -> str:
@@ -296,16 +520,23 @@ class SessionPackageService:
         for name, value in os.environ.items():
             if _SECRET_KEY.search(name) and len(value) >= 8:
                 values.add(value)
-        for setting in ("llm_api_key", "model_profiles"):
+        for setting in ("llm_api_key", "agent_plan_key", "model_profiles"):
             raw = self.store.get_setting(setting)
             if not raw:
                 continue
-            if setting == "llm_api_key":
+            if setting in {"llm_api_key", "agent_plan_key"}:
                 # Resolve through the broker first. Once migrated this row holds
                 # a reference, and adding *that* to the redaction set would
                 # redact a harmless opaque string while leaving the real key —
                 # if it appeared anywhere in the export — untouched. Redaction
                 # needs the value it is redacting.
+                #
+                # An operator-injected credential has no row at all, so it is
+                # never reached here; it is covered by the environment scan
+                # above, which holds because a broker variable is named
+                # OPENAI4S_SECRET_<SCOPE>_<KEY> and every settings credential's
+                # key ends in `_api_key`. A future one that does not would need
+                # this branch to run without a row rather than a wider regex.
                 resolved = self.store.get_secret_setting(setting)
                 if resolved and len(resolved) >= 8:
                     values.add(resolved)
@@ -527,12 +758,22 @@ class SessionPackageService:
             "annotations", self.store.list_annotations(root_frame_id)
         )
         annotations = [
-            item
+            package_annotation(item)
             for item in annotations
             if str(item.get("artifact_id") or "") in safe_artifact_ids
         ]
         memories = self._bounded_records(
-            "memories", self.store.list_memories(project_id=project_id)
+            "memories",
+            # What this project owns, not what it inherits. A scoped read now
+            # merges the global tier in, and packaging those would hand the
+            # recipient the exporting installation's cross-project background
+            # re-scoped as this session's own -- a promotion nobody asked for,
+            # and a duplicate on every re-import.
+            [
+                item
+                for item in self.store.list_memories(project_id=project_id)
+                if item.get("project_id") == project_id
+            ],
         )
         step_count = int(self.store.step_count(root_frame_id) or 0)
         review_steps = self._bounded_records(
@@ -621,6 +862,13 @@ class SessionPackageService:
             **workspace_files,
             **artifact_files,
         }
+        files["REPRODUCE.md"] = _reproduce_notes(
+            root_frame_id=root_frame_id,
+            project_name=_safe_text(project.get("name") or ""),
+            environment=environment,
+            artifacts=artifact_projection,
+            lineage_edges=lineage_edges,
+        )
         for name, payload in files.items():
             if self._contains_secret_bytes(payload):
                 raise SessionPackageError(
@@ -863,6 +1111,11 @@ class SessionPackageService:
                         "frame_id",
                         "created_at",
                         "env_snapshot_id",
+                        # Where the data came from. A package whose artifacts
+                        # cannot say that is missing the half of provenance a
+                        # recipient most needs -- the environment answers "how
+                        # was this made", the source answers "from what".
+                        "source",
                     )
                 }
                 record["filename"] = filename
@@ -2313,6 +2566,11 @@ class SessionPackageService:
                     env_snapshot_id=env_map.get(
                         str(version.get("env_snapshot_id") or "")
                     ),
+                    # Carried across verbatim. Unlike ids, a retrieval envelope
+                    # is not remapped on import: it describes an event on
+                    # someone else's machine, and rewriting it would be a claim
+                    # about a retrieval this installation never made.
+                    source=version.get("source"),
                 )
                 new_artifact = str(record["artifact_id"])
                 if source_artifact:
@@ -2731,18 +2989,26 @@ class SessionPackageService:
                 confidence=item.get("confidence"),
                 steps=list(item.get("steps") or []),
                 artifact_id=artifact_map.get(str(item.get("artifact_id") or "")),
-                status=str(item.get("status") or "draft"),
+                status=_imported_plan_status(item.get("status")),
             )
             if item.get("step_status"):
                 self.store.update_plan(
                     plan["plan_id"], step_status=dict(item["step_status"])
                 )
         for item in memories.get("memories") or []:
-            self.store.add_memory(
-                project_id=new_project,
-                block=str(item.get("block") or "general"),
-                content=str(item.get("content") or ""),
-            )
+            try:
+                self.store.add_memory(
+                    project_id=new_project,
+                    block=str(item.get("block") or "general"),
+                    content=str(item.get("content") or ""),
+                )
+            except MemoryLimitError:
+                # An imported package is someone else's data and may carry rows
+                # this installation's write limits refuse. Skip that row rather
+                # than abort the import: one over-long memory would otherwise
+                # make a whole session permanently unimportable, and accepting
+                # it would let an import plant an item no live write could.
+                continue
         for item in review.get("annotations") or []:
             artifact_id = artifact_map.get(str(item.get("artifact_id") or ""))
             if not artifact_id:
@@ -2755,7 +3021,13 @@ class SessionPackageService:
                 rel_y=float(item.get("rel_y") or 0),
                 body=str(item.get("body") or ""),
             )
-            status = str(item.get("status") or "open")
+            # Normalised on the way in. A package can carry a row that still
+            # names a holder -- an older export, or one taken mid-flight -- and
+            # the request that held it did not survive the transfer. Left
+            # as-is, `reserved` would be rejected outright by the public status
+            # whitelist, and an import would fail on a session that is
+            # otherwise perfectly valid.
+            status = str(restore_annotation(item).get("status") or "open")
             if status != "open":
                 self.store.update_annotation(annotation["annotation_id"], status=status)
         for item in review.get("activity_steps") or []:
@@ -2763,9 +3035,11 @@ class SessionPackageService:
             status = (
                 "done"
                 if source_status in {"done", "completed", "pass", "passed"}
-                else "error"
-                if source_status in {"error", "failed", "failure"}
-                else "stopped"
+                else (
+                    "error"
+                    if source_status in {"error", "failed", "failure"}
+                    else "stopped"
+                )
             )
             step_id = f"s-{uuid.uuid4().hex[:12]}"
             self.store.add_step(

@@ -26,6 +26,7 @@ Protocol (JSON-per-line):
  protocol IN (host -> worker): execute requests AND host_response frames
  protocol OUT (worker -> host): host_call / stdout_chunk / final response frames
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -41,9 +42,43 @@ import threading
 import time
 import traceback
 
-MAX_OUTPUT = 1_000_000  # 1MB head cap on captured cell output
+MAX_OUTPUT = 1_000_000  # 1M-character head cap on captured cell output
 _DISCARD_BUDGET = 8  # bounded discard for desync
 _HOST_CALL_WIRE_CAP = 15_000_000  # 15MB host_call payload cap
+#: One streamed chunk. A `write()` used to become one frame of whatever size it
+#: was handed, so `print("x" * 200_000_000)` put a single ~200MB JSON line on
+#: the pipe and the host's `readline()` materialised it whole -- ~200MB
+#: allocated on both sides at once, from one ordinary statement.
+_MAX_CHUNK_CHARS = 64_000
+#: Hard backstop for every outbound frame, whatever its type. The inbound
+#: direction has had `_HOST_CALL_WIRE_CAP` all along; this side had nothing.
+#:
+#: Derived, not chosen. It was a flat 8_000_000 with a comment claiming it sat
+#: "above the largest legitimate frame (a response carries stdout and stderr,
+#: each capped at MAX_OUTPUT)" -- true only for ASCII. MAX_OUTPUT counts
+#: CHARACTERS and this counts BYTES, and one character is up to 4 bytes in
+#: UTF-8 and up to 6 in JSON's `\uXXXX` escape. Measured: both streams filled
+#: to the cap with CJK text, or with control characters, serialise to
+#: 12,000,059 bytes -- so a cell whose output obeyed every documented limit had
+#: its whole frame replaced by a drop note, taking stderr, the exception text,
+#: `error_lineno`, `guards` and `usage` with it. Only stdout survived, and only
+#: because the manager backfills it from the streamed chunks.
+#:
+#: Twelve, not six. `\uXXXX` is six bytes and that is what a CJK character or a
+#: control character costs -- but Python counts an astral character (an emoji,
+#: say) as ONE character while JSON must emit it as a surrogate pair,
+#: `\ud83d\ude00`, which is twelve. Six was the first value here and the test
+#: below caught it: `MAX_OUTPUT` characters of emoji is 12 MB per stream, and a
+#: cap derived from six would have gone on dropping exactly the frames this
+#: change exists to stop dropping.
+#:
+#: It still bounds the allocation the backstop is for: a
+#: `print("x" * 200_000_000)` is stopped just the same.
+_JSON_WORST_BYTES_PER_CHAR = 12
+_MAX_FRAME_BYTES = _JSON_WORST_BYTES_PER_CHAR * 2 * MAX_OUTPUT + 2_000_000
+#: One spelling of the marker, so the streamed tail and the captured result
+#: cannot disagree about what happened.
+_TRUNCATION_MARKER = f"\n...(truncated at {MAX_OUTPUT} characters)"
 _MAX_CACHED_CELLS = 128  # linecache retention, evicted by counter
 
 # --- protocol channel setup (dup2 swap + publish) ---------------------
@@ -179,6 +214,33 @@ def _readline_protocol() -> str:
 
 def _write_frame(obj: dict) -> None:
     line = json.dumps(obj, ensure_ascii=False) + "\n"
+    if len(line.encode("utf-8", "replace")) > _MAX_FRAME_BYTES:
+        # Never put a frame on the wire that the host would have to
+        # materialise whole. Replaced rather than truncated: a truncated JSON
+        # line is not a frame at all, and the reader would desynchronise on it.
+        note = (
+            f"kernel dropped an oversized {obj.get('type', 'unknown')!r} "
+            f"frame (>{_MAX_FRAME_BYTES} bytes)"
+        )
+        # A dropped `response` leaves the host waiting for an id that will
+        # never arrive -- `Kernel.execute` blocks until the watchdog kills the
+        # worker, which reads to the user as a hang rather than as a refusal.
+        # So the replacement keeps the contract: same type, same id, no
+        # payload, and an error that says what happened. Capping the fields
+        # above is what stops this being reached; this is what stops the next
+        # unbounded field being a hang instead of a message.
+        if obj.get("type") == "response" and obj.get("id"):
+            replacement: dict = {
+                "type": "response",
+                "id": obj.get("id"),
+                "stdout": "",
+                "stderr": "",
+                "error": note,
+                "interrupted": bool(obj.get("interrupted")),
+            }
+        else:
+            replacement = {"type": "log", "msg": note}
+        line = json.dumps(replacement, ensure_ascii=False) + "\n"
     with _write_lock():
         out = _proto_out()
         out.write(line)
@@ -219,6 +281,7 @@ def _peak_rss_kb() -> int:
 
 _HOST_CALL_SEQ = 0
 _ACTIVE_CELL_ID: list[str | None] = [None]
+_ACTIVE_CELL_ORIGIN = [""]
 
 
 def _attach_cell_context(method: str, args: list) -> list:
@@ -231,7 +294,15 @@ def _attach_cell_context(method: str, args: list) -> list:
     message type.
     """
     cell_id = _ACTIVE_CELL_ID[0]
-    if method != "save_artifact" or not cell_id or not args:
+    # `materialise_artifact` too. It writes a version like `save_artifact` does,
+    # and without the cell identity that version carries `producing_cell_id`
+    # NULL -- which is the exact column the end-of-cell capture matches on, so
+    # the capture could never reuse it and made a second version of the same
+    # bytes. The lineage edge stayed on the first, leaving the artifact head
+    # with no inputs.
+    if method not in ("save_artifact", "materialise_artifact") or not cell_id:
+        return args
+    if not args:
         return args
     spec = args[0]
     if not isinstance(spec, dict):
@@ -306,6 +377,78 @@ _NS: dict = {"__name__": "__openai4s__", "__builtins__": __builtins__}
 _CELL_SEQ = 0
 _LIVE_TAGS: list[str] = []
 _SKILL_LOAD_EVENT_STATE: list[object] = [None, 0]
+_SKILL_LOAD_PROTOCOL_FRAMES = [0]
+
+
+def _publish_skill_sidecar_event(
+    event: object,
+    _emit=_write_frame,
+    _cell_state=_ACTIVE_CELL_ID,
+    _frame_count=_SKILL_LOAD_PROTOCOL_FRAMES,
+) -> None:
+    """Publish one audit-attested import before user code can revoke it.
+
+    The CPython audit hook calls this sink only when the caller's code object is
+    the loader registered by a system/recovery bootstrap Cell. The sink itself
+    is never placed in the persistent user namespace.
+    """
+
+    payload = dict(event) if type(event) is dict else {}
+    event_name = payload.get("event")
+    attestation_id = payload.get("attestation_id")
+    attestation_mac = payload.get("attestation_mac")
+    if (
+        type(attestation_mac) is not str
+        or len(attestation_mac) != 64
+        or any(char not in "0123456789abcdef" for char in attestation_mac)
+    ):
+        payload = {"event": "invalid_sidecar_event"}
+        event_name = "invalid_sidecar_event"
+        attestation_id = ""
+    if event_name == "sidecar_capture_started":
+        source_sha256 = payload.get("sha256")
+        if (
+            type(attestation_id) is not str
+            or not attestation_id
+            or type(source_sha256) is not str
+            or len(source_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in source_sha256)
+        ):
+            payload = {"event": "invalid_sidecar_event"}
+    elif event_name == "invalid_sidecar_event":
+        payload = {
+            "event": "invalid_sidecar_event",
+            "attestation_id": (attestation_id if type(attestation_id) is str else ""),
+            **(
+                {"attestation_mac": attestation_mac}
+                if type(attestation_mac) is str
+                else {}
+            ),
+        }
+    else:
+        source_b64 = payload.get("source_b64")
+        if (
+            type(attestation_id) is not str
+            or not attestation_id
+            or type(source_b64) is not str
+            or len(source_b64) > 2_666_672
+        ):
+            payload = {"event": "invalid_sidecar_event"}
+    _emit(
+        {
+            "type": "skill_sidecar_load",
+            "id": _cell_state[0],
+            "event": payload,
+        }
+    )
+    _frame_count[0] += 1
+
+
+def _complete_skill_sidecar_attestations(_audit=sys.audit) -> None:
+    """End one Cell's hidden loader attestations before its response frame."""
+
+    _audit("openai4s.skill_cell_complete")
+
 
 # SIGINT discipline
 _in_user_code = [False]
@@ -357,11 +500,14 @@ def _error_lineno(tb, tag: str) -> tuple[int | None, str | None]:
 def _drain_skill_sidecar_loads() -> list[dict]:
     """Return worker-generated successful imports not reported by prior Cells.
 
-    Bootstrap can replace its event list when a generation is reinitialized;
-    list identity resets the cursor.  This is result metadata only—no extra
-    protocol reader, Host call, or sidecar execution happens here.
+    Current loaders publish a separate protocol frame as soon as execution
+    succeeds.  The visible list remains as compatibility result metadata for
+    an older bootstrap hook; the manager prefers an already-received event
+    frame when both are present.
     """
 
+    protocol_frames = _SKILL_LOAD_PROTOCOL_FRAMES[0]
+    _SKILL_LOAD_PROTOCOL_FRAMES[0] = 0
     events = _NS.get("__openai4s_skill_load_events__")
     if type(events) is not list:
         _SKILL_LOAD_EVENT_STATE[:] = [None, 0]
@@ -377,7 +523,7 @@ def _drain_skill_sidecar_loads() -> list[dict]:
     if len(captured) != len(pending):
         captured.append({"event": "invalid_sidecar_event"})
     _SKILL_LOAD_EVENT_STATE[1] = len(events)
-    return captured
+    return [] if protocol_frames else captured
 
 
 def _install_host(ns: dict) -> None:
@@ -402,18 +548,165 @@ def _install_host(ns: dict) -> None:
         _write_frame({"type": "log", "msg": f"provenance unavailable: {e}"})
 
 
-class _StreamingStdout(io.StringIO):
-    """Captures stdout AND streams stdout_chunk frames live."""
+class _BoundedBuffer(io.StringIO):
+    """A capture buffer that stops RETAINING at `MAX_OUTPUT`.
+
+    Bounding at the producer and bounding at the response builder yield the
+    same string and a completely different peak, which is why nothing caught
+    this: the visible result was always correct. `_cap` ran once the whole
+    payload was already in worker RAM. Measured on this file before the change,
+    a cell doing 200 x `sys.stderr.write('x' * 1_000_000)` peaked at 452 MB to
+    keep 1 MB of it. Peak here is the cap plus at most one incoming chunk.
+
+    An `io.StringIO` subclass rather than a bare `io.TextIOBase`: this object
+    stands in for `sys.stderr` inside user code, and a cell is entitled to find
+    the same surface the plain `StringIO` gave it before.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._retained = 0
+        #: Whether anything was dropped. Retaining exactly `MAX_OUTPUT` makes
+        #: the result indistinguishable from output that simply ended there, so
+        #: the buffer has to say so itself -- otherwise the captured stream is
+        #: silently short, which is the failure this whole change is about.
+        self.truncated = False
+
+    @property
+    def full(self) -> bool:
+        """Whether anything further would be dropped.
+
+        Read by `_bounded_format_exc`, which uses it to stop pulling chunks out
+        of the traceback generator rather than format frames it would throw
+        away one line later.
+        """
+        return self._retained >= MAX_OUTPUT
+
+    def write(self, s: str) -> int:  # type: ignore[override]
+        if not s:
+            return 0
+        room = MAX_OUTPUT - self._retained
+        if room > 0:
+            kept = s if len(s) <= room else s[:room]
+            super().write(kept)
+            self._retained += len(kept)
+            if len(kept) < len(s):
+                self.truncated = True
+        else:
+            self.truncated = True
+        # Report the length HANDED OVER, never the length retained. A short
+        # return means "partial write" to every stdlib caller: `print` treats it
+        # as a failed write and retries the remainder, which would turn a
+        # bounded stream into a loop.
+        return len(s)
+
+    def captured(self) -> str:
+        value = self.getvalue()
+        # Exactly one marker per stream, appended here rather than at each
+        # write, so a stream cut across a hundred writes still says so once.
+        return value + _TRUNCATION_MARKER if self.truncated else value
+
+
+class _StreamingStdout(_BoundedBuffer):
+    """Captures stdout AND streams stdout_chunk frames live, both bounded.
+
+    Charged as the output is produced rather than when the response is built.
+    `_cap` at the end of the cell was the only bound, and it runs far too late
+    to matter: by then the whole string is already in worker RAM, and every
+    intermediate `write` has already been forwarded verbatim as its own frame.
+
+    The retention half of that now lives in `_BoundedBuffer`, shared with cell
+    stderr. Two near-identical bounded writers in one file is how the two
+    streams drifted apart in the first place -- stdout got the fix and stderr
+    did not.
+    """
 
     def __init__(self, cell_id: str) -> None:
         super().__init__()
         self._cell_id = cell_id
+        self._streamed = 0
+        self._marked = False
+
+    def _emit(self, text: str) -> None:
+        _write_frame({"type": "stdout_chunk", "id": self._cell_id, "text": text})
 
     def write(self, s: str) -> int:  # type: ignore[override]
-        n = super().write(s)
-        if s:
-            _write_frame({"type": "stdout_chunk", "id": self._cell_id, "text": s})
-        return n
+        if not s:
+            return 0
+        super().write(s)  # retention bound and `truncated` live in the base
+
+        budget = MAX_OUTPUT - self._streamed
+        if budget > 0:
+            payload = s[:budget]
+            self._streamed += len(payload)
+            for start in range(0, len(payload), _MAX_CHUNK_CHARS):
+                self._emit(payload[start : start + _MAX_CHUNK_CHARS])
+        if self._streamed >= MAX_OUTPUT and not self._marked:
+            # Exactly one marker per cell, matching the R worker's contract.
+            self._marked = True
+            self._emit(_TRUNCATION_MARKER)
+
+        # Report the full length. `print` treats a short return as a failed
+        # write and retries, which would turn a bounded stream into a loop.
+        return len(s)
+
+
+def _cap(s: str) -> str:
+    """Head-cap a string that is ALREADY materialised.
+
+    The last resort, not the strategy: every stream a cell can grow without
+    bound is now bounded while it is being written. What is left for this are
+    the short sentences the worker composes itself, plus one that is not short
+    -- a trapped `SystemExit`'s message, which exists whole in the cell's own
+    frame before the worker ever sees it.
+
+    Module level because the `except` clauses need it, and a nested definition
+    further down `_run_cell` does not exist yet when they run.
+
+    `len` on a str counts characters, so the old "bytes" in this message was
+    wrong -- and the R worker, which does gate on bytes, says so in its own
+    units. Named for what it measures rather than made to agree by coincidence.
+    """
+    if len(s) <= MAX_OUTPUT:
+        return s
+    return s[:MAX_OUTPUT] + _TRUNCATION_MARKER
+
+
+def _bounded_format_exc(exc: BaseException) -> str:
+    """Format an exception without ever holding the whole traceback.
+
+    `traceback.format_exc()` joins every chunk first and hands the result to
+    `_cap`, which keeps the first megabyte -- so a large traceback was paid for
+    in full before anything refused it, and paid for again when the same string
+    was serialised into the response frame. Measured on a sixty-deep exception
+    chain whose links share one 1 MB message: 122 MB peak to produce 61 MB of
+    text, against 3 MB here.
+
+    `TracebackException.format()` is a generator, so the frames past the cap
+    are never formatted at all. What this does NOT bound is a single yielded
+    chunk: an exception's own message arrives as one string, so
+    `raise ValueError('x' * 200_000_000)` still costs 200 MB transiently --
+    though that string already exists in the cell's frame either way, and it is
+    never retained here. Bounding it would mean reimplementing
+    `format_exception_only`, which is a larger promise than this one makes.
+    """
+    buf = _BoundedBuffer()
+    try:
+        chunks = traceback.TracebackException.from_exception(exc).format()
+        for chunk in chunks:
+            buf.write(chunk)
+            if buf.full:
+                # Everything still inside the generator would be dropped, so
+                # stop formatting it -- that is the whole reason for using the
+                # generator form. One further chunk is pulled to tell "ended
+                # exactly at the cap" from "was cut", so the marker is never
+                # attached to complete output.
+                if next(chunks, None) is not None:
+                    buf.truncated = True
+                break
+    except BaseException:  # noqa: BLE001 - a hostile __repr__ must not eat the cell
+        buf.write(f"{type(exc).__name__}: <traceback could not be formatted>\n")
+    return buf.captured()
 
 
 def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
@@ -422,6 +715,7 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
     tag = f"<kernel:{_CELL_SEQ}>"
     _register_cell(code, tag)
     _ACTIVE_CELL_ID[0] = cell_id
+    _ACTIVE_CELL_ORIGIN[0] = origin
 
     if "host" not in _NS:
         _install_host(_NS)
@@ -435,7 +729,12 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
         pass
 
     out_buf = _StreamingStdout(cell_id)
-    err_buf = io.StringIO()
+    # Bounded as it is written. This was a plain `io.StringIO` capped in the
+    # response builder -- exactly the mistake `_StreamingStdout` exists to fix
+    # on the other stream, left standing on this one. Not streamed: there is no
+    # `stderr_chunk` frame in the protocol and inventing one would be a
+    # protocol change this does not need.
+    err_buf = _BoundedBuffer()
     real_out, real_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = out_buf, err_buf
 
@@ -487,17 +786,22 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
         else:
             # user code did `raise KeyboardInterrupt`: normal error w/ lineno.
             tb = sys.exc_info()[2]
-            error_str = traceback.format_exc()
+            error_str = _bounded_format_exc(e)
             error_lineno, error_call = _error_lineno(tb, tag)
             error_str = error_str or f"KeyboardInterrupt: {e}"
     except (SystemExit, GeneratorExit) as e:
         # exit/quit must NOT kill the worker — trap and report.
         _in_user_code[0] = False
-        error_str = f"{type(e).__name__} trapped (worker kept alive): {e}"
-    except BaseException:  # noqa: BLE001 - capture everything for the agent
+        # `_cap` around the MESSAGE, not around the finished sentence. A
+        # `SystemExit('x' * 200_000_000)` would otherwise be interpolated whole
+        # before anything looked at its size -- and capping the sentence
+        # afterwards would append a second truncation marker to a string this
+        # call already marked.
+        error_str = f"{type(e).__name__} trapped (worker kept alive): " + _cap(str(e))
+    except BaseException as exc:  # noqa: BLE001 - capture everything for the agent
         _in_user_code[0] = False
         tb = sys.exc_info()[2]
-        error_str = traceback.format_exc()
+        error_str = _bounded_format_exc(exc)
         error_lineno, error_call = _error_lineno(tb, tag)
     finally:
         _in_user_code[0] = False
@@ -514,16 +818,29 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
         except Exception:  # noqa: BLE001
             guard_report = {}
 
-    def _cap(s: str) -> str:
-        if len(s) <= MAX_OUTPUT:
-            return s
-        return s[:MAX_OUTPUT] + f"\n...(truncated at {MAX_OUTPUT} bytes)"
+    # Any loader that announced a source compile but did not prove execution
+    # remains unmatched in the manager and makes the generation unrecoverable.
+    # Clear the audit hook's frame references now that no loader frame can
+    # legitimately complete after this Cell response.
+    _complete_skill_sidecar_attestations()
 
     response = {
         "type": "response",
         "id": cell_id,
-        "stdout": _cap(out_buf.getvalue()),
-        "stderr": _cap(err_buf.getvalue()),
+        # All three were bounded while they were produced, so each already
+        # carries its own single truncation marker; capping again here would
+        # append a second one to a string that says it was cut once.
+        "stdout": out_buf.captured(),
+        "stderr": err_buf.captured(),
+        # `error` used to be capped right here and nowhere else -- and before
+        # that, not at all: an exception carrying a large message --
+        # `raise ValueError("x" * 12_000_000)`, or a traceback quoting a big
+        # repr -- pushed the whole response frame past `_MAX_FRAME_BYTES`.
+        # `_write_frame` then correctly refused to put it on the wire and sent
+        # a `log` in its place, so no response for this cell id ever arrived
+        # and `Kernel.execute` blocked until the watchdog killed the kernel.
+        # Verified: the cell had not returned after 90s. The bound now lives at
+        # the producer, which fixes the allocation the late cap never could.
         "error": error_str,
         "interrupted": interrupted,
         "trace": {"error_lineno": error_lineno, "error_call": error_call},
@@ -777,31 +1094,87 @@ def _inspect_namespace(limit: int) -> dict:
     }
 
 
-def _install_audit_hook() -> None:
-    """Arm the in-kernel dlopen guard (defense layer 3).
+def _install_audit_hook(event_key: bytes) -> bool:
+    """Arm the in-kernel dlopen guard and Skill-load attestation hook.
 
     Runs inside THIS worker process — an audit hook only sees events raised in
-    its own interpreter. Opt out with OPENAI4S_SAFETY_AUDIT_HOOK=0. Best-effort:
-    a failure here must never stop the kernel from serving cells.
+    its own interpreter. ``OPENAI4S_SAFETY_AUDIT_HOOK=0`` disables the dlopen
+    policy, but not the result-integrity event channel. Best-effort: a failure
+    here must never stop the kernel from serving cells.
     """
-    if os.environ.get("OPENAI4S_SAFETY_AUDIT_HOOK", "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        return
+    dlopen_enabled = os.environ.get(
+        "OPENAI4S_SAFETY_AUDIT_HOOK", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
     try:
         from openai4s.security.audit_hook import install
 
-        install(enabled=True)
+        def skill_event_origin() -> str:
+            return str(_ACTIVE_CELL_ORIGIN[0])
+
+        event_sink = _publish_skill_sidecar_event
+        install(
+            enabled=dlopen_enabled,
+            skill_event_sink=event_sink,
+            skill_event_origin=skill_event_origin,
+            skill_event_key=event_key,
+        )
+        # The audit hook owns the sole live publisher reference. In particular,
+        # ``import __main__`` from a Cell must not expose a callable that can
+        # manufacture manager protocol frames.
+        globals().pop("_publish_skill_sidecar_event", None)
+        return True
     except Exception as e:  # noqa: BLE001
         _write_frame({"type": "log", "msg": f"audit hook unavailable: {e}"})
+        return False
+
+
+def _initialize_manager_attestation() -> bool:
+    """Consume the one pre-Cell manager handshake and arm the hidden hook."""
+
+    raw_line = _readline_protocol()
+    if not raw_line:
+        return False
+    try:
+        request = json.loads(raw_line)
+    except ValueError:
+        return False
+    request_id = request.get("id", "unknown")
+    raw_key = request.get("skill_attestation_key")
+    if request.get("type") != "initialize" or type(raw_key) is not str:
+        _write_frame(
+            {
+                "type": "initialization_error",
+                "id": request_id,
+                "error": "missing manager attestation handshake",
+            }
+        )
+        return False
+    try:
+        event_key = bytes.fromhex(raw_key)
+    except ValueError:
+        event_key = b""
+    # Drop the protocol document before any user frame exists. The only live
+    # key reference after this helper returns is inside the hidden audit hook.
+    request.clear()
+    raw_line = ""
+    raw_key = ""
+    if len(event_key) != 32 or not _install_audit_hook(event_key):
+        _write_frame(
+            {
+                "type": "initialization_error",
+                "id": request_id,
+                "error": "invalid manager attestation handshake",
+            }
+        )
+        return False
+    _write_frame({"type": "initialized", "id": request_id})
+    return True
 
 
 def main() -> None:
     _setup_protocol_channels()
-    _install_audit_hook()
+    if not _initialize_manager_attestation():
+        return
     while True:
         raw_line = _readline_protocol()
         if not raw_line:

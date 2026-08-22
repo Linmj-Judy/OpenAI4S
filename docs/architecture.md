@@ -75,10 +75,12 @@ the in-kernel `host` singleton
 ([`openai4s/sdk/host.py`](../openai4s/sdk/host.py)):
 
 ```python
-host.web_search(...)   host.web_fetch(...)                           # networked tools
+host.web_search(...)   host.web_fetch(...)   host.web_download(...)   # networked tools
+host.materialise_artifact(version_id)                                 # D3: copy in, never read in place
 host.bash(...)          # shell — runs INSIDE the kernel process, never on the host
 host.read_file / write_file / edit_file / grep / glob / list_dir     # filesystem (workspace-jailed)
 host.llm(...)          host.delegate(...)    host.collect(...)       # models & sub-agents
+host.science.list_databases(...) / search(...)                       # structured public science APIs
 host.compute.create(...).submit_job(...)   host.fold(...)            # remote GPU (BYOC) + folding
 host.save_artifact(...) host.artifacts(...) host.view_image(...)     # versioned artifacts
 host.skills.*  host.env.use(...)  host.mcp.call(...)  host.query(...) # skills, envs, MCP, read-only SQL
@@ -104,7 +106,7 @@ host.submit_output(...)                         # scientific-cell completion
   an exact owner, queue positions, and scoped cancellation; interrupts target an
   execution ID, owner, and frozen kernel lease rather than a session-global PID.
 
-The engine is **pure Python stdlib**: the kernel is a subprocess speaking a hardened JSON-per-line protocol, the LLM client speaks OpenAI / Anthropic / Gemini wires over `urllib`, and the daemon is `http.server` + a hand-rolled WebSocket — no framework, no third-party dependency in the core.
+The engine is **pure Python stdlib**: the kernel is a subprocess speaking a hardened JSON-per-line protocol, the LLM client speaks OpenAI Chat-compatible, OpenAI Responses, Anthropic, and Gemini wires over `urllib`, and the daemon is `http.server` + a hand-rolled WebSocket — no framework, no third-party dependency in the core. Provider identities and model-profile presets live in validated process-local catalogs above those four adapters, so a deployment can add an endpoint or model without adding a router branch; a genuinely new wire still requires a focused adapter.
 
 At spawn, each worker environment is rebuilt from a strict allowlist rather
 than copied from the daemon, so provider/API/cloud secrets and loader injection
@@ -158,6 +160,33 @@ kernel, and real scientific work continues through persistent Python/R cells.
 The old fenced `tool`-block parser remains a
 silent compatibility path for saved prompts and older clients, but it is no
 longer advertised to the refactored agent.
+
+Scientific database breadth does not expand the model's tool count. The
+registry exposes only `science_list_dbs` and `science_search`; a connector
+service normalizes UniProt, RCSB PDB, Ensembl, ChEMBL, PubChem, arXiv, and
+OpenAlex records behind that pair. The same operations are available as
+`host.science.*` for loop/join-heavy code cells. Fixed HTTPS endpoints still
+pass through the normal network switch, SSRF and redirect guards, egress
+allowlist, permission/audit envelope, and untrusted-output screening. See
+[Scientific database connectors](science-connectors.md).
+
+Every search result carries a **provenance envelope**: the database, the exact
+request, the filters, when it was fetched, the normalization version, and a
+SHA-256 of the bytes upstream actually returned (per request, in the order
+made, plus one combined digest). Pass it to
+`host.save_artifact(..., source=result["provenance"])` and it is stored on the
+artifact *version* — a property of that version rather than the artifact,
+because rerunning the same analysis a month later produces the same file from
+a different retrieval. It travels into an exported session package unchanged,
+and is deliberately not remapped on import: it describes an event on someone
+else's machine.
+
+Two questions decide whether retrieved data is evidence, and neither could be
+answered before: *when was this true* (a public database is a moving target, so
+without a timestamp a changed result and a changed analysis are
+indistinguishable) and *was it the same bytes* (without a response hash, a
+rerun that quietly returned something different reads exactly like one that did
+not).
 
 Native `Tool` classes that declare `writes_files=True` are wrapped by the Web
 adapter in a per-call workspace transaction. Every write/edit is diffed and
@@ -230,9 +259,10 @@ the usual answer to the real multi-process access here — `openai4s run` and
 `openai4s init` open the database from their own process — but measurement showed
 no reader blocking to fix, and changing a live database's on-disk format on
 folklore is a bad trade), and `synchronous` stays FULL because this database holds
-an audit ledger. `foreign_keys` is ON, which is a no-op today: the schema declares
-no `REFERENCES` at all, so the pragma only ensures a future constraint would
-actually bite rather than read as documentation.
+an audit ledger. `foreign_keys` is ON. DataPro index entries are the first rows
+to use it: each references its batch with `ON DELETE CASCADE`; lifecycle
+repositories still delete both explicitly so upgraded or externally opened
+databases remain correct as well.
 
 Repositories share the `Store` connection and `RLock`; services use narrow
 ports or late-bound providers for replaceable session state. Compatibility
@@ -341,7 +371,7 @@ physical-path fallback for legacy relative rows and symlink aliases.
 
 ## The R execution channel
 
-An R Cell runs on a **persistent R kernel** — `kernel/r_worker.R` spawned by [`kernel/r_kernel.py`](../openai4s/kernel/r_kernel.py) through the *same* manager as the python worker (`Kernel(argv=…)`), speaking the same `execute`/`response` frames with the same result contract (`stdout/stderr/error/interrupted/trace.error_lineno/usage`). The R interpreter resolves from the selected env's `Rscript` → the prebuilt `r` env → `PATH`; `host.env.use("r")` retargets the channel. Differences from the python kernel, by design: the R kernel is an **analysis kernel** — no `host` object, no mid-cell RPC, completion stays on the python control plane — and its plots are captured through the workspace diff (`ggsave()` into the working directory), not a figure device. The two namespaces are separate; cells exchange data through workspace files.
+An R Cell runs on a **persistent R kernel** — `kernel/r_worker.R` spawned by [`kernel/r_kernel.py`](../openai4s/kernel/r_kernel.py) through the *same* manager as the python worker (`Kernel(argv=…)`), speaking the same `execute`/`response` frames with the same result contract (`stdout/stderr/error/interrupted/trace.error_lineno/usage`). The R interpreter resolves from the selected env's `Rscript` → the prebuilt `r` env → `PATH`; `host.env.use("r")` retargets the channel. Differences from the python kernel, by design: the R kernel is an **analysis kernel** — no `host` object, no mid-cell RPC, completion stays on the python control plane — and its plots are captured through the workspace diff (`ggsave()` into the working directory), not a figure device. The two namespaces are separate; cells exchange data through workspace files. One further difference is not by design but forced by R: an R cell's captured output is bounded by the **host**, not by the worker. R is single threaded and no callback fires inside a top-level expression, so a cap living in `r_worker.R` could only act between expressions — one expression printing 300 MB still wrote all of it. The cell's two streams are therefore sunk to fifos the manager drains ([`kernel/sink_drain.py`](../openai4s/kernel/sink_drain.py)), which keeps the first megabyte, drops the rest as it arrives, and reports `stdout_seen_bytes`/`stdout_dropped_bytes` in `usage` so a capped result cannot be mistaken for output that was lost, alongside explicit `stdout_truncated`/`stderr_truncated` booleans. The booleans are stated rather than derived: a consumer asking "was this cut?" would otherwise have to know that `dropped > 0` means yes and that a marker in the text means yes, and the second is not a promise — output ending exactly at the cap was never cut, and a cell whose own text contains the marker's wording is not evidence.
 
 ## The Notebook as a read-only execution trace
 

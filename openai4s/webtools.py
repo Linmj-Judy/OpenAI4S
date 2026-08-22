@@ -10,23 +10,40 @@ the arXiv API); fetch downloads a URL and converts HTML to readable markdown/tex
 Networking can be globally gated by ``OPENAI4S_ALLOW_NETWORK`` (default on);
 the daemon's Customize → Network panel flips this.
 """
+
 from __future__ import annotations
 
 import base64
+import contextlib
+import errno
+import hashlib
 import html as _html
 import ipaddress
 import json
 import os
+import pathlib
 import re
 import socket
+import stat
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any, BinaryIO, Iterator
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_HARDLINK_UNSUPPORTED = frozenset(
+    {
+        errno.EPERM,
+        errno.EXDEV,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EPERM),
+        getattr(errno, "EOPNOTSUPP", errno.EPERM),
+    }
 )
 
 
@@ -77,6 +94,18 @@ def _host_is_private(host: str) -> bool:
     return False
 
 
+def guard_url(url: str) -> None:
+    """Refuse a URL that resolves to a private, loopback or metadata address.
+
+    Public because more than one module needs it: `_http_get` applies it per
+    redirect hop, and `host/endpoints.py` applies it to an agent-supplied
+    endpoint URL before probing. Reaching for `_guard_url` across a package
+    boundary is what `test_backend_import_contract` refuses, and rightly — a
+    guard two subsystems depend on is surface, not an internal.
+    """
+    return _guard_url(url)
+
+
 def _guard_url(url: str) -> None:
     if os.environ.get("OPENAI4S_ALLOW_PRIVATE_FETCH", "") in ("1", "true", "yes"):
         return  # explicit opt-in (e.g. fetching a local model endpoint)
@@ -91,17 +120,129 @@ def _guard_url(url: str) -> None:
 # --------------------------------------------------------------------------- #
 #  low-level fetch
 # --------------------------------------------------------------------------- #
-def _http_get(
+#: Ceiling on a single response body held in memory. Enforced while reading,
+#: not after: a cap applied to an already-allocated body is a description of
+#: how big the allocation was, not a bound on it.
+MAX_FETCH_BYTES = 32 * 1024 * 1024
+
+
+class ResponseTooLarge(RuntimeError):
+    """A body exceeded the byte ceiling and was abandoned mid-read."""
+
+
+def _read_capped(reader: Any, limit: int) -> bytes:
+    """Read at most ``limit`` bytes, then stop and say so.
+
+    `resp.read()` with no argument is what this replaces. It allocates whatever
+    the server chooses to send, which for a capability an agent can point at an
+    arbitrary URL is the server deciding how much memory this process uses.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = reader.read(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(
+                f"response exceeds {limit} bytes; aborted after {total}"
+            )
+        chunks.append(chunk)
+
+
+def _copy_capped(reader: Any, writer: BinaryIO, limit: int) -> tuple[int, str]:
+    """Stream at most ``limit`` bytes to ``writer`` while hashing them."""
+
+    total = 0
+    digest = hashlib.sha256()
+    while True:
+        chunk = reader.read(64 * 1024)
+        if not chunk:
+            return total, digest.hexdigest()
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(
+                f"response exceeds {limit} bytes; aborted after {total}"
+            )
+        writer.write(chunk)
+        digest.update(chunk)
+
+
+def _hash_capped(reader: Any, limit: int) -> tuple[int, str]:
+    """Hash at most ``limit`` bytes without accumulating them in memory."""
+
+    total = 0
+    digest = hashlib.sha256()
+    while True:
+        chunk = reader.read(64 * 1024)
+        if not chunk:
+            return total, digest.hexdigest()
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(
+                f"response exceeds {limit} bytes; aborted after {total}"
+            )
+        digest.update(chunk)
+
+
+def _path_matches_regular_inode(path: pathlib.Path, expected: os.stat_result) -> bool:
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(current.st_mode) and os.path.samestat(expected, current)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface a 3xx as an HTTPError instead of quietly following it.
+
+    `urllib.request.urlopen` follows redirects inside the stdlib, so a caller
+    that means to inspect every hop never sees the intermediate ones. That is
+    exactly what `_http_get` and `web_probe` both need to prevent, so the
+    handler lives here rather than being defined twice.
+    """
+
+    def redirect_request(self, *_args, **_kwargs):  # noqa: ANN002, ANN003
+        return None
+
+
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Build the opener per call rather than once at import.
+
+    Reusing a module-level opener looks like the obvious optimisation and it is
+    the wrong trade twice over: assembling a handler chain is nothing next to
+    an HTTP request, and an opener created at import time cannot be replaced by
+    a test that patches `urllib.request.build_opener` -- which is exactly how
+    `web_probe`'s own test drives this code.
+    """
+    return urllib.request.build_opener(_NoRedirect)
+
+
+#: The 3xx codes a redirect-following client would act on. 304 is deliberately
+#: absent -- it is a cache answer, not a redirect, and has no Location.
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+@contextlib.contextmanager
+def _open_http_response(
     url: str,
     *,
     timeout: float = 30.0,
     headers: dict | None = None,
+    method: str = "GET",
     _max_redirects: int = 5,
-) -> tuple[bytes, str, str]:
-    """GET a URL, following redirects MANUALLY so the SSRF guard is applied to
-    every hop (a public URL can 30x-redirect to a metadata/loopback target).
-    Returns (body_bytes, final_url, content_type)."""
+) -> Iterator[tuple[Any, str, str]]:
+    """Open one guarded response and keep it live for the caller to consume.
+
+    Redirects are followed manually so the SSRF and egress guards apply to every
+    hop. The response is always closed when the caller finishes or raises.
+    """
+
     _require_network()
+    method = str(method or "GET").upper()
+    if method not in ("GET", "HEAD"):
+        raise ValueError(f"unsupported method {method!r}; expected GET or HEAD")
     hdrs = {"User-Agent": _UA, "Accept": "*/*"}
     if headers:
         hdrs.update(headers)
@@ -114,31 +255,86 @@ def _http_get(
     from openai4s import egress
 
     for _hop in range(_max_redirects + 1):
-        # Host-stamped outbound domain allowlist. No-op unless
-        # OPENAI4S_EGRESS=allowlist; applied per hop so a public URL that
-        # 30x-redirects to a non-allowlisted domain is still fenced. Checked
-        # BEFORE the SSRF guard so a blocked domain short-circuits with a
-        # proxy-403 soft error and zero DNS/network. SSRF still guards allowed
-        # domains (a permitted host that resolves to a private/metadata IP).
         egress.check_url(cur)
         _guard_url(cur)
         if requests is not None:
-            r = requests.get(cur, headers=hdrs, timeout=timeout, allow_redirects=False)
-            if r.is_redirect and r.headers.get("Location"):
-                cur = urllib.parse.urljoin(cur, r.headers["Location"])
-                continue
-            return r.content, r.url, r.headers.get("Content-Type", "")
-        req = urllib.request.Request(cur, headers=hdrs)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-                return (
-                    resp.read(),
-                    resp.geturl(),
-                    resp.headers.get("Content-Type", ""),
+            response = requests.request(
+                method,
+                cur,
+                headers=hdrs,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+            )
+            try:
+                if response.is_redirect and response.headers.get("Location"):
+                    cur = urllib.parse.urljoin(cur, response.headers["Location"])
+                    continue
+                status_code = int(response.status_code)
+                if not 200 <= status_code < 300:
+                    response.raise_for_status()
+                    raise RuntimeError(f"HTTP request failed with status {status_code}")
+                yield (
+                    response.raw,
+                    response.url,
+                    response.headers.get("Content-Type", ""),
                 )
-        except urllib.error.HTTPError as e:  # urllib follows redirects itself
-            raise e
+                return
+            finally:
+                response.close()
+        req = urllib.request.Request(cur, headers=hdrs, method=method)
+        try:
+            # NOT `urlopen`. The stdlib opener follows redirects internally, so
+            # every hop would not pass through the guards above.
+            response = _no_redirect_opener().open(req, timeout=timeout)  # noqa: S310
+        except urllib.error.HTTPError as error:
+            location = (error.headers or {}).get("Location") if error.headers else None
+            if error.code in _REDIRECT_CODES and location:
+                error.close()
+                cur = urllib.parse.urljoin(cur, location)
+                continue
+            raise
+        with response:
+            yield (
+                response,
+                response.geturl(),
+                response.headers.get("Content-Type", ""),
+            )
+            return
     raise RuntimeError("too many redirects")
+
+
+def _http_get(
+    url: str,
+    *,
+    timeout: float = 30.0,
+    headers: dict | None = None,
+    method: str = "GET",
+    max_bytes: int | None = None,
+    _max_redirects: int = 5,
+) -> tuple[bytes, str, str]:
+    """Fetch a URL, following redirects MANUALLY so the SSRF guard is applied to
+    every hop (a public URL can 30x-redirect to a metadata/loopback target).
+
+    ``method`` may be GET or HEAD. HEAD exists so a caller can ask whether a
+    resource is there without downloading it -- a DOI existence probe was the
+    reason three bundled skills reached for raw ``urllib`` instead of this
+    function, and so bypassed the egress allowlist and this guard entirely.
+    It goes through exactly the same per-hop checks; a HEAD is a request.
+
+    Returns (body_bytes, final_url, content_type). For HEAD the body is empty.
+    """
+    method = str(method or "GET").upper()
+    limit = MAX_FETCH_BYTES if max_bytes is None else int(max_bytes)
+    with _open_http_response(
+        url,
+        timeout=timeout,
+        headers=headers,
+        method=method,
+        _max_redirects=_max_redirects,
+    ) as (reader, final_url, content_type):
+        body = b"" if method == "HEAD" else _read_capped(reader, limit)
+        return body, final_url, content_type
 
 
 # --------------------------------------------------------------------------- #
@@ -253,12 +449,43 @@ def _strip_tags(html_text: str) -> str:
 
 
 def web_fetch(
-    url: str, fmt: str = "markdown", timeout: float = 30.0, max_chars: int = 20000
+    url: str,
+    fmt: str = "markdown",
+    timeout: float = 30.0,
+    max_chars: int = 20000,
+    *,
+    method: str = "GET",
+    user_agent: str | None = None,
 ) -> dict:
-    """Fetch a URL and return its content. fmt ∈ {markdown, text, html, json}."""
+    """Fetch a URL and return its content. fmt ∈ {markdown, text, html, json}.
+
+    ``method="HEAD"`` asks only whether the resource is there, and returns no
+    ``content``. ``user_agent`` overrides the default one for services that
+    require a contactable identity -- Crossref and OpenAlex serve their "polite
+    pool" only to callers who send one, and without these two options three
+    bundled skills used raw ``urllib`` instead, which meant their requests were
+    subject to neither the egress allowlist nor the SSRF guard.
+    """
     if not re.match(r"^https?://", url, re.I):
         url = "https://" + url
-    body, final_url, ctype = _http_get(url, timeout=timeout)
+    if str(method or "GET").upper() == "HEAD":
+        # Delegated, and deliberately does not follow redirects -- see
+        # `web_probe`. Two spellings of "does this exist" that disagree about
+        # redirects is one more than anybody can keep straight, and the
+        # non-following answer is both the more informative one (doi.org's own
+        # 302/404 rather than the publisher's) and the narrower one (a single
+        # guarded request instead of a chain).
+        #
+        # No `content` key at all rather than an empty one: "" reads as "the
+        # resource is empty", when what happened is that we did not ask.
+        return {
+            **web_probe(url, timeout=timeout, user_agent=user_agent),
+            "method": "HEAD",
+        }
+    headers = {"User-Agent": user_agent} if user_agent else None
+    body, final_url, ctype = _http_get(
+        url, timeout=timeout, headers=headers, method=method
+    )
     raw = body.decode("utf-8", errors="replace")
     is_html = ("html" in ctype.lower()) or bool(re.search(r"(?i)<html", raw[:2000]))
     if fmt == "html":
@@ -278,6 +505,177 @@ def web_fetch(
         "content_type": ctype,
         "truncated": truncated,
         "content": content[:max_chars],
+        # The response exactly as it came off the wire, before decoding and
+        # before any reformatting. `content` above has been through
+        # `decode(errors="replace")` — which maps every invalid byte sequence
+        # onto the same U+FFFD — and, for JSON, through a load/dump round trip
+        # that discards the original whitespace entirely. Two materially
+        # different responses can produce identical `content`, so a hash taken
+        # over `content` cannot answer "are these the same bytes we received".
+        # These describe the complete body even when `content` is truncated.
+        "raw_sha256": hashlib.sha256(body).hexdigest(),
+        "raw_bytes": len(body),
+    }
+
+
+def web_probe(
+    url: str,
+    *,
+    timeout: float = 15.0,
+    user_agent: str | None = None,
+) -> dict:
+    """Ask whether a URL is there, and report the *origin server's own* answer.
+
+    A HEAD that follows redirects cannot answer the question a probe is usually
+    asked. ``https://doi.org/<doi>`` returns 302 for a registered DOI and 404
+    for an unregistered one; follow the 302 and you get the publisher's status
+    instead, which may be a 403 paywall for a DOI that certainly exists. So
+    this makes exactly one hop and returns what came back.
+
+    Not following is also the narrower behaviour: one guarded request rather
+    than a chain of them. The SSRF and egress checks still apply to that hop --
+    a probe is a request, and exempting it would turn this into an existence
+    oracle for the host's private network.
+
+    Returns ``{url, status, location, exists}``. ``exists`` is the 2xx/3xx
+    judgement callers actually want; ``status`` is there for the ones that need
+    to tell 401 from 404.
+    """
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    _require_network()
+    from openai4s import egress
+
+    egress.check_url(url)
+    _guard_url(url)
+
+    hdrs = {"User-Agent": user_agent or _UA, "Accept": "*/*"}
+
+    request = urllib.request.Request(url, headers=hdrs, method="HEAD")
+    try:
+        with _no_redirect_opener().open(
+            request, timeout=timeout
+        ) as response:  # noqa: S310
+            status = int(getattr(response, "status", 0) or 200)
+            location = response.headers.get("Location") or ""
+    except urllib.error.HTTPError as error:
+        status = int(error.code)
+        location = (error.headers or {}).get("Location") or ""
+    except urllib.error.URLError as error:
+        # No status could be obtained at all. Reported as a status of 0 rather
+        # than as an exception, because "unreachable" is an answer to the
+        # question asked and a caller probing a list of DOIs should not have
+        # one connection failure end the batch.
+        return {
+            "url": url,
+            "status": 0,
+            "location": "",
+            "exists": False,
+            "error": str(error.reason),
+        }
+    return {
+        "url": url,
+        "status": status,
+        "location": location,
+        "exists": 200 <= status < 400,
+    }
+
+
+def web_download(
+    url: str,
+    destination: "os.PathLike[str] | str",
+    *,
+    timeout: float = 60.0,
+    max_bytes: int = 64 * 1024 * 1024,
+    user_agent: str | None = None,
+) -> dict:
+    """Fetch a URL straight to a file, bounded, through the same guards.
+
+    `web_fetch` decodes to text, so it is the wrong shape for a ZIP or a
+    coordinate file -- which is why a bundled skill downloaded the RRUFF
+    spectra archive with raw ``urllib`` and, in doing so, skipped the egress
+    allowlist and the SSRF guard that every hop of `_http_get` applies.
+
+    The byte ceiling is the caller's, defaulting well above a real dataset and
+    well below "whatever the server feels like sending", and it is enforced
+    while streaming into a temporary sibling. Only a complete response is
+    atomically published, so a failed or oversized request cannot corrupt an
+    existing destination. Confinement of ``destination`` is deliberately NOT
+    done here: this module knows nothing about sessions or workspaces. The Host
+    service that exposes this resolves the path against the session workspace
+    first, because a capability that writes wherever it is told is a capability
+    that writes outside the session.
+    """
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    path = pathlib.Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": user_agent} if user_agent else None
+    limit = int(max_bytes)
+    if limit < 0:
+        raise ValueError("max_bytes must be non-negative")
+    stage = tempfile.TemporaryDirectory(
+        prefix=f".{path.name}.download-",
+        dir=path.parent,
+        ignore_cleanup_errors=True,
+    )
+    stage_path = pathlib.Path(stage.name)
+    temporary = stage_path / "response.part"
+    publish_link = stage_path / "publish.link"
+    verified_identity: os.stat_result | None = None
+    try:
+        with temporary.open("x+b") as target:
+            with _open_http_response(url, timeout=timeout, headers=headers) as (
+                reader,
+                final_url,
+                ctype,
+            ):
+                first_digest = _copy_capped(reader, target, limit)
+            target.flush()
+            verified_identity = os.fstat(target.fileno())
+            publication_source = publish_link
+            try:
+                os.link(temporary, publish_link, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno not in _HARDLINK_UNSUPPORTED:
+                    raise
+                # FAT-family and some network filesystems cannot create hard
+                # links. The private 0700 staging directory still lets them
+                # use atomic replace, with the same held-fd checks before and
+                # after publication. Writers to one destination must be
+                # serialized on this compatibility path.
+                publication_source = temporary
+            if not _path_matches_regular_inode(publication_source, verified_identity):
+                raise RuntimeError("download staging path changed before publication")
+
+            # Re-read the held inode before replacing an existing destination.
+            # A same-UID watcher can modify a named staging inode in place
+            # without changing its identity; catching that here preserves the
+            # previous destination instead of publishing bytes we did not
+            # receive from the guarded response.
+            target.seek(0)
+            if _hash_capped(target, limit) != first_digest:
+                raise RuntimeError("download bytes changed before publication")
+            if not _path_matches_regular_inode(publication_source, verified_identity):
+                raise RuntimeError("download staging path changed before publication")
+
+            os.replace(publication_source, path)
+            if not _path_matches_regular_inode(path, verified_identity):
+                raise RuntimeError("download destination changed during publication")
+            target.seek(0)
+            if _hash_capped(target, limit) != first_digest:
+                raise RuntimeError("download bytes changed during publication")
+            if not _path_matches_regular_inode(path, verified_identity):
+                raise RuntimeError("download destination changed during verification")
+            size, sha256 = first_digest
+    finally:
+        stage.cleanup()
+    return {
+        "url": final_url,
+        "path": str(path),
+        "bytes": size,
+        "content_type": ctype,
+        "sha256": sha256,
     }
 
 
@@ -507,9 +905,9 @@ def _arxiv_lookup(arxiv_id: str, timeout: float) -> list[dict]:
         out.append(
             {
                 "title": title,
-                "url": link_m.group(1)
-                if link_m
-                else f"https://arxiv.org/abs/{arxiv_id}",
+                "url": (
+                    link_m.group(1) if link_m else f"https://arxiv.org/abs/{arxiv_id}"
+                ),
                 "snippet": _tag("summary")[:500],
             }
         )

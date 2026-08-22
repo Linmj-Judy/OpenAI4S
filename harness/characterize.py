@@ -178,8 +178,9 @@ def _cli_max_turns(data_dir: Path) -> Mapping[str, Any]:
             "raw": {},
         }
     )
-    with mock.patch.object(loop, "Kernel", _FakeKernel), mock.patch.object(
-        loop, "chat", fake_chat
+    with (
+        mock.patch.object(loop, "Kernel", _FakeKernel),
+        mock.patch.object(loop, "chat", fake_chat),
     ):
         result = loop.Agent(
             cfg=cfg, max_turns=2, use_skills=False, allow_delegate=False
@@ -219,8 +220,9 @@ def _rate_limit_single_attempt() -> Mapping[str, Any]:
     error_type = None
     error_text = None
     content = None
-    with mock.patch("urllib.request.urlopen", urlopen), mock.patch(
-        "time.sleep", return_value=None
+    with (
+        mock.patch("urllib.request.urlopen", urlopen),
+        mock.patch("time.sleep", return_value=None),
     ):
         try:
             result = llm.chat([{"role": "user", "content": "hello"}], cfg)
@@ -248,7 +250,7 @@ def _partial_sse_hard_failure() -> Mapping[str, Any]:
     )
     deltas: list[str] = []
 
-    def fail_after_delta(url, payload, headers, timeout, on_event) -> None:
+    def fail_after_delta(url, payload, headers, timeout, on_event, **_context) -> None:
         on_event({"choices": [{"delta": {"content": "committed-delta"}}]})
         raise llm.LLMError("stream disconnected after committed delta")
 
@@ -256,9 +258,11 @@ def _partial_sse_hard_failure() -> Mapping[str, Any]:
     post_json = mock.Mock()
     error_type = None
     error_text = None
-    with mock.patch.object(llm, "_post_sse", post_sse), mock.patch.object(
-        llm, "_post_json", post_json
-    ), mock.patch.dict(os.environ, {"OPENAI4S_LLM_STREAM": "1"}):
+    with (
+        mock.patch.object(llm, "_post_sse", post_sse),
+        mock.patch.object(llm, "_post_json", post_json),
+        mock.patch.dict(os.environ, {"OPENAI4S_LLM_STREAM": "1"}),
+    ):
         try:
             llm.chat(
                 [{"role": "user", "content": "hello"}], cfg, on_delta=deltas.append
@@ -300,7 +304,12 @@ def _compaction_provider_hoist(data_dir: Path) -> Mapping[str, Any]:
 
     payloads: dict[str, dict[str, Any]] = {}
 
-    def capture_post(url, payload, headers, timeout):
+    # ``**_context`` absorbs the provider/cancellation the dispatch seam now
+    # binds onto the transport. This probe characterizes how each wire hoists
+    # the system message, which that context does not touch — but a stub whose
+    # signature is narrower than the real transport fails the call outright and
+    # would record a probe error instead of the behaviour under study.
+    def capture_post(url, payload, headers, timeout, **_context):
         if "/v1/messages" in url:
             payloads["anthropic"] = copy.deepcopy(payload)
             return {

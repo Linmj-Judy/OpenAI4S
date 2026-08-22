@@ -9,8 +9,10 @@ workbench-state, and permission services). If you change that public surface,
 update this document.
 
 Scope note: this covers the **gateway** started by `openai4s serve` /
-`./start.sh`. The minimal `openai4s/server/daemon.py` single-page UI and its
-`/run` endpoint are a separate, smaller surface and are not documented here.
+`./start.sh`, which is the only HTTP surface the package serves. A second,
+minimal server (`openai4s/server/daemon.py`, `POST /run`) was removed rather
+than documented: nothing imported it and it had none of the gateway's Host,
+Origin, token or header defences.
 
 ## 1. Transport and general behavior
 
@@ -35,12 +37,28 @@ Scope note: this covers the **gateway** started by `openai4s serve` /
   `code` is the machine-readable contract; `error` remains the human message and
   is unchanged, so the enrichment is additive. Match on `code`, never on prose —
   the message wording is not an interface and will be improved.
+  The enrichment never overwrites a field the route itself set, so on the few
+  routes that return a domain result under an error code — `POST
+  /frames/<id>/recovery/actions/<id>` answers a failed action with its whole
+  result and `409` — `status` stays that route's own value. Read the HTTP
+  status line, or `code`, when you need the transport status specifically;
+  those are always present, whereas a clobbered domain field has no second
+  copy.
   Status is too coarse to branch on alone: four distinct 400s
   (`malformed_json`, `invalid_body_type`, `invalid_cursor`, `invalid_limit`)
   need telling apart, and a client retrying `invalid_cursor` the way it retries
   a transient failure would loop on a request that can never succeed.
   `request_id` matches the `X-Request-Id` response header and the correlation id
   in the structured log line, so one id ties a user report to a server event.
+  A **background job that fails** carries the same field on its *success-path*
+  body (`200 {"status":"failed", …}` from a waited turn, plan or cell), holding
+  the id of the request that started it. It used to be absent there, and worse,
+  the log lines from inside those job threads carried an empty id: a new thread
+  starts with an empty `contextvars` context, so the id was lost at exactly the
+  boundary where the slow, failure-prone work begins. The field is **omitted,
+  never null**, when a job was built outside any request — a daemon-lifetime
+  sweep or a recovery pass — because `null` would read as "this request had no
+  id" rather than "there was no request".
 - **Success bodies are not wrapped in a `{data: …}` envelope.** Considered and
   declined: it would churn every route and every consumer to relocate
   information that is already unambiguous, and a half-finished reshape presents
@@ -48,11 +66,24 @@ Scope note: this covers the **gateway** started by `openai4s serve` /
   needs from the success side is a documented, stable shape per route, which the
   route/event inventory test enforces.
 - **WebSocket events carry a monotonic `seq` per root frame.** A client resumes
-  with `{"type":"view_session","root_frame_id":…,"since_seq":N}` and receives
-  only events after `N`; `replay_begin` reports `from_seq`/`to_seq` and
+  with `{"type":"view_session","root_frame_id":…,"since_seq":N,"epoch":E}` and
+  receives only events after `N`; `replay_begin` reports `from_seq`/`to_seq`,
+  this daemon run's `epoch`, and
   `gap: true` when the capped buffer no longer reaches back to `N+1`, so a
   client that was away too long can refetch state instead of resuming into a
   hole it cannot detect. `since_seq` absent or `0` replays the whole buffer.
+- A cursor is only meaningful inside the daemon run that issued it. The
+  sequence counter lives in the process, so a restart puts it back to zero
+  while the client still holds a cursor from the previous run — which used to
+  produce no replay frames at all and left the client believing it was caught
+  up on a stream it had entirely missed. The server now declares `gap: true`
+  in that case, detecting it either from a mismatched `epoch` or, for a client
+  that sends none, from its own counter sitting below the presented cursor.
+  The client stores the `epoch`, drops every cursor when it changes, and
+  refetches the session on `gap: true`. A cursor the server cannot place
+  replays *nothing* — the client is about to refetch, so replaying the buffer
+  from the start would render events that are immediately discarded, and a
+  fabricated cursor must never wrap around into a full replay.
   The counter does not reset between turns — a per-turn counter would make a
   stale cursor look already-satisfied and skip the new turn's first events.
   Only `broadcast` events are sequenced; point-to-point snapshots delivered on
@@ -65,9 +96,10 @@ Scope note: this covers the **gateway** started by `openai4s serve` /
 - All JSON responses are `application/json; charset=utf-8` with
   `Cache-Control: no-cache` and an explicit `Content-Length`.
 - Request bodies are JSON except the explicitly documented Session-package
-  import route, which consumes raw ZIP bytes. `Handler._body()` accepts an empty body but rejects an unparsable
-  body by returning `{}` — a malformed JSON body is **silently treated as
-  empty**, not rejected with 400.
+  import route, which consumes raw ZIP bytes. `Handler._body()` accepts an
+  empty body, but an unparsable one is rejected with `400 malformed_json`, and
+  a body that parses to something other than an object with
+  `400 invalid_body_type`. Neither is silently coerced to `{}`.
 - Query strings are parsed with `parse_qs` (every value is a list;
   handlers read `q.get("x", [default])[0]`).
 
@@ -78,28 +110,71 @@ Scope note: this covers the **gateway** started by `openai4s serve` /
   the `Host` header is rejected with `403 {"error": "cross-origin request
   refused"}`. Requests without an `Origin` header (curl, same-origin fetches)
   pass.
-- **Token gate** (only active when bound to a non-loopback address or
-  `OPENAI4S_REQUIRE_TOKEN=1`): all paths except `/health` require either the
-  `os_token` cookie or `?token=<hex>`. A `GET` carrying a valid `?token=`
-  responds `303 Location: /` and sets the cookie; a valid non-GET proceeds.
-  Anything else gets `401 {"error": "unauthorized — append ?token=… to the
-  URL"}`. On the default loopback bind there is **no authentication at all**.
+- **Token gate — on by default, including on loopback.** All paths except
+  `/health` and `/api/v1/auth/status` require a credential, in either spelling:
+  the `os_token` cookie, `Authorization: Bearer <token>` (what a generic client
+  or `curl -H` reaches for), or `X-OpenAI4S-Token` (for when something upstream
+  already owns `Authorization`). Neither header is preferred; the scheme is
+  compared caselessly per RFC 7235 and the value in constant time.
+- **`?token=` bootstraps the root page only.** A `GET` for `/` or
+  `/index.html` responds `303` with the cookie set, redirecting to the same
+  page with only the token stripped (any other query parameters survive).
+  Everywhere else it is refused — deep links included. They used to bootstrap,
+  because the rule was "any path that is not `/api/v1/*` or `/static/*`", and
+  `/preview/<id>` is neither: a link carrying a token there set the cookie and
+  then served the artifact bytes. A URL carrying a credential is a shareable
+  credential: pasted into chat, logged by proxies, kept in history, leaked by
+  `Referer`. On the root page the link buys an empty SPA shell; on a data path
+  the response *is* the payload.
+- **A `token` query parameter on a mutating request is refused outright** with
+  `401`, even when the request also carries a valid cookie or header. Ignoring
+  it meant the leaked URL worked, so the caller never discovered they were
+  shipping a secret in a URL. Send `Authorization: Bearer <token>` or
+  `X-OpenAI4S-Token` instead.
+- The token is minted once under the data dir (`access-token`, owner-only) and
+  survives restarts; it used to be per-boot, which invalidated every cookie
+  already issued. The CLI reads the same file, or `OPENAI4S_TOKEN` when the
+  daemon runs under another account.
+- `OPENAI4S_REQUIRE_TOKEN=0` disables the gate **on loopback only**, until the
+  version named by `gateway.LEGACY_TOKEN_OPT_OUT_REMOVED_IN`. It is the same variable that used to opt *in*, with its sense
+  reversed. Off loopback it is ignored: a bind anything can route to has no
+  configuration under which it should answer without a credential.
+- `GET /api/v1/auth/status` is reachable unauthenticated so a client can
+  discover it needs a credential, and answers
+  `{authenticated, auth_mode: "token"|"none", token_header}` — a mode string
+  only, never any part of the token. It previously reported `"none"`
+  unconditionally, so a daemon running with the gate on told every caller there
+  was no gate.
 
 ### Error envelope
 
-- The backend error shape is always **`{"error": "<message>"}`** with an HTTP
-  status code: raised `GatewayError(code, message)` → `{"error": message}`
-  with that code; any unhandled exception → `500 {"error": str(e)}`; the
-  `_api` catch-all → `404 {"error": "not found", "path": sub, "method": …}`.
+- The backend error shape is the enriched envelope described in §2 —
+  `{"error", "code", "status", "request_id"}` plus route-specific diagnostic
+  fields. The unenriched `{"error": "<message>"}` shape this section used to
+  describe has not been the wire format since the envelope landed; the two
+  sections contradicted each other, and the frozen artifacts agreed with the
+  wrong one because the contract capture observed bodies before enrichment ran.
+  The sources are unchanged: raised `GatewayError(code, message)`; any
+  unhandled exception → `500`; the `_api` catch-all → `404` carrying `path`
+  and `method`.
 - The frontend `api()` helper reads `j.error || j.detail`, so the Gateway's
   error text is shown. `detail` remains accepted for compatibility with
   external adapters.
-- Some handlers return errors **inside a 200 body** instead of an error
-  status: `POST /api/connectors/{id}/call` returns `{"error": str(e)}` with
-  HTTP 200 on exception, and `POST
-  /api/artifacts/{aid}/versions/{vid}/restore` maps a soft
+- An **unhandled** exception never puts its own text on the wire. It is
+  projected through `errors.public_exception` into `{"error": "internal
+  error", "code": "internal_error", "status", "request_id"}`, and the original
+  goes to the redacted `unhandled_exception` diagnostic that
+  `diagnostics.build_bundle` collects. A `GatewayError`'s message is
+  author-written and is passed through unchanged. Quote `request_id` in a
+  support report: it is this daemon's own correlation id, never an upstream
+  provider's.
+- Some handlers still return errors **inside a 200 body** instead of an error
+  status: `POST /api/artifacts/{aid}/versions/{vid}/restore` maps a soft
   `{"error": …}` result to 404 but other handlers pass soft errors through as
-  200. Do not assume "2xx ⇒ no `error` key".
+  200. Do not assume "2xx ⇒ no `error` key". `POST /api/connectors/{id}/call`
+  used to be in this list and now answers `502 connector_failed`: `api()` in
+  the web client only rejects on a non-2xx, so a connector that never ran was
+  reported to the user as one that did.
 
 ### JSON routes vs raw-bytes routes
 
@@ -113,7 +188,7 @@ or stored `Content-Type`:
 | `GET /api/artifacts/{ident}` | artifact bytes | `ident` may be a **version_id, artifact_id, or filename** (in that resolution order: `store.resolve_artifact_path` tries `artifact_versions.version_id` first, then `artifacts.artifact_id` → its latest version; the handler falls back to a filename lookup). `Content-Type` comes from stored metadata, else guessed from the filename. |
 | `GET /api/frames/{fid}/artifacts.zip` | ZIP bytes | Current Artifact versions for one session. |
 | `GET /api/projects/{pid}/artifacts.zip` | ZIP bytes | Current Artifact versions across one project. |
-| `GET /api/frames/{fid}/notebook/export?language=` | `.ipynb` or ZIP bytes | `python`/`r` returns one Notebook; omitted/`bundle` returns both plus a manifest. |
+| `GET /api/frames/{fid}/notebook/export?language=` | `.ipynb`, ZIP or Markdown bytes | `python`/`r` returns one Notebook; omitted/`bundle` returns both plus a manifest; `markdown` returns one `.md` with both languages in execution order. |
 | `GET /api/frames/{fid}/session/export` | Session ZIP bytes | Deterministic `application/vnd.openai4s.session+zip`; carries schema and SHA-256 headers. |
 | `GET /preview/{ident}` | artifact bytes | Same resolution, but `Content-Type` is **forced** to `text/html; charset=utf-8` (sandboxed iframe preview). Not under `/api`. |
 | `GET /ketcher` | HTML | Static placeholder page. |
@@ -141,11 +216,57 @@ success response body. Serializer shapes are in §4.
 | `GET /me` | Hardcoded local identity: `{"user_id":"local-dev","email":null,"provider","has_api_key","shared_api_key":false,"auth_mode":"none"}`. |
 | `GET /auth/status` | `{"authenticated":true,"auth_mode":"none"}` (always). |
 | `GET /csrf` | `{"csrf_token":"local"}` (a stub; the real CSRF defense is the Origin check). |
-| `GET|POST|PUT|PATCH /config/llm` | GET → `{provider,model,base_url,has_api_key}`. Write → persists `provider`/`model`/`base_url`; `api_key` only overwrites when non-empty; `clear_api_key:true` empties it → `{"ok":true,"has_api_key"}`. The raw key is never returned. |
-| `GET /search?q=` | `{sessions:[{id,project_id,name,task_summary}], artifacts:[{id,filename,content_type,root_frame_id,project_id}]}`; empty `q` → empty lists. |
+| `GET|POST|PUT|PATCH /config/llm` | GET → `{provider,model,base_url,has_api_key}`. Write → persists `provider`/`model`/`base_url`; `api_key` only overwrites when non-empty; `clear_api_key:true` empties it. Changing provider without a replacement key also clears the old provider-bound credential so it cannot be reinterpreted or sent to the new provider → `{"ok":true,"has_api_key"}`. The raw key is never returned. |
+| `GET /search?q=` | `{sessions:[{id,project_id,name,task_summary}], artifacts:[{id,filename,content_type,root_frame_id,project_id}], datapro:[{query,dataset_type,json_pointer,content,artifact_id,root_frame_id,project_id}]}`; empty `q` → empty lists. `datapro` searches every recursively indexed key and scalar in successful DataPro content; each hit is a logical result occurrence, so equal records at different JSON pointers remain distinct. |
 | `GET /` (i.e. `/api` or `/api/v1/`) | `{"service":"openai4s","ok":true}`. |
 
 ### Models and model profiles
+
+**Readiness is local; reachability is asked for.** Every profile carries a
+`readiness` object — `ready` / `needs_key` / `needs_model` / `unsupported` —
+derived entirely from stored state, so listing profiles costs no network at
+all. `checked_endpoint` is always `false` there, and `ready` means *the
+configuration is complete*, not that anyone answered; the detail line says so,
+because a user who read it as "verified" would be reading a stronger claim than
+the data supports.
+
+`POST /model-profiles/{id}/probe` is the only thing that contacts a provider.
+POST rather than GET because it spends the user's own quota and rate limit, and
+a GET invites a prefetch or a refresh loop to spend it for them. It refuses
+without contacting anything when readiness is not `ready` — a keyless profile's
+401 reads like an endpoint fault rather than the missing credential it is. A
+failure reports the provider's own message, redacted, because a rewritten one
+loses the detail that distinguishes a bad key from a bad model name.
+
+`gemini` and `openai_responses` are selectable protocols. Both were dispatchable
+by the LLM layer and absent from the profile menu, so a user holding a Gemini
+key had no way to say so.
+
+
+**A session binds `profile_id + revision`.** A frame used to store a model
+*string*, which answers "which model name" and not "which configuration" — and
+the two come apart in exactly the case that matters, because two profiles can
+name the same model against different providers or endpoints, and editing a
+profile rewrote it in place. A replayed session therefore reported whatever its
+profile says today.
+
+- Each profile carries `revision` and an append-only `revisions[]`. A new
+  revision is minted only when `(provider, base_url, model)` changes. A rename
+  does not, and neither does a key rotation — the credential reference is
+  derived from `(scope, profile_id)`, so revisions must share the profile id or
+  rotating a key would strand earlier revisions on an unreadable secret and
+  deleting any revision would destroy the key the others point at.
+- Binding happens on **send only**. Reading a session never binds it, so an
+  unbound legacy session stays fully readable — history, artifacts, Notebook.
+- `409 model_revision_unavailable` — the session is pinned to a revision that
+  no longer exists. Resolving to the nearest one would be the silent
+  follow-latest behaviour this replaces, wearing a number.
+- `409 model_revision_ambiguous` — a legacy session whose recorded model
+  matches more than one profile. Backfill happens only on a **unique** match;
+  an ambiguous one stays unbound and asks, because picking either would be a
+  guess presented as a fact.
+- An install with no profiles at all (driven by `.env`) binds nothing and runs.
+  An absent profile is an absent binding, not an error.
 
 | Method & path | Behavior |
 | --- | --- |
@@ -159,7 +280,7 @@ success response body. Serializer shapes are in §4.
 | `PUT|PATCH /model-profiles/{id}` | Partial edit; `api_key` only overwrites when non-empty; `clear_api_key:true` clears. Editing the active profile also syncs the live settings → masked profile; unknown id → 404. |
 | `DELETE /model-profiles/{id}` | Removes it (clears `active_model_profile` if it was active) → `{"ok":true}`. Deleting a nonexistent id still returns `{"ok":true}`. |
 
-### Projects, notes, folders
+### Projects, notes, folders, example session
 
 | Method & path | Behavior |
 | --- | --- |
@@ -178,8 +299,23 @@ success response body. Serializer shapes are in §4.
 | `PUT|PATCH /folders/{fid}` | Rename → `{"ok":true}`. |
 | `DELETE /folders/{fid}` | `{"ok":true}`. |
 | `POST|PUT|PATCH /frames/{fid}/folder` | Body `{folder_id}` (or null) → `{"ok":true}`. |
+| `GET /example/session` | `{seeded,frame_id,project_id,started,running,seeds_at_startup,error}` — state of the bundled example analysis. `started` is always `false` on a GET. |
+| `POST /example/session` | Body **must** be `{"confirm": true}`; anything else is `400 confirmation_required` and seeds nothing. Idempotent: already seeded → `{"seeded": true, "started": false}`; already running → `{"started": false, "running": true}`, which is distinguishable from a refusal. Seeding happens on a background thread, so this returns immediately and the client polls the `GET`. |
 
 ### Frames (sessions) and turns
+
+**`@file` references are version-pinned.** `@name#v-<version_id>` sends the
+frozen bytes of that exact version; it used to read the artifact's *live path*,
+so the same reference meant different bytes once a later cell overwrote the
+file. A same-project reference belonging to another session is **materialised**
+into this one (D3) when the turn is sent — not when the reference is typed, so
+an inserted-then-deleted reference leaves no Artifact and no lineage edge
+behind. Cross-project is refused with the same answer as absent.
+
+The bare `@name` spelling still works for one minor release. It resolves inside
+the calling session only, through the artifact's latest *version* rather than
+its live path, and says in the injected block that it is unpinned.
+
 
 | Method & path | Behavior |
 | --- | --- |
@@ -188,15 +324,18 @@ success response body. Serializer shapes are in §4.
 | `GET /frames/{fid}` | Frame JSON, or `{}` when not found. |
 | `PATCH /frames/{fid}` | Updates `name`/`task_summary`, broadcasts `frame_update` → frame JSON. |
 | `DELETE /frames/{fid}` | `{"ok":true}`. |
-| `GET /frames/{fid}/messages?from=&limit=&branch_id=` | Branch-projected `{"messages":[{message_id,role,content,created_at,fork_checkpoint_id}…]}`. Omitted `branch_id` selects the durable active branch; its inherited prefix and post-Revert continuation are included, while sibling/abandoned rows remain only in the audit source. `from` (default 0) and `limit` (default 300) are real slice parameters. |
+| `GET /frames/{fid}/messages?from=&limit=&branch_id=` | Branch-projected `{"messages":[{message_id,role,content,created_at,fork_checkpoint_id,artifact_refs,failure?}…]}`. `failure` is present only on a message that recorded one, and carries `{request_id,code,output_committed?}` — an allowlisted projection of the row's metadata, never the exception. It exists because reopening otherwise lost both the support id and the retry veto: the socket event is gone once the tab closes and the stored row is a sentence. `output_committed` appears only when true; absent is "no claim". Omitted `branch_id` selects the durable active branch; its inherited prefix and post-Revert continuation are included, while sibling/abandoned rows remain only in the audit source. `from` (default 0) and `limit` (default 300) are real slice parameters. **Latest-first paging:** `?newest_first=1` returns the newest page and adds `next_before_seq` + `has_earlier`; `?before_seq=<seq>` walks backwards. Without either, the response is exactly what it always was — oldest-first from `from`, and no cursor keys. It mattered because a 640-message session returned messages 0–299: the *oldest* page, with the newest 340 absent. The cursor is a `seq` bound rather than an offset, because newest-first plus OFFSET shifts on every arriving message. `has_earlier` is observed, not inferred from a short page — the branch projection can hide rows, which a client cannot tell from the end of history. `before_seq` that is not an integer is `400 invalid_cursor`. |
 | `GET /frames/{fid}/steps` | `{"steps":[…]}` (persisted semantic steps). |
-| `POST /frames/{fid}/message` | Starts a turn. Body `{request}` (or `{input_data:{request}}`), optional `model`, `plan`, `explore`, `annotation_ids`. With `wait:false` → `202 {"status":"accepted","frame_id","job_id","execution_id","owner":{"kind","id"},"queue_position"}`; default (`wait` omitted/true) blocks for the turn result. A valid sole `finalize_response` is an Engine completion (even if an earlier step ran a Cell); `host.submit_output(...)` is the only completion emitted from inside a Python Cell. Ordinary prose/results and max-turn exhaustion are not success. |
+| `POST /frames/{fid}/message` | Starts a turn. Body `{request}` (or `{input_data:{request}}`), optional `model`, `plan`, `explore`, `annotation_ids`. With `wait:false` → `202 {"status":"accepted","frame_id","job_id","execution_id","owner":{"kind","id"},"queue_position","request_id"}`; `request_id` is the local id this turn will be named by everywhere else — the failure `frame_update`, the job result, the persisted assistant message and `GET /frames/{fid}/messages` all carry the same one, and a `wait:false` client has no other synchronous chance to learn it; default (`wait` omitted/true) blocks for the turn result.
+
+When `annotation_ids` are sent, **both** branches additionally carry `annotations` and `annotation_reservation_id`. Admission is exactly-once: the pins named are claimed atomically, only what was actually claimed is quoted into the prompt, and `annotations` says what became of them — `sent` (consumed), `pending` (the turn was accepted but the consume did not confirm; they are still reserved, so neither retry them nor treat them as gone) or `none` (this request claimed nothing, because a concurrent turn won the race, and they are still the user's to send). The fields are **absent** when no pins were sent: an absent field and a field saying "none" are different claims. `annotation_reservation_id` is what `GET /frames/{fid}/admissions/{reservation_id}` is asked about after a lost response — a dropped connection, a closed tab, a reload — and it is scoped to the frame, so it is a value a client holds rather than a capability. A synchronous refusal (413/409/429, or a worker that could not be started) releases the reservation and leaves the pins `open`; a failure with **no** response is not a refusal and must not be treated as one. A valid sole `finalize_response` is an Engine completion (even if an earlier step ran a Cell); `host.submit_output(...)` is the only completion emitted from inside a Python Cell. Ordinary prose/results and max-turn exhaustion are not success. |
 | `GET /frames/{fid}/execution` | Authoritative FIFO snapshot: `{root_frame_id,owner,queue,queued_count,active_count,closed,close_reason}`. Owner/queue entries include `execution_id`, `{kind,id}` owner, status, position, branch/language/generation and resource keys when known. |
 | `POST /frames/{fid}/cancel` | Scoped cancellation. Body `{execution_id,owner:{kind,id}}` (or `owner_kind` + `owner_id`) and optional `reason` → `{ok,execution_id,owner,scope,…}`. Missing identity returns HTTP 400 with `error`; stale/mismatched identity returns `ok:false`. A queued cancellation does not affect the active owner. |
-| `GET /frames/{fid}/status` | `{"frame_id","running",kernel:{…kernel status…}}`. |
+| `GET /frames/{fid}/status` | `{"frame_id","running","status",kernel:{…kernel status…}}`. `status` is the **frame's** stored status, which `running` cannot express: `running:false` is equally true of a session that completed, one that was cancelled and one that failed, so a client reopening a session could not tell which and could not restore a failure that had already ended. |
 | `POST /frames/{fid}/feedback` | Body `{key,rating}` → `{"ok":true}`. |
 | `GET /frames/{fid}/feedback` | `{"feedback":[…]}`. |
 | `GET /frames/{fid}/session/export` | Raw deterministic Session-package ZIP with `X-Content-SHA256` and `X-OpenAI4S-Session-Schema`. It contains branch-owned messages, complete sanitized provider groups/wire state, Notebook and Artifact/lineage records, Revert cursors, evidence reviews and checkpoint plan/review/memory snapshots; secret material is rejected. |
+| `POST /sessions/verify` | Raw Session ZIP body (same limit as import) → HTTP 200 with the `verify_package` report: `{ok, format, schema_version, archive_sha256, files_verified, problems, verifies}`. Reads only the archive — no daemon state, no network, nothing admitted to the database — so a recipient can check what they were handed before deciding to import it. The frontend calls this *before* `/sessions/import` and refuses the import when it fails. `verifies` states plainly what the check does not establish: internal consistency is not authorship, which would need a signature. |
 | `POST /sessions/import` | Raw Session ZIP body (not JSON, maximum archive 128 MiB) → HTTP 201 with new `{project_id,root_frame_id,active_branch_id,kernel_state:"ended",view_only:true,trust_state:"quarantined",explicit_recovery_required:true,…}`. The entire archive is preflighted as untrusted input, all identities are remapped, permissions are downgraded, review automation is disabled, and no Kernel/hook/package code starts. The quarantine is durable: frame-scoped mutations return HTTP 423 until the user calls `POST /frames/{fid}/recovery/actions/restart_fresh` with `{"confirm":true}`; read/export/delete remain available. |
 
 ### Plan mode
@@ -204,8 +343,9 @@ success response body. Serializer shapes are in §4.
 | Method & path | Behavior |
 | --- | --- |
 | `GET /frames/{fid}/plan` | `{"frame_id","plan_id","status","plan"}` (nulls when no plan). |
-| `POST /frames/{fid}/plan/approve` | `202 {"status":"accepted","frame_id","job_id"}` — auto-execution runs in the background. |
-| `POST /frames/{fid}/plan/revise` | Body `{changes}` (or `{feedback}`); empty → `400 {"error":"changes required"}`; else `202` accepted. |
+| `POST /frames/{fid}/plan/approve` | `202 {"status":"accepted","frame_id","job_id","request_id","execution_id"}` — auto-execution runs in the background; `request_id` correlates with the failure surfaces exactly as the message route's does. `execution_id` is a real coordinator execution taken at submit, so the 202, the job poll, the socket and any failure all name the same one; a plan turn is queued behind the running turn and holds the session until it has written its own outcome, exactly like a message turn. The approve/resume routes claim the plan row before answering, and the background turn always settles that claim — `failed` when it faults, `paused` when it is cancelled, including a cancellation that arrives while it is still queued. |
+| `POST /frames/{fid}/plan/resume` | `202 {"status":"accepted","frame_id","job_id","request_id","execution_id"}` — runs only the plan's **unfinished** steps. `409 plan_not_paused` when the plan is any other status, refused synchronously: the `paused` → `executing` transition is a compare-and-swap performed *before* the 202, so of two concurrent resumes exactly one is accepted and the other is refused with the status it lost to, instead of both being handed a job that runs the same steps. A step counts as settled when it is `completed` or `failed`: `failed` is a decision the agent made and moved on from, while `in_progress` was interrupted with no record of how far it got, so it is re-run. The resume seed names the settled steps and instructs the agent not to redo them. A paused plan with nothing unfinished is marked `completed` without running a turn. |
+| `POST /frames/{fid}/plan/revise` | Body `{changes}` (or `{feedback}`); empty → `400 {"error":"changes required"}`; else `202 {"status":"accepted","frame_id","job_id","request_id","execution_id"}`. |
 | `POST /frames/{fid}/plan/discard` | Result of `runner.discard_plan` (synchronous). |
 
 ### Permissions
@@ -223,9 +363,10 @@ success response body. Serializer shapes are in §4.
 | Method & path | Behavior |
 | --- | --- |
 | `GET /frames/{fid}/annotations?artifact_id=` | `{"annotations":[annotation…]}`. |
-| `POST /frames/{fid}/annotations` | Body `{artifact_id,body` (or `text`)`,artifact_name?,x?,y?}` (`x`/`y` are 0–1 fractions; `rel_x`/`rel_y` accepted as aliases). Missing artifact_id/body → 400 → else `201 {"annotation":…}`. |
-| `PATCH|POST|PUT /annotations/{aid}` | Body `{body?,status?}` → `{"annotation":…}` or `404 {"annotation":null}`. |
-| `DELETE /annotations/{aid}` | `{"ok":true}`. |
+| `GET /frames/{fid}/admissions/{reservation_id}` | `{"reservation_id","state","annotations":[id…],"request_id","job_id"}`, or `404` when this session has no such admission. What a client asks after its 202 was lost. Scoped to the frame: a reservation id travels in a response, so it is a value a client holds and not a capability. |
+| `POST /frames/{fid}/annotations` | Body `{artifact_id,body` (or `text`)`,artifact_name?,x?,y?}` (`x`/`y` are 0–1 fractions; `rel_x`/`rel_y` accepted as aliases). Missing artifact_id/body → 400 → else `201 {"annotation":…}`. The server binds the pin to the artifact's **current version id + checksum**; a client may not supply them. On send, that exact version's bytes are read (its immutable snapshot, else the live path verified against the checksum) — a file overwritten after the pin is refused as `version_changed`, never substituted. |
+| `PATCH\|POST\|PUT /annotations/{aid}` | Body `{body?,status?}` → `{"annotation":…}`, `404`, `400 invalid_status`, or `409 annotation_reserved`. `status` is a whitelist (`open`/`sent`/`resolved`/`dismissed`); `reserved` is not publicly writable, because that state is entered only together with its holder and a row holding nothing is released by nothing. A pin currently held by an in-flight turn refuses with 409 — the check and the write are one statement, so a reservation taken concurrently is respected rather than raced. |
+| `DELETE /annotations/{aid}` | `{"ok":true}`, or `409 annotation_reserved` while a turn holds the pin. Same single-statement guard as PATCH. |
 
 ### Kernel / notebook (per-session)
 
@@ -291,7 +432,7 @@ These routes are thin Gateway adapters over `SessionDomainService` and
 | `GET /frames/{fid}/recovery/actions` | Describes enabled/disabled reasons for `restore`, `retry`, and `restart_fresh` on the current root branch. |
 | `POST /frames/{fid}/recovery/actions/{restore\|retry\|restart_fresh}` | Runs the advertised verified-recovery action under an exact recovery execution ticket. `restart_fresh` requires `{"confirm":true}` and never claims namespace restoration. |
 | `GET /frames/{fid}/kernel/variables?language=python|r` | Bounded idle-only Variable Inspector projection. It never starts a stopped language worker and returns explicit Busy/Restoring/Ended/Not Started states. |
-| `GET /frames/{fid}/notebook/export?language=` | Raw deterministic `.ipynb` for `python`/`r`; omitted or `bundle` returns a stable ZIP containing both plus a manifest. Includes `Content-Disposition` and `X-Content-SHA256`. |
+| `GET /frames/{fid}/notebook/export?language=` | Raw deterministic `.ipynb` for `python`/`r`; omitted or `bundle` returns a stable ZIP containing both plus a manifest. `markdown` returns a `text/markdown` rendering of the branch — both languages in execution order, because the interleaving is the record the split forms lose — with every cell's index, language and state revision in a citable heading, and failed cells kept and labelled. Anything else is 400. Includes `Content-Disposition` and `X-Content-SHA256`. |
 | `GET /frames/{fid}/session/export` | Raw deterministic, manifest-hashed Session package. |
 | `GET /renderers` | Safe scientific renderer descriptor catalog. |
 | `GET /artifacts/{aid}/renderer?version=&root_frame_id=` | Selects a version-bound renderer descriptor plus immutable checksum/size/provenance metadata; it never executes Artifact content. |
@@ -322,9 +463,41 @@ available through the query parameter.
 | `POST|PUT|PATCH /artifacts/{aid}/rename` | Body `{filename}`; missing → `400`; unknown → `404` → `{"ok":true,"artifact_id","filename"}`. |
 | `DELETE /artifacts/{aid}` | Deletes rows + snapshot files → `{"ok":true}`; broadcasts a *bare* `artifact_created`. |
 | `GET /artifacts/{ident}` | **Raw bytes** (see §1). |
-| `POST /uploads` | **Base64 JSON upload — not multipart.** Body `{filename?,content_base64` (or `content`)`,frame_id?,project_id?}`. Invalid base64 does not error (wart, two-tier): decoding uses `base64.b64decode` without `validate=True`, so **non-alphabet characters are silently discarded** before decoding; only when the result still has a bad length/padding (`binascii.Error`/`ValueError`) does it fall back to storing the raw string's UTF-8 bytes as-is. File lands in the session workspace (or `data_dir/uploads` without `frame_id`), is registered as a versioned artifact (`is_user_upload`), re-upload of the same name in the same frame creates a new version → `{"artifact_id","id","filename"}`. |
+| `POST /uploads` | **Base64 JSON upload — not multipart.** Body `{filename?, content_base64` (or `content`, or `content_text`)`, frame_id?, project_id?}`. Supply **exactly one** content field; two is a `400`, because which one is authoritative cannot be guessed. `content_base64`/`content` are strict base64 — whitespace is stripped (line wrapping is transport formatting) and anything else outside the alphabet is a `400`. `content_text` uploads text as UTF-8. A rejected upload writes nothing. This used to decode without `validate=True`, silently discarding stray characters so a corrupted payload decoded to different bytes with no error, and to fall back to storing the raw string's UTF-8 bytes — so a `.npy` that lost one character became an artifact containing base64 text, versioned and checksummed. File lands in the session workspace (or `data_dir/uploads` without `frame_id`), is registered as a versioned artifact (`is_user_upload`), re-upload of the same name in the same frame creates a new version → `{"artifact_id","id","filename"}`. |
 
 ### Skills / agents / specialists / connectors
+
+**Customize skill failures are real failures.** `POST /skills`,
+`PUT|PATCH /skills/{name}`, `GET /skills/{name}`, `DELETE /skills/{name}` and
+`POST /skills/import` used to answer `200` with `{"error": …}` in the body. The
+service returns soft dictionaries by design (`server/skills.py`) and still
+does; what changed is that the gateway now projects them to a status. Each
+failure carries a stable `code` — the status is derived from the code, never
+from the message:
+
+| `code` | Status | When |
+| --- | --- | --- |
+| `skill_name_required` | `400` | empty name, including an import whose frontmatter has none |
+| `skill_name_unsafe` | `400` | the name resolves outside the user skills directory (symlink or traversal). Not `403`: nothing was denied by policy, the name is unusable |
+| `skill_name_conflict` | `409` | collides with a bundled skill, which discovery would shadow anyway |
+| `skill_not_found` | `404` | no such user skill |
+| `skill_read_only` | `403` | a bundled skill cannot be edited or deleted. Not `404` — it plainly exists, and saying otherwise is a lie the user can disprove |
+| `skill_no_version_history` | `404` | version history requested for a skill with none |
+| `skill_version_storage_unavailable` | `503` | the version store is absent — a missing dependency, not a bad request |
+| `skill_write_failed` | `500` | the write itself failed (`OSError`, permissions) |
+
+Why it mattered beyond tidiness: `api()` in the web client throws only on a
+non-2xx, and the Customize editor's save handler does not inspect the body — so
+a rejected save closed the modal and told the user "saved" while nothing was
+written. These bodies also never reached `public_failure`, so they carried no
+`request_id`.
+
+The four sibling routes that already answered a real status —
+`GET /skills/{name}/versions` and `POST /skills/{name}/rollback`, plus their
+`/projects/{pid}/…` twins — keep the statuses they had (`404` and `409`
+respectively, chosen per route) and now carry the specific `code` too. Their
+statuses are deliberately **not** re-derived from the code table: that would
+change published behaviour for no stated benefit. Branch on `code`.
 
 | Method & path | Behavior |
 | --- | --- |
@@ -349,8 +522,40 @@ available through the query parameter.
 | `GET /connectors/directory` | `{"directory":[…]}` — the curated install list. |
 | `PUT|PATCH /connectors/{id}/enabled` | `{"ok":true}`. |
 | `POST /connectors/{id}/probe` | Spawns the server, lists tools; unknown id → 404. |
-| `POST /connectors/{id}/call` | Body `{tool,args}` → tool result; **exceptions are returned as `{"error":…}` with HTTP 200**. |
+| `POST /connectors/{id}/call` | Body `{tool,args}` → tool result; a failing call answers `502` with `code: "connector_failed"` (the MCP server's own message is not echoed — it quotes the argv and env it was launched with). |
 | `DELETE /connectors/{id}` | Disconnect + delete → `{"ok":true}`. |
+
+Doubao Search is the primary managed web-search product in Customize →
+Network. It shares the brokered Agent Plan credential with Ark and DataPro,
+but its dedicated test route is deliberately not the generic multi-engine
+search path: a Tavily or keyless result must never make Doubao appear healthy.
+
+| Method + path | Response / semantics |
+| --- | --- |
+| `GET /doubao-search/config` | Returns `{key_configured,ark_key_reused,provider:"doubao-search",primary:true}`; credential state is boolean and the provider label is non-secret metadata. It never returns the key, an Authorization value, or the fixed upstream endpoint. Configuration is not an authentication verdict. |
+| `POST /doubao-search/config` | Body `{agent_plan_key}`. Stores the same SecretBroker credential used by DataPro and mirrors it to the active Ark credential/profile when Ark is selected. The response contains booleans and product metadata only. |
+| `POST /doubao-search/search` | Body `{query,num_results?}` (`query` 1–100 characters; `num_results` 1–50). Calls Doubao Search directly with no fallback and returns normalized `{query,count,results:[{title,url,snippet}],source:"doubao",available,message}`. `available:true` requires the real response source to be Doubao and at least one usable result with a non-empty URL; an empty response remains unavailable. Reflected credential text is redacted before projection. |
+
+DataPro is the one managed Streamable HTTP connector and has a narrower
+product route. It is not editable or deletable through the generic connector
+API, and its generic probe is refused because `initialize` plus `tools/list`
+does not establish authentication:
+
+| Method + path | Response / semantics |
+| --- | --- |
+| `GET /datapro/config` | Credential, connector, and bundled-Skill booleans only. No key, broker reference, endpoint header, or header value is returned. An active Ark model key is reported as reused only while the active provider is Ark. |
+| `POST|PUT|PATCH /datapro/config` | Body `{agent_plan_key}`. Stores it through SecretBroker, enables the connector, drops the cached MCP session when the effective credential changes, and mirrors it to the active Ark credential/profile when Ark is selected. The response contains booleans only. |
+| `POST /datapro/search` | Body `{query,frame_id?}`. Makes a real `dataPro_search({query})` tool call through the managed connector, fully indexes the redacted result envelope returned by that call (including `structuredContent`, content blocks, text, and future fields), saves a JSON Artifact, and returns `{structuredContent,content,is_error,code,available,message,index,artifact}`. A successful `index` receipt includes `complete:true`, logical `entry_count`, equal `source_leaf_count`/`indexed_leaf_count`, and completeness digests. Only a real integer `structuredContent.code` equal to `0` **and** a complete index transaction let the UI report “专业数据集可用”; `4011` maps to `Key 无效、额度不足，或者专业数据集 Harness 未开启。`. Reflected credential text is redacted before the response, index, or Artifact is written. |
+
+The completeness receipt covers all redacted content in the result envelope
+returned by this specific DataPro call, including content blocks, text,
+unrecognized future keys, and nested values; it
+does not claim that one query has enumerated or indexed DataPro's entire remote
+corpus. The same ingestion boundary is used by the dedicated product route,
+the managed connector call, and `host.mcp.call` from the bundled Skill. A
+failed or non-integer/nonzero tool code creates no successful index batch, and
+an index transaction failure prevents an availability success from being
+projected.
 
 ### Session sharing (`shares`)
 
@@ -377,9 +582,20 @@ the route index so the surface is discoverable from one place.
 | `GET /compute/providers` | `{"providers":[…]}`. |
 | `GET /compute/local/hostinfo` | Host info snapshot. |
 | `GET /compute/jobs` | `{"jobs":[…]}`. |
-| `POST /compute/jobs` | Body `{command|code,kind("bash"),cwd?}` → job row. **Local code-exec endpoint** — protected only by the Origin check + loopback bind. |
+| `POST /compute/jobs` | Body `{command|code,kind("bash"),cwd?,deadline_s?}` → job row. `deadline_s` defaults to one hour and is refused above 24 h with `job_bad_deadline`; there is no unbounded run. **Local code-exec endpoint** — protected only by the Origin check + loopback bind. |
 | `POST /compute/jobs/{id}/cancel` | Cancel result. |
-| `GET /compute/jobs/{id}` | Job row. |
+| `GET /compute/jobs/{id}` | Job row, plus `output`. |
+
+A job row carries `status` from `queued|running|done|failed|cancelled|timeout|abandoned`.
+The last two are distinct on purpose: `timeout` is the daemon stopping a job that
+outlived its deadline, and `abandoned` is a job the previous daemon was running
+when it died — read from its receipt on the next boot, never revived, and never
+reported as `failed` (which would blame the job's own command) or `cancelled`
+(which would claim somebody meant to stop it).
+
+Output is bounded in bytes as it is read, not trimmed afterwards, so every row
+carries `seen_bytes`, `retained_bytes`, `dropped_bytes` and `truncated`. What is
+kept is the tail; `output` is prefixed with a notice when anything was dropped.
 | `GET /environments/status` | `{"environments":[{language,status,python_version,package_count,packages,preinstall}]}`. |
 | `GET /environments` | Same shape as `GET /frames/{fid}/environments`, without a session. |
 | `GET /kernel/packages` | `{"packages":[…],"preinstall":{…}}`. |
@@ -396,10 +612,19 @@ the route index so the surface is discoverable from one place.
 | `POST /memory` | Body `{content,block?("general"),project_id?}` → memory row. |
 | `GET /memory/categories?project_id=` | `{"categories":[…]}`. |
 | `GET /memory/context?project_id=` | `{"context":"- …\n- …"}`. |
+| `PATCH /memory/{id}?project_id=` | Body `{content?,block?}` → the edited row. `project_id` is required and is not defaulted, exactly as for the DELETE: an id is not authority over a project, and a cross-scope edit answers 404 rather than succeeding. Refuses empty or over-long content before the write (`memory_empty`, `memory_too_long`), and refuses a request that changes nothing (`memory_no_change`). Sets `updated_at`, which is what retention measures — an edit is a touch, so a corrected memory does not expire on the clock of the one it replaced. |
 | `DELETE /memory/{id}` | `{"ok":true}`. |
+
+`POST /memory` refuses on two distinct codes when a scope is full.
+`memory_scope_full` counts memories still inside the retention window;
+`memory_scope_full_expired` is the ceiling on rows *stored*, live or not. They
+are separate because the remedies are: one asks the user to delete a memory they
+are still using, the other rows that are not being injected at all.
 | `GET|PUT|PATCH|POST /network/status` | Write toggles `OPENAI4S_ALLOW_NETWORK` (process env + setting); always returns `{"enabled":bool}`. |
 | `GET /preferences/builtin-allowlist` | `{"enabled","egress_mode","granted":[domains],"groups"}`. |
-| `GET|PUT|PATCH|POST /search/config` | Tavily key config; write accepts `{api_key}` or `{clear_api_key}`; always returns `{"endpoint":"https://api.tavily.com/search","api_key_configured":bool}` — the key itself is never echoed. |
+| `GET|PUT|PATCH|POST /search/config` | Backup Tavily key config; write accepts `{api_key}` or `{clear_api_key}`; always returns `{"endpoint":"https://api.tavily.com/search","api_key_configured":bool}` — the key itself is never echoed. The dedicated Doubao Search route never falls back to Tavily. |
+| `GET /telemetry/consent` | `{"enabled":bool,"env_locked":bool}`. Opt-in anonymous telemetry, off by default; `env_locked` is true when `OPENAI4S_TELEMETRY` vetoes it, so the UI can disable a toggle that would otherwise do nothing. |
+| `PUT|PATCH|POST /telemetry/consent` | Body `{enabled}`. Granting records consent and mints the anonymous install id; revoking deletes both. Neither ever transmits — see `openai4s/telemetry/`. Returns the same shape as the GET. |
 
 ## 3. WebSocket contract (`/api/v1/ws`)
 
@@ -430,7 +655,13 @@ m.frame_id`.
 
 | Event `type` | Fields (beyond `root_frame_id`) | Meaning |
 | --- | --- | --- |
-| `replay_begin` / `replay_end` | — | Bracket the buffered-event replay after `view_session` mid-turn. |
+| `notebook_cell_draft` | `frame_id`, `draft_id`, `revision`, `source`, `status`, `reason` | A Notebook cell the agent is composing, before it runs. Superseded revisions are collapsed in the resume buffer so a reconnect renders only the newest. Emitted by `server/agent_run.py`. |
+| `recovery_state` | `branch_id`, `recovery_id`, `state`, `status`, `message` | A kernel-recovery attempt changing state. Emitted by `server/recovery_execution.py`. |
+| `recovery_log` | `branch_id`, `recovery_id`, plus the journal entry's own fields | One line of a recovery's journal, as it happens. Emitted by `server/recovery_control.py`. |
+| `branch_activated` | `branch_id`, `checkpoint_id`, `ok` | A branch became the session's active one, and its runtime state was reconstructed. Emitted by `server/session_domain.py`. |
+| `cursor_checkpoint_failed` | `branch_id`, `source_kind`, `source_id`, `reason`, `ok: false` | A cell or message completed but its cursor checkpoint could not be captured — so forking from that point will 409 rather than reconstruct state it does not have. Emitted by `server/session_domain.py`. |
+| `delegation_child_event` | `event`, `at`, `child` (a snapshot), plus per-event extras | A sub-agent started, progressed, or finished. Carries no `frame_id` of its own; the hub's emitter attaches `root_frame_id`. Emitted by `agent/delegation.py`. |
+| `replay_begin` / `replay_end` | — | Bracket the buffered-event replay after `view_session` mid-turn. `replay_begin` carries `from_seq`, `to_seq`, the daemon run's `epoch`, and `gap`. |
 | `text_reset` | `frame_id` | Start of a fresh streamed assistant message (clears the live bubble). |
 | `text_chunk` | `frame_id`, `block_type` (`"text"` for prose, `"tool"` for code-cell echo/stdout/errors), `chunk`; a code-cell start also carries `cell_index`, canonical `kernel_id`, and `language` | Incremental stream. The frontend uses the start metadata directly so live Notebook grouping matches the persisted execution log without a status-cache race. |
 | `notebook_cell_start` | `frame_id`, `producing_cell_id`, `cell_index`, `state_revision`, `generation_id`, `kernel_id`, `language`, `origin`, `source`, `status` | Starts/upserts one immutable Cell identity using the exact attempt-bound runtime generation. |
@@ -442,7 +673,7 @@ m.frame_id`.
 | `plan_progress` | `frame_id`, `plan_id`, `step_id`, `status`, `note` | A plan step ticked during auto-execution. |
 | `await_permission` | `frame_id`, `decision_id`, `tool`, `kind`, `title`, `input`, `target`, `suggested_patterns`, `scopes`, `sub_agent` | A tool call is blocked awaiting user approval (answer via `POST /api/frames/{fid}/decision`). Emitted from `openai4s/permissions.py`. |
 | `permission_resolved` | `frame_id`, `decision_id`, `allow`, `scope`, and after restart: `resolution_context`, `requires_continue`, `original_action_executed`, `continuation_expires_at`, `continuation_authorization` | The pending prompt was answered / timed out. An after-restart event explicitly says the old operation did not execute and whether the user must start a fresh continuation. |
-| `frame_update` | `frame_id`, `status`, `task_summary` (only with `status:"titled"`) | Turn/session lifecycle. Emitted statuses: `processing`, `completed`, `failed`, `cancelled`, `success` (REPL cell), `updated` (rename/PATCH), and `titled` — the background auto-title thread's upgrade of the placeholder session title, which carries an extra `task_summary` field (the new title) that no other status has. The frontend treats `completed|failed|cancelled|success|done` as terminal — note `done` is in the frontend's terminal set but is **never emitted** by the gateway as a `frame_update` status (it is only the *stored* frame status for a completed turn). |
+| `frame_update` | `frame_id`, `status`, `request_id`, `code` + `output_committed?` (terminal turn events), `task_summary` (only with `status:"titled"`) | Turn/session lifecycle. Emitted statuses: `processing`, `completed`, `failed`, `cancelled`, `success` (REPL cell), `updated` (rename/PATCH), and `titled` — the background auto-title thread's upgrade of the placeholder session title, which carries an extra `task_summary` field (the new title) that no other status has. Every turn event — `processing`, both terminal forms, and the outer handler's `text_reset`/`text_chunk` — also carries `execution_id`, and that is the field a client filters on. A request id cannot separate two turns: clients may reuse `X-Request-Id`, and the ordering that matters (`processing(A)`, `processing(B)`, `failed(A)` — A unwinding after B was promoted out of the queue) then looks like B's own terminal event. A terminal whose `execution_id` differs from the running turn's must not close it. When one side names no execution the pair falls back to `request_id`, and when neither names anything the event is treated as current: that is the pre-identity contract, and anything stricter strands every turn against an older daemon. The `processing` event carries `request_id` too, and it is the one a queued follow-up depends on: that turn's 202 resolved while an earlier turn still owned the screen, so `processing` — "your turn is running now" — is the first moment its id is current. Under an HTTP job it is the same string the 202 returned; a direct call (CLI, recovery replay) mints one rather than emitting an empty field. A terminal turn event also carries `request_id` — the same id the submit 202 returned — and, when the turn failed, a stable `code` (`max_turns` for turn-limit exhaustion; `llm_request_burst`, `llm_rate_limited`, or `llm_upstream_overloaded` for controlled LLM capacity failures; otherwise the projector's, defaulting to `turn_failed`). These local codes never expose the provider's raw error code or message. `output_committed:true` is added only when the failure happened after bytes were streamed or a tool ran: `llm/models.py` calls it the retry veto, because a transparent retry there duplicates visible output or re-fires a side effect however retryable the status looks. It is never emitted as `false` — absent is "no claim", and a `false` would assert a safety the projector cannot know. The frontend treats `completed|failed|cancelled|success|done` as terminal — note `done` is in the frontend's terminal set but is **never emitted** by the gateway as a `frame_update` status (it is only the *stored* frame status for a completed turn). |
 | `kernel_status` | `frame_id`, `status` ∈ `restarted|stopped|started|env_changed|packages_installed|ended`, plus per-status extras (`generation`, `env`, `installed`, `ok`, `state`, `ended_reason`, `requires_kernel_recovery`) | Kernel lifecycle changes. A successful branch revert emits `ended` after invalidating both language slots. |
 | `execution_state` | `frame_id`, `execution_id`, `owner:{kind,id}`, `status` (`queued|running|finalizing|completed|failed|cancelled`), `queue_position`, `reason` | One exact ticket changed state. |
 | `execution_queue` | authoritative snapshot fields from `GET /frames/{fid}/execution` | Queue/position projection; also sent immediately after `view_session`. |
@@ -455,6 +686,8 @@ m.frame_id`.
 | `branch_projection_restored` | `frame_id`, `branch_id`, `checkpoint_id` | The branch-scoped projection was rebuilt (for example after a Revert); clients holding a stale message/Notebook view must refetch it rather than patch. |
 | `branch_activation_state` | `frame_id`, `root_frame_id`, `branch_id`, `checkpoint_id`, `status`/`state` | Activation of a branch runtime progressed. `status` and `state` carry the same value — a compatibility duplication kept because both spellings are already consumed. |
 | `artifact_created` | **non-uniform — see below** | An artifact was produced, edited, renamed, uploaded, restored, or deleted. |
+| `artifact_ref_problems` | `frame_id`, `problems[]` of `{ref, code, message}` (max 8) | One or more `@file` references in the user's message did not resolve. Emitted rather than raised: a user who referenced four files and mistyped one wants an answer about the other three plus a note, not a refusal. Codes: `not_found` (absent, or in another project — deliberately the same answer), `no_frozen_bytes`, `not_text` (a binary artifact, which used to be pasted in as replacement characters), `cross_session_not_allowed`, `materialise_failed`, `too_many_refs`. The previous behaviour was to drop an unresolvable reference silently, so the user asked about a file the model never received. |
+| `attachment_problems` | `frame_id`, `problems[]` of `{name, reason, limit?, bytes?}` (max 8) | Pinned figures that exceeded this turn's image budget and were not sent. Reasons: `too_many` (more than 8 images), `too_large` (one image over 4 MiB after the pin markers are drawn), `budget_exhausted` (12 MiB total). None of these limits existed: every pinned figure was attached at full size, so eight pins on a large raster sent ~10 MiB and eighty sent ten times that. The model is told as well as the user — a system note names the missing figures and instructs it to say they were not received, rather than describe a picture it never got. |
 | `pong` | — | Reply to JSON ping. |
 
 ### `artifact_created` payload non-uniformity (wart, load-bearing)
@@ -507,7 +740,9 @@ timestamps are ISO-8601 strings (or null).
 - **Note** (`_note_json`): `{note_id, id, content, created_at, updated_at}`.
 - **Annotation** (`_annotation_json`): `{id, annotation_id, root_frame_id,
   artifact_id, artifact_name, x, y` (0–1 fractions)`, number, body,
-  status("open"|"sent"), created_at, updated_at}`.
+  status("open"|"sent"), version_id, created_at, updated_at}`. `version_id` is
+  the artifact version the pin was taken against (`null` on pins created before
+  the binding existed, which fall back to the artifact's latest version).
 
 The duplicated-key pattern (`id` + a typed id) is deliberate frontend
 compatibility; keep both when touching these serializers.
@@ -519,14 +754,14 @@ compatibility; keep both when touching these serializers.
   `limit` on frames, and the Timeline's `before_ordinal`/`after_ordinal` +
   `limit` windows (§2).
 - `artifact_created` has four payload shapes; every field is optional (§3).
-- Uploads are JSON/base64, not multipart; non-alphabet characters in the
-  base64 are silently discarded, and input that still fails to decode is
-  silently stored as raw UTF-8 text (§2).
+- Uploads are JSON/base64, not multipart, and are strict: exactly one content
+  field, whitespace tolerated, anything else outside the base64 alphabet
+  refused with `400` rather than decoded to other bytes or stored as text
+  (§2).
 - Missing resources are inconsistently signaled: some routes 404 with
   `{error}`, others return `{}` (frame/project GET), `{"ok":true}`
-  (idempotent deletes), a nulls-filled 200 (`/artifacts/{aid}/lineage`), or a
-  200 body containing `{error}` (`/connectors/{id}/call`).
-- Malformed JSON request bodies are treated as `{}`, not rejected.
+  (idempotent deletes), or a nulls-filled 200 (`/artifacts/{aid}/lineage`).
+- Malformed JSON request bodies are rejected with `400 malformed_json`.
 - Raw-bytes artifact routes return JSON bodies on 404.
 - Skill enable-disable state is durable; the legacy built-in-agent roster
   toggle is still process-local. Specialist runtime policy has separate

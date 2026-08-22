@@ -32,14 +32,568 @@ class _Hub:
         self.events.append(event)
 
 
-def test_demo_seed_can_be_disabled_for_ci_and_air_gapped_startup(monkeypatch):
+def test_a_fresh_daemon_seeds_no_demo_and_the_variable_now_opts_in(monkeypatch):
+    """The default was `"1"`, and on a fresh data dir that meant: bind the port,
+    then start a Python kernel, execute six cells, call the UniProt and RCSB
+    REST APIs, spawn the bundled MCP connector and write four artifacts --
+    before the user had typed anything. Every one of those is something this
+    application otherwise asks permission for.
+
+    The variable keeps its name and reverses sense, which is the cheap part.
+    The load-bearing part is that a fresh boot now does *nothing*.
+    """
     monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
-    assert gateway_mod._demo_seed_enabled() is True
-    for value in ("0", "false", "NO", "off"):
+    assert gateway_mod._demo_seed_enabled() is False
+    for value in ("0", "false", "NO", "off", "", "  "):
         monkeypatch.setenv("OPENAI4S_SEED_DEMO", value)
         assert gateway_mod._demo_seed_enabled() is False
-    monkeypatch.setenv("OPENAI4S_SEED_DEMO", "1")
-    assert gateway_mod._demo_seed_enabled() is True
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("OPENAI4S_SEED_DEMO", value)
+        assert gateway_mod._demo_seed_enabled() is True
+
+
+def test_a_fresh_boot_starts_no_kernel_and_executes_no_cell(tmp_path, monkeypatch):
+    """The behavioural half of the test above.
+
+    Asserting the flag is off proves the flag is off. This asserts the thing
+    the flag was gating: build the server on a brand-new data dir and let the
+    background threads have a moment, and no cell ran, no kernel spawned and no
+    artifact exists. Driven through `build_app_server` rather than the seeder,
+    because the defect was in the wiring, not in `_seed_demo_session`.
+    """
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    monkeypatch.setenv("OPENAI4S_REQUIRE_TOKEN", "0")
+    cfg = _cfg(tmp_path)
+    cfg.port = 0  # ask the OS for a free port; do not fight a live daemon
+
+    executed: list[object] = []
+    monkeypatch.setattr(
+        gateway_mod.SessionRunner,
+        "run_repl",
+        lambda self, *a, **k: executed.append(a),
+    )
+    spawned: list[object] = []
+    monkeypatch.setattr(
+        gateway_mod.SessionRunner,
+        "_spawn_kernel",
+        lambda self, st: spawned.append(st),
+    )
+
+    httpd = gateway_mod.build_app_server(cfg)
+    try:
+        time.sleep(0.4)  # a seeding thread would have started by now
+        store = get_store(cfg.db_path)
+        assert executed == [], "a fresh boot executed a cell"
+        assert spawned == [], "a fresh boot spawned a kernel"
+        assert store.list_artifacts({}) == [], "a fresh boot created an artifact"
+        roots = store.browse_frames(project_id="proj_example", roots_only=True)
+        assert roots == [], "a fresh boot created a session"
+    finally:
+        httpd.server_close()
+        httpd.runner.close()
+
+
+def test_the_example_seed_is_on_demand_idempotent_and_single_flight(
+    tmp_path, monkeypatch
+):
+    """`_seed_demo_session` is idempotent by session name, which stops it
+    duplicating the example but not two concurrent requests both *starting* it:
+    the name check and the insert are not one transaction, and the seed runs for
+    as long as six live cells take. Two clicks would have run twelve cells and
+    two sets of API calls.
+    """
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+
+    release = threading.Event()
+    runs: list[int] = []
+
+    def _slow_seed(_cfg, _runner):
+        runs.append(1)
+        release.wait(5)
+
+    monkeypatch.setattr(gateway_mod, "_seed_demo_session", _slow_seed)
+    try:
+        assert runner.example_seed.start(cfg, runner) is True
+        for _ in range(50):  # wait for the thread to actually enter the seed
+            if runs:
+                break
+            time.sleep(0.01)
+        assert runner.example_seed.running() is True
+        # The second caller is refused, and refused distinguishably: `started`
+        # false with `running` true is "someone else is doing it", which the UI
+        # shows differently from a failure.
+        assert runner.example_seed.start(cfg, runner) is False
+        assert runs == [1]
+    finally:
+        release.set()
+        runner.close()
+
+
+def test_the_example_seed_route_reports_state_and_surfaces_its_error(
+    tmp_path, monkeypatch
+):
+    """A background seed that fails has nowhere to report to, so it reports
+    here. Without this the UI's only signal is that the example never appears,
+    which is indistinguishable from a slow network."""
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    try:
+        handler = object.__new__(handler_cls)
+        handler.path = "/api/v1/example/session"
+        seen: list[tuple[dict, int]] = []
+        handler._json = lambda obj, code=200: seen.append((obj, code))
+        handler._body = lambda: {}
+
+        handler._api("GET", "/example/session")
+        body, code = seen[-1]
+        assert code == 200
+        assert body["seeded"] is False and body["running"] is False
+        assert body["started"] is False  # a GET never starts anything
+        assert body["seeds_at_startup"] is False
+
+        # An unconfirmed POST refuses and, more to the point, seeds nothing.
+        # This is what keeps a generic surface driver -- the contract capture,
+        # a route-coverage sweep -- from executing six cells and calling two
+        # external APIs just by enumerating verbs. Asserting the 400 alone
+        # would not prove it: the check has to happen *before* the start.
+        ran: list[int] = []
+        monkeypatch.setattr(gateway_mod, "_seed_demo_session", lambda *a: ran.append(1))
+        with pytest.raises(gateway_mod.GatewayError) as refused:
+            handler._api("POST", "/example/session")
+        assert refused.value.code == 400
+        assert refused.value.error_code == "confirmation_required"
+        time.sleep(0.1)
+        assert ran == [], "an unconfirmed POST started the example seed"
+
+        def _boom(_cfg, _runner):
+            raise RuntimeError("uniprot unreachable")
+
+        monkeypatch.setattr(gateway_mod, "_seed_demo_session", _boom)
+        handler._body = lambda: {"confirm": True}
+        handler._api("POST", "/example/session")
+        assert seen[-1][0]["started"] is True
+        for _ in range(200):
+            if runner.example_seed.last_error():
+                break
+            time.sleep(0.01)
+        handler._api("GET", "/example/session")
+        assert "uniprot unreachable" in (seen[-1][0]["error"] or "")
+    finally:
+        runner.close()
+
+
+def test_the_example_seed_route_reports_the_already_seeded_state(tmp_path, monkeypatch):
+    """The idempotent path the API docs describe and nothing exercised.
+
+    `POST /example/session` on an install that already has the example must not
+    start anything: `existing is not None` skips `start()` entirely, so the
+    response reports the frame that is there and whatever error the last attempt
+    left behind. Worth a test on its own -- it is the difference between a
+    second click costing nothing and a second click running six cells.
+
+    It also closes a hole that surfaced somewhere unexpected. The frozen
+    `POST /example/session [ok]` shape in `docs/response-schemas.json` was built
+    from the single observation the suite happened to make, and that observation
+    sits immediately after `start()` has cleared `_last_error` and spawned a
+    thread that may or may not have failed yet. Both threads then contend for
+    the same lock, so `error` was captured as `string` on Linux/CI and `null` on
+    macOS -- a scheduler outcome published as a contract, in a file whose whole
+    claim is that it describes the API. The field is `str | None` on both verbs
+    (one dict literal, fed by `last_error()`), and so is `frame_id`
+    (`str` once seeded, `null` before). The two observations below pin both
+    halves of each, deterministically, without depending on which thread wins.
+    """
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    seen: list[tuple[dict, int]] = []
+
+    def _handler_for(active_runner):
+        handler = object.__new__(gateway_mod.make_handler(cfg, _Hub(), active_runner))
+        handler.path = "/api/v1/example/session"
+        handler._json = lambda obj, code=200: seen.append((obj, code))
+        handler._body = lambda: {"confirm": True}
+        return handler
+
+    try:
+        # A real error, recorded through the real state object.
+        def _boom(_cfg, _runner):
+            raise RuntimeError("uniprot unreachable")
+
+        monkeypatch.setattr(gateway_mod, "_seed_demo_session", _boom)
+        handler = _handler_for(runner)
+        handler._api("POST", "/example/session")
+        for _ in range(200):
+            if runner.example_seed.last_error():
+                break
+            time.sleep(0.01)
+        assert runner.example_seed.last_error()
+
+        # The example exists now. Written the way the seeder writes it -- a real
+        # store row, not a patched lookup, so the response is still the real
+        # handler's answer and the shape it publishes stays honest.
+        store = get_store(cfg.db_path)
+        fid = store.new_frame(
+            kind="turn", project_id="proj_example", status="done", model=cfg.llm.model
+        )
+        store.update_frame(fid, name=gateway_mod._DEMO_SESSION_NAME)
+
+        handler._api("POST", "/example/session")
+        body, code = seen[-1]
+        assert code == 200
+        assert body["seeded"] is True
+        assert body["started"] is False, "a POST on a seeded install started a run"
+        assert body["frame_id"] == fid
+        assert "uniprot unreachable" in (body["error"] or "")
+
+        # Same seeded install, a runner that has never failed: the null half of
+        # the same contract, and the one CI could not observe.
+        fresh = gateway_mod.SessionRunner(cfg, _Hub())
+        try:
+            for verb in ("GET", "POST"):
+                _handler_for(fresh)._api(verb, "/example/session")
+                body, code = seen[-1]
+                assert code == 200
+                assert body["seeded"] is True
+                assert body["started"] is False
+                assert body["frame_id"] == fid
+                assert body["error"] is None
+        finally:
+            fresh.close()
+    finally:
+        runner.close()
+
+
+def test_a_confirmed_seed_completes_without_an_attached_approver(tmp_path, monkeypatch):
+    """The confirmed seed must never block on an approval nobody can answer.
+
+    Cell 2 calls the bundled MCP connector and the global default for
+    `mcp_call` is "ask", so a scripted `POST /example/session` (no browser
+    attached, nobody watching the brand-new session) filed a pending approval
+    and the seed hung at Cell 2 for the broker's full 15-minute backstop while
+    `GET /example/session` reported `running: true` the whole time --
+    indistinguishable from a dead seed. The `{"confirm": true}` click is the
+    user's approval of exactly what the demo does, so the seeder pre-authorizes
+    `example/calc` + `example/now` for its own conversation and Cell 2 executes
+    immediately.
+
+    The other five cells are swapped for offline stand-ins (the real ones call
+    UniProt/RCSB and need the science extra); Cell 2 runs VERBATIM through the
+    real kernel, the real dispatcher, the real permission broker and the real
+    bundled MCP server.
+    """
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    cfg = _cfg(tmp_path)
+    gateway_mod._seed_example_connector(cfg)  # boot normally registers it
+    monkeypatch.setattr(
+        gateway_mod,
+        "_DEMO_UNIPROT",
+        "entries = [{'sequence': 'ACDEFGHIKL'}, {'sequence': 'MNPQRSTVWY'}]\n",
+    )
+    for heavy in ("_DEMO_PLOT", "_DEMO_CSV", "_DEMO_PDB", "_DEMO_MD"):
+        monkeypatch.setattr(gateway_mod, heavy, "pass\n")
+
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    try:
+        assert runner.example_seed.start(cfg, runner) is True
+        # Before the fix Cell 2 blocked for the broker's 900 s timeout; this
+        # bound is generous for a slow CI box yet far below that backstop.
+        deadline = time.time() + 120
+        while runner.example_seed.running() and time.time() < deadline:
+            time.sleep(0.1)
+        assert not runner.example_seed.running(), (
+            "the seed is still running -- Cell 2 is blocked on a permission "
+            "prompt with no approver attached"
+        )
+        assert runner.example_seed.last_error() is None
+
+        frame = gateway_mod._example_session_frame(cfg)
+        assert frame is not None
+        fid = frame.get("frame_id") or frame.get("id")
+        store = get_store(cfg.db_path)
+
+        cells = store.list_cells(fid)
+        assert len(cells) == 6
+        mcp_cell = next(c for c in cells if "host.mcp.call" in (c.get("code") or ""))
+        assert mcp_cell["status"] == "ok"
+        assert 'MCP connector "example" reachable' in (mcp_cell.get("stdout") or ""), (
+            "Cell 2 did not execute the MCP call -- it was denied or skipped: "
+            f"stdout={mcp_cell.get('stdout')!r}"
+        )
+        assert "MCP connector call skipped" not in (mcp_cell.get("stdout") or "")
+
+        # The pre-authorization means no approval request was ever filed:
+        # nothing pending, nothing denied, nothing waiting out a timeout.
+        assert store.list_permission_requests(root_frame_id=fid) == []
+
+        # And the grant is exactly as narrow as the demo: two conversation-
+        # scoped patterns, never a project/global rule another session could
+        # inherit.
+        rules = store.get_permission_rules(scope="conversation", scope_id=fid)
+        assert {(r["tool"], r["pattern"], r["decision"]) for r in rules} == {
+            ("mcp_call", "example/calc", "allow"),
+            ("mcp_call", "example/now", "allow"),
+        }
+    finally:
+        runner.close()
+
+
+def _seed_with_fake_cells(tmp_path, monkeypatch, cell_behaviour):
+    """Run the real `_seed_demo_session` with `run_repl` replaced per cell.
+
+    `cell_behaviour(index, register)` returns the kernel error string for that
+    cell (None for success, or a full run_repl outcome dict for cancelled /
+    interrupted shapes) and calls `register(filename)` for any artifact the
+    cell would have written. Returns (store, final assistant message content).
+    """
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    executed: list[str] = []
+
+    def _fake_run_repl(self, root_frame_id, project_id, code, *args, **kwargs):
+        executed.append(code)
+
+        def register(name):
+            store.save_artifact(
+                path=str(tmp_path / name),
+                filename=name,
+                content_type=None,
+                size_bytes=1,
+                checksum=None,
+                frame_id=root_frame_id,
+                root_frame_id=root_frame_id,
+                project_id=project_id,
+            )
+
+        error = cell_behaviour(len(executed), register)
+        if isinstance(error, dict):
+            return error
+        return {"status": "completed", "cell": {"error": error}}
+
+    monkeypatch.setattr(gateway_mod.SessionRunner, "run_repl", _fake_run_repl)
+    try:
+        gateway_mod._seed_demo_session(cfg, runner)
+    finally:
+        runner.close()
+
+    assert len(executed) == 6, "the seed must attempt every demo cell"
+    roots = store.browse_frames(project_id="proj_example", roots_only=True)
+    row = next(
+        r for r in roots if (r.get("name") or "") == gateway_mod._DEMO_SESSION_NAME
+    )
+    fid = row.get("frame_id") or row.get("id")
+    messages = store.list_messages(fid)
+    final = messages[-1]
+    assert final["role"] == "assistant"
+    return store, final["content"]
+
+
+def test_the_example_seed_message_lists_only_materials_that_really_exist(
+    tmp_path, monkeypatch
+):
+    """The final assistant message must be reconciled against what actually ran.
+
+    On a lightweight install (no Biopython/pandas) Cell 4 dies on
+    ModuleNotFoundError and Cell 6 on FileNotFoundError, yet the message used to
+    open with "Done — every value ... is computed from real data" and list
+    family_biochemistry.csv and nif3_report.md as clickable materials. Every
+    material line now branches on the artifact store, and the header reports the
+    crashed cells instead of claiming success on their behalf.
+    """
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+
+    def behaviour(index, register):
+        if index == 3:
+            register("figure_cell3_0001.png")
+        elif index == 4:
+            return (
+                "Traceback (most recent call last):\n"
+                '  File "<kernel:4>", line 3, in <module>\n'
+                "ModuleNotFoundError: No module named 'Bio'"
+            )
+        elif index == 5:
+            register("nif3_structure.pdb")
+        elif index == 6:
+            return (
+                "Traceback (most recent call last):\n"
+                '  File "<kernel:6>", line 2, in <module>\n'
+                "FileNotFoundError: [Errno 2] No such file or directory: "
+                "'family_biochemistry.csv'"
+            )
+        return None
+
+    store, content = _seed_with_fake_cells(tmp_path, monkeypatch, behaviour)
+
+    # The header is honest about the crashed cells and cites their errors.
+    assert not content.startswith("Done")
+    assert "2 of 6 example cells did not complete" in content
+    assert "cell 4/6: ModuleNotFoundError: No module named 'Bio'" in content
+    assert "cell 6/6: FileNotFoundError" in content
+
+    # Materials list exactly what the artifact store holds: produced files are
+    # clickable claims, missing ones are honest placeholders.
+    produced = {
+        a.get("filename") for a in store.list_artifacts({"project_id": "proj_example"})
+    }
+    assert produced == {"figure_cell3_0001.png", "nif3_structure.pdb"}
+    assert "**hydropathy figure (PNG)**" in content
+    assert "**nif3_structure.pdb**" in content
+    assert "**family_biochemistry.csv**" not in content
+    assert "**nif3_report.md**" not in content
+    assert "_biochemistry table_ — not produced this run" in content
+    assert "_summary report_ — not produced this run" in content
+
+
+def test_the_example_seed_message_keeps_the_full_claim_when_everything_ran(
+    tmp_path, monkeypatch
+):
+    """The all-green run keeps its original, fully-claimed message."""
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+
+    def behaviour(index, register):
+        if index == 3:
+            register("figure_cell3_0001.png")
+        elif index == 4:
+            register("family_biochemistry.csv")
+        elif index == 5:
+            register("nif3_structure.pdb")
+        elif index == 6:
+            register("nif3_report.md")
+        return None
+
+    _store, content = _seed_with_fake_cells(tmp_path, monkeypatch, behaviour)
+
+    assert content.startswith("Done — every value in this session")
+    assert "did not complete" not in content
+    for name in (
+        "**hydropathy figure (PNG)**",
+        "**family_biochemistry.csv**",
+        "**nif3_structure.pdb**",
+        "**nif3_report.md**",
+    ):
+        assert name in content
+
+
+def test_the_example_seed_counts_interrupted_cells_as_failures(tmp_path, monkeypatch):
+    """Cancelled/interrupted cells carry ``error`` None and must not read as
+    successes: doing so reopened the all-green "Done — every value is real"
+    header over cells that never finished, alongside material lines pointing
+    at a Notebook error that does not exist."""
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+
+    def behaviour(index, register):
+        if index == 3:
+            return {
+                "status": "completed",
+                "cell": {"error": None, "status": "interrupted"},
+            }
+        if index == 4:
+            register("family_biochemistry.csv")
+        elif index == 5:
+            register("nif3_structure.pdb")
+        elif index == 6:
+            register("nif3_report.md")
+        return None
+
+    _store, content = _seed_with_fake_cells(tmp_path, monkeypatch, behaviour)
+
+    assert not content.startswith("Done")
+    assert "1 of 6 example cells did not complete" in content
+    assert "cell 3/6: interrupted before completion" in content
+    assert "_hydropathy figure_ — not produced this run" in content
+
+
+def test_build_app_server_closes_runner_when_startup_raises_before_bind(
+    tmp_path, monkeypatch
+):
+    """The orphan guard must cover every raise site after the runner exists.
+
+    The seeds and ``make_handler`` run after SessionRunner started its
+    recovery sweeper; guarded only around the bind, an exception there leaked
+    the sweeper/coordinator to any embedder that catches and retries."""
+    closed: list[bool] = []
+    real_close = gateway_mod.SessionRunner.close
+
+    def spying_close(self):
+        closed.append(True)
+        return real_close(self)
+
+    monkeypatch.setattr(gateway_mod.SessionRunner, "close", spying_close)
+    monkeypatch.setattr(
+        gateway_mod,
+        "_seed_example_project",
+        lambda cfg: (_ for _ in ()).throw(RuntimeError("store locked")),
+    )
+
+    with pytest.raises(RuntimeError, match="store locked"):
+        gateway_mod.build_app_server(_cfg(tmp_path))
+
+    assert closed, "a failed startup must close the runner it created"
+
+
+@pytest.mark.stubbed_backend
+def test_server_close_drops_datapro_connection_bound_to_old_secret_store(
+    tmp_path, monkeypatch
+):
+    """A new in-process daemon must never inherit the prior Store's key."""
+
+    from openai4s import datapro, mcp_client
+
+    seen: list[str] = []
+
+    class _Connection:
+        command = ["streamable_http"]
+
+        def __init__(self, config):
+            self.provider = config["headers_provider"]
+            self.closed = False
+
+        def faulted(self):
+            return self.closed
+
+        def list_tools(self):
+            seen.append(self.provider()["X-Agent-Plan-Key"])
+            return [{"name": datapro.TOOL_NAME}]
+
+        def close(self):
+            self.closed = True
+            return True
+
+    shared = mcp_client.MCPManager()
+    monkeypatch.setattr(shared, "_connect", lambda config: _Connection(config))
+    monkeypatch.setattr(mcp_client, "_MANAGER", shared)
+    monkeypatch.setenv("OPENAI4S_REQUIRE_TOKEN", "0")
+
+    monkeypatch.setattr(
+        gateway_mod.ThreadingHTTPServer, "server_close", lambda _server: None
+    )
+    connector = {
+        "connector_id": datapro.CONNECTOR_ID,
+        "command": datapro.managed_connector_command(),
+    }
+
+    def generation(path, key):
+        cfg = _cfg(path)
+        cfg.ensure_dirs()
+        store = get_store(cfg.db_path)
+        datapro.save_agent_plan_key(store, key)
+        shared.list_tools(
+            datapro.CONNECTOR_ID,
+            datapro.connector_runtime_config(store, connector),
+        )
+        server = object.__new__(gateway_mod._GatewayHTTPServer)
+        server.runner = SimpleNamespace(close=store.close)
+        server.RequestHandlerClass = SimpleNamespace(jobs_manager=None)
+        server.server_close()
+
+    generation(tmp_path / "first", "first-plan-key")
+    generation(tmp_path / "second", "second-plan-key")
+    assert seen == ["first-plan-key", "second-plan-key"]
 
 
 def test_ws_resume_buffer_replaces_notebook_drafts_and_keeps_live_cell_events():
@@ -431,6 +985,21 @@ def test_ws_live_frame_limit_is_hard_even_when_every_buffer_is_running():
     assert hub.is_running("root-live-1") is False
 
 
+def _auth_headers(cfg, extra: dict | None = None) -> dict:
+    """Headers a client presents now that the token gate is on by default.
+
+    Tests that drive `_route` go through the gate; tests that call `_api`
+    directly do not. Rather than each remembering that distinction, this makes
+    the credential explicit wherever `_route` is used -- which is also what a
+    real client does.
+    """
+    from openai4s.server import local_auth
+
+    headers = {local_auth.TOKEN_HEADER: local_auth.load_or_mint(cfg.data_dir)}
+    headers.update(extra or {})
+    return headers
+
+
 def _cfg(tmp_path):
     return Config(
         data_dir=tmp_path,
@@ -599,7 +1168,8 @@ def test_gateway_projects_submit_only_result_as_live_and_persisted_final_message
     final_text_index = max(
         index
         for index, event in enumerate(hub.events)
-        if event.get("type") == "text_chunk" and "已完成真实数据分析" in event.get("chunk", "")
+        if event.get("type") == "text_chunk"
+        and "已完成真实数据分析" in event.get("chunk", "")
     )
     terminal_index = max(
         index
@@ -623,6 +1193,10 @@ def test_submit_message_runs_turn_in_background(tmp_path):
         plan=False,
         annos=None,
         explore=False,
+        # What the item was ACCEPTED under, carried from the request thread. The
+        # freeze used to be written only to the frame, whose pin the rebind route
+        # rewrites by design -- so a queued follow-up could adopt it after 202.
+        frozen_binding=None,
     ):
         started.set()
         assert root_frame_id == "f-test"
@@ -902,6 +1476,10 @@ def test_explore_flag_passes_through_submit_message(tmp_path):
         plan=False,
         annos=None,
         explore=False,
+        # What the item was ACCEPTED under, carried from the request thread. The
+        # freeze used to be written only to the frame, whose pin the rebind route
+        # rewrites by design -- so a queued follow-up could adopt it after 202.
+        frozen_binding=None,
     ):
         seen["explore"] = explore
         return {"status": "completed", "frame_id": root_frame_id}
@@ -1058,7 +1636,17 @@ def test_model_profile_mask_and_empty_defaults_ignore_placeholder_keys(tmp_path)
     store.set_setting("llm_api_key", "your-api-key-here")
     payload = handler._model_profiles_payload()
     assert payload["profiles"] == []
-    assert payload["protocols"] == ["chatgpt", "claude", "ark"]
+    # Every protocol the LLM layer can dispatch. `gemini` and
+    # `openai_responses` were dispatchable and unlisted, so a user holding a
+    # Gemini key had no way to select it; `test_model_profile_readiness.py`
+    # now fails if a provider is neither offered nor declared withheld.
+    assert payload["protocols"] == [
+        "chatgpt",
+        "claude",
+        "ark",
+        "gemini",
+        "openai_responses",
+    ]
     assert store.list_model_profiles() == []
 
 
@@ -1100,6 +1688,415 @@ def test_model_profile_activate_moves_to_front_and_sanitizes_key(tmp_path):
     assert [p["id"] for p in store.list_model_profiles()] == ["mp-b", "mp-a"]
     assert store.get_setting("active_model_profile") == "mp-b"
     assert store.get_setting("llm_api_key") == ""
+
+
+@pytest.mark.stubbed_backend
+def test_ark_profile_rotation_drops_this_store_datapro_session_and_reconnects(
+    tmp_path, monkeypatch
+):
+    """An Ark A→B activation must not keep DataPro's account-A session."""
+
+    from openai4s import datapro, mcp_client
+
+    class _ScopedManager:
+        def __init__(self):
+            self.sessions = {}
+            self.disconnects = []
+            self.serial = 0
+
+        def open_session(self, connector_id, config):
+            cache_key = (connector_id, config["cache_scope"])
+            if cache_key not in self.sessions:
+                self.serial += 1
+                outbound = config["headers_provider"]()
+                self.sessions[cache_key] = (
+                    f"session-{self.serial}",
+                    outbound["X-Agent-Plan-Key"],
+                )
+            return self.sessions[cache_key]
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+            if cache_scope is None:
+                for key in list(self.sessions):
+                    if key[0] == connector_id:
+                        del self.sessions[key]
+            else:
+                self.sessions.pop((connector_id, cache_scope), None)
+
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    store.set_model_profiles(
+        [
+            {
+                "id": "ark-a",
+                "name": "Ark A",
+                "provider": "ark",
+                "base_url": "",
+                "model": "model-a",
+                "api_key": "profile-a-key",
+            },
+            {
+                "id": "ark-b",
+                "name": "Ark B",
+                "provider": "ark",
+                "base_url": "",
+                "model": "model-b",
+                "api_key": "profile-b-key",
+            },
+        ]
+    )
+    store.set_setting("llm_provider", "ark")
+    store.set_setting("active_model_profile", "ark-a")
+    store.set_secret_setting("llm_api_key", "profile-a-key", scope="llm")
+    manager = _ScopedManager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    scope = datapro.runtime_cache_scope(store)
+    connector = {"connector_id": datapro.CONNECTOR_ID}
+    manager.sessions[(datapro.CONNECTOR_ID, "another-store")] = (
+        "other-session",
+        "other-key",
+    )
+    try:
+        config_a = datapro.connector_runtime_config(store, connector)
+        session_a, key_a = manager.open_session(datapro.CONNECTOR_ID, config_a)
+
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        replies = []
+        handler._query = lambda: {}
+        handler._body = lambda: {}
+        handler._json = lambda obj, code=200: replies.append((code, obj))
+        handler._api("POST", "/model-profiles/ark-b/activate")
+
+        assert replies[-1][0] == 200
+        assert manager.disconnects == [(datapro.CONNECTOR_ID, scope)]
+        assert (datapro.CONNECTOR_ID, "another-store") in manager.sessions
+        config_b = datapro.connector_runtime_config(store, connector)
+        session_b, key_b = manager.open_session(datapro.CONNECTOR_ID, config_b)
+        assert session_b != session_a
+        assert key_a == "profile-a-key"
+        assert key_b == "profile-b-key"
+    finally:
+        runner.close()
+
+
+@pytest.mark.stubbed_backend
+def test_model_routes_invalidate_datapro_only_when_effective_key_changes(
+    tmp_path, monkeypatch
+):
+    """Every model mutation route shares the same Store-scoped decision."""
+
+    from openai4s import datapro, mcp_client
+
+    class _Manager:
+        def __init__(self):
+            self.disconnects = []
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    store.set_model_profiles(
+        [
+            {
+                "id": "ark-a",
+                "name": "Ark A",
+                "provider": "ark",
+                "base_url": "",
+                "model": "model-a",
+                "api_key": "profile-a-key",
+            },
+            {
+                "id": "ark-b",
+                "name": "Ark B",
+                "provider": "ark",
+                "base_url": "",
+                "model": "model-b",
+                "api_key": "profile-b-key",
+            },
+        ]
+    )
+    store.set_setting("llm_provider", "ark")
+    store.set_setting("active_model_profile", "ark-a")
+    store.set_secret_setting("llm_api_key", "profile-a-key", scope="llm")
+    manager = _Manager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    scope = datapro.runtime_cache_scope(store)
+    expected_call = (datapro.CONNECTOR_ID, scope)
+    body = {}
+    try:
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        handler._query = lambda: {}
+        handler._body = lambda: body
+        handler._json = lambda obj, code=200: None
+
+        body = {"model": "model-a-v2"}
+        handler._api("POST", "/config/llm")
+        assert manager.disconnects == [], "a model-only edit keeps the same key"
+
+        body = {"api_key": "direct-ark-key-2"}
+        handler._api("POST", "/config/llm")
+        assert manager.disconnects == [expected_call]
+
+        body = {"api_key": "direct-ark-key-3"}
+        handler._api("PATCH", "/config/llm")
+        assert manager.disconnects == [expected_call] * 2
+
+        body = {"model_id": "ark-b"}
+        handler._api("POST", "/models/default")
+        assert manager.disconnects == [expected_call] * 3
+
+        body = {}
+        handler._api("POST", "/model-profiles/ark-a/activate")
+        assert manager.disconnects == [expected_call] * 4
+
+        body = {"name": "Ark A renamed"}
+        handler._api("PATCH", "/model-profiles/ark-a")
+        assert manager.disconnects == [expected_call] * 4
+
+        body = {"api_key": "profile-a-key-rotated"}
+        handler._api("PATCH", "/model-profiles/ark-a")
+        assert manager.disconnects == [expected_call] * 5
+
+        body = {}
+        handler._api("DELETE", "/model-profiles/ark-a")
+        assert manager.disconnects == [expected_call] * 6
+    finally:
+        runner.close()
+
+
+@pytest.mark.stubbed_backend
+def test_config_provider_switch_never_reuses_old_provider_key_for_datapro(
+    tmp_path, monkeypatch
+):
+    """A provider-only non-Ark→Ark edit clears, rather than re-labels, its key."""
+
+    from openai4s import datapro, mcp_client
+
+    class _Manager:
+        def __init__(self):
+            self.disconnects = []
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+
+    old_provider_canary = "old-provider-credential-canary"
+    dedicated = "dedicated-agent-plan-test-value"
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    store.set_setting("llm_provider", "claude")
+    store.set_secret_setting("llm_api_key", old_provider_canary, scope="llm")
+    datapro.save_agent_plan_key(store, dedicated)
+    manager = _Manager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    try:
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        replies = []
+        handler._query = lambda: {}
+        handler._body = lambda: {"provider": "ark"}
+        handler._json = lambda obj, code=200: replies.append((code, obj))
+
+        handler._api("PATCH", "/config/llm")
+
+        assert replies[-1][0] == 200
+        assert store.get_secret_setting("llm_api_key") == ""
+        assert datapro.resolve_agent_plan_key(store) == dedicated
+        outbound = datapro.connector_runtime_config(
+            store, {"connector_id": datapro.CONNECTOR_ID}
+        )["headers_provider"]()
+        assert outbound["X-Agent-Plan-Key"] == dedicated
+        assert old_provider_canary not in json.dumps(outbound)
+        assert manager.disconnects == [
+            (datapro.CONNECTOR_ID, datapro.runtime_cache_scope(store))
+        ]
+    finally:
+        runner.close()
+
+
+@pytest.mark.stubbed_backend
+def test_inactive_profile_provider_switch_forgets_key_before_ark_activation(
+    tmp_path, monkeypatch
+):
+    """Editing a saved provider cannot carry its old credential across vendors."""
+
+    from openai4s import datapro, mcp_client
+
+    class _Manager:
+        def __init__(self):
+            self.disconnects = []
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+
+    profile_canary = "inactive-profile-credential-canary"
+    dedicated = "dedicated-agent-plan-test-value"
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    datapro.save_agent_plan_key(store, dedicated)
+    manager = _Manager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    body = {
+        "name": "Cross-provider",
+        "provider": "claude",
+        "model": "model-a",
+        "api_key": profile_canary,
+    }
+    replies = []
+    try:
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        handler._query = lambda: {}
+        handler._body = lambda: body
+        handler._json = lambda obj, code=200: replies.append((code, obj))
+
+        handler._api("POST", "/model-profiles")
+        profile_id = replies[-1][1]["id"]
+        old_ref = next(
+            item["api_key"]
+            for item in store.list_model_profiles()
+            if item["id"] == profile_id
+        )
+
+        body = {"provider": "ark"}
+        handler._api("PATCH", f"/model-profiles/{profile_id}")
+        edited = next(
+            item for item in store.list_model_profiles() if item["id"] == profile_id
+        )
+        assert edited["api_key"] == ""
+        assert store.secrets.get(old_ref) is None
+        assert manager.disconnects == [], "an inactive edit changes no live context"
+
+        body = {}
+        handler._api("POST", f"/model-profiles/{profile_id}/activate")
+        assert store.get_secret_setting("llm_api_key") == ""
+        assert datapro.resolve_agent_plan_key(store) == dedicated
+        outbound = datapro.connector_runtime_config(
+            store, {"connector_id": datapro.CONNECTOR_ID}
+        )["headers_provider"]()
+        assert outbound["X-Agent-Plan-Key"] == dedicated
+        assert profile_canary not in json.dumps(outbound)
+        assert manager.disconnects == [
+            (datapro.CONNECTOR_ID, datapro.runtime_cache_scope(store))
+        ]
+    finally:
+        runner.close()
+
+
+@pytest.mark.stubbed_backend
+def test_deleting_active_profile_clears_live_key_and_uses_dedicated_fallback(
+    tmp_path, monkeypatch
+):
+    """The broker entry and its activated live copy die in the same route."""
+
+    from openai4s import datapro, mcp_client
+
+    class _Manager:
+        def __init__(self):
+            self.disconnects = []
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+
+    profile_canary = "deleted-profile-credential-canary"
+    dedicated = "dedicated-agent-plan-test-value"
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    datapro.save_agent_plan_key(store, dedicated)
+    manager = _Manager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    body = {
+        "name": "Ark active",
+        "provider": "ark",
+        "model": "model-a",
+        "api_key": profile_canary,
+    }
+    replies = []
+    try:
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        handler._query = lambda: {}
+        handler._body = lambda: body
+        handler._json = lambda obj, code=200: replies.append((code, obj))
+
+        handler._api("POST", "/model-profiles")
+        profile_id = replies[-1][1]["id"]
+        profile_ref = next(
+            item["api_key"]
+            for item in store.list_model_profiles()
+            if item["id"] == profile_id
+        )
+        body = {}
+        handler._api("POST", f"/model-profiles/{profile_id}/activate")
+        assert datapro.resolve_agent_plan_key(store) == profile_canary
+        manager.disconnects.clear()
+
+        handler._api("DELETE", f"/model-profiles/{profile_id}")
+
+        assert store.get_secret_setting("llm_api_key") == ""
+        assert store.secrets.get(profile_ref) is None
+        assert datapro.resolve_agent_plan_key(store) == dedicated
+        outbound = datapro.connector_runtime_config(
+            store, {"connector_id": datapro.CONNECTOR_ID}
+        )["headers_provider"]()
+        assert outbound["X-Agent-Plan-Key"] == dedicated
+        assert profile_canary not in json.dumps(outbound)
+        assert manager.disconnects == [
+            (datapro.CONNECTOR_ID, datapro.runtime_cache_scope(store))
+        ]
+    finally:
+        runner.close()
+
+
+@pytest.mark.stubbed_backend
+def test_disabling_datapro_disconnects_only_the_current_store_scope(
+    tmp_path, monkeypatch
+):
+    """One embedded Store cannot tear down another Store's DataPro session."""
+
+    from openai4s import datapro, mcp_client
+
+    class _Manager:
+        def __init__(self):
+            self.disconnects = []
+
+        def disconnect(self, connector_id, cache_scope=None):
+            self.disconnects.append((connector_id, cache_scope))
+
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    store = get_store(cfg.db_path)
+    store.upsert_connector(
+        connector_id=datapro.CONNECTOR_ID,
+        name="Volcengine DataPro",
+        command=datapro.managed_connector_command(),
+        enabled=True,
+    )
+    manager = _Manager()
+    monkeypatch.setattr(mcp_client, "manager", lambda: manager)
+    try:
+        handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+        handler = object.__new__(handler_cls)
+        handler._query = lambda: {}
+        handler._body = lambda: {"enabled": False}
+        handler._json = lambda obj, code=200: None
+
+        handler._api("PATCH", f"/connectors/{datapro.CONNECTOR_ID}/enabled")
+
+        assert manager.disconnects == [
+            (datapro.CONNECTOR_ID, datapro.runtime_cache_scope(store))
+        ]
+        assert store.get_connector(datapro.CONNECTOR_ID)["enabled"] is False
+    finally:
+        runner.close()
 
 
 def test_local_model_discovery_route_is_explicit_and_non_mutating(
@@ -1331,13 +2328,22 @@ def test_frame_update_status_literal_vocabulary(tmp_path):
     exactly {processing, titled, failed, success, updated}; the run_message
     terminal site emits a VARIABLE status ∈ {completed, failed, cancelled}
     (asserted behaviorally by the structured-submit and max-turn tests above).
-    If this fails, a status was added/removed — update docs/webapp-api.md."""
+    If this fails, a status was added/removed — update docs/webapp-api.md.
+
+    The *vocabulary* is what docs/webapp-api.md promises, so the vocabulary is
+    what is locked. This used to also require at least seven emit sites, which
+    made deduplication look like a contract change: folding two copies of the
+    terminal failure event into `_terminal_failure_event` reddened it while
+    emitting exactly the same statuses. Collapsing a literal into the helper
+    that owns it is the direction this file should encourage, so the terminal
+    failure status is now asserted at that helper instead of counted.
+    """
     from openai4s.server import titles as titles_mod
 
     src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
     src += Path(titles_mod.__file__).read_text(encoding="utf-8")
     sites = list(re.finditer(r'"type": "frame_update"', src))
-    assert len(sites) >= 7  # the emit sites documented today
+    assert sites, "no frame_update emit site is visible; this test sees nothing"
     literals = set()
     for m in sites:
         window = src[m.end() : m.end() + 250]
@@ -1345,6 +2351,20 @@ def test_frame_update_status_literal_vocabulary(tmp_path):
         if s:
             literals.add(s.group(1))
     assert literals == {"processing", "titled", "failed", "success", "updated"}
+
+    # The one status no longer written at more than one emit site. It is built
+    # by a named helper, so it is checked by calling it -- which also pins that
+    # a failed turn's terminal event carries the ids the client needs to tell
+    # it from the next turn's.
+    job = gateway_mod.MessageJob("job-vocab", "root-vocab")
+    job.execution_id = "exec-vocab"
+    terminal = gateway_mod.SessionRunner._terminal_failure_event(
+        None, "root-vocab", job
+    )
+    assert terminal["type"] == "frame_update"
+    assert terminal["status"] == "failed"
+    assert terminal["request_id"] == job.request_id
+    assert terminal["execution_id"] == "exec-vocab"
 
 
 def test_auto_title_broadcasts_titled_frame_update(monkeypatch, tmp_path):
@@ -1385,18 +2405,42 @@ def test_auto_title_broadcasts_titled_frame_update(monkeypatch, tmp_path):
 
 
 def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
-    """The token gate (docs/webapp-api.md §1): with OPENAI4S_REQUIRE_TOKEN=1,
-    a request without the token gets a 401 {"error": ...} envelope; a GET
-    carrying a valid ?token= gets 303 Location:/ + Set-Cookie os_token;
-    /health stays exempt."""
+    """The token gate: no credential is a 401 envelope, a valid `?token=` on a
+    GET sets the cookie and redirects with the token stripped, `/health` and
+    `/auth/status` stay reachable so a client can discover it needs one.
+
+    Three things changed here and each was a defect on its own. The token was
+    minted per boot into a closure, so every restart invalidated every cookie
+    already issued. Comparison was `==`, which leaks a secret's prefix through
+    timing. And the redirect went to "/" unconditionally, so a bookmarked deep
+    link carrying a token landed on the dashboard instead of its target.
+    """
     monkeypatch.setenv("OPENAI4S_REQUIRE_TOKEN", "1")
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
-    printed = capsys.readouterr().out
-    tok = re.search(r"\?token=([0-9a-f]{32})", printed)
-    assert tok, "gateway did not print the access token"
+    captured = capsys.readouterr()
+    # stderr, and this assertion is the point rather than a detail. On `print`
+    # to stdout the banner is block-buffered whenever stdout is not a TTY, so
+    # under nohup, systemd, Docker or any redirect to a log file the one line a
+    # user needs in order to open their own daemon never appeared. It showed in
+    # a terminal, which is exactly why it survived review -- the configuration
+    # that hides it is the one nobody develops in. Found by running a real
+    # daemon with stdout redirected, not by reading the code.
+    assert (
+        "?token=" not in captured.out
+    ), "the access token went to stdout, which is block-buffered off a TTY"
+    tok = re.search(r"\?token=([A-Za-z0-9_-]{20,})", captured.err)
+    assert tok, "gateway did not print the access token to stderr"
     token = tok.group(1)
+
+    # Persisted, so a second daemon on the same data dir uses the same token
+    # rather than invalidating the first one's cookies.
+    from openai4s.server import local_auth
+
+    assert local_auth.read_token(cfg.data_dir) == token
+    gateway_mod.make_handler(cfg, _Hub(), runner)
+    assert local_auth.read_token(cfg.data_dir) == token
 
     handler = object.__new__(handler_cls)
     handler.headers = {}  # no Cookie, no Origin
@@ -1415,6 +2459,20 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     handler._route("GET")
     assert replies[-1][0] == 401
 
+    # A mutation may not authenticate from the query string at all. A URL
+    # carrying a credential is logged by proxies, kept in history and leaked by
+    # Referer, and a mutation is the request least able to afford that.
+    handler.path = f"/api/v1/frames?token={token}"
+    handler._route("POST")
+    assert replies[-1][0] == 401
+
+    # ...but the header works for a non-browser client.
+    handler.headers = {"X-OpenAI4S-Token": token}
+    handler.path = "/health"
+    handler._route("GET")
+    assert replies[-1][0] == 200
+    handler.headers = {}
+
     # /health is exempt from the gate
     handler.path = "/health"
     handler._route("GET")
@@ -1422,7 +2480,19 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     assert code == 200 and body["status"] == "ok"
     assert "data_dir" not in body
 
-    # valid ?token= on a GET → 303 to / with the os_token cookie set
+    # /auth/status is reachable unauthenticated, and tells the truth. It used
+    # to answer `auth_mode: "none"` even with the gate on, so the frontend had
+    # no way to learn a token was required.
+    handler.path = "/api/v1/auth/status"
+    handler._route("GET")
+    code, body = replies[-1]
+    assert code == 200
+    assert body["auth_mode"] == "token"
+    assert body["authenticated"] is False
+    assert token not in json.dumps(body)
+
+    # valid ?token= on a GET → 303 with the os_token cookie, token stripped
+    # from the URL but the rest of the path and query preserved.
     resp = {"code": None, "headers": {}}
     handler.send_response = lambda c: resp.__setitem__("code", c)
     handler.send_header = lambda k, v: resp["headers"].__setitem__(k, v)
@@ -1434,6 +2504,21 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     assert resp["headers"]["Set-Cookie"].startswith(f"os_token={token}")
     assert "HttpOnly" in resp["headers"]["Set-Cookie"]
 
+    resp["headers"].clear()
+    handler.path = f"/?token={token}&mode=raw"
+    handler._route("GET")
+    assert resp["code"] == 303
+    assert resp["headers"]["Location"] == "/?mode=raw"
+
+    # ...but a path that answers with data may not be bootstrapped at all.
+    # `/preview/<id>` streams artifact bytes, so a link carrying a token there
+    # used to set the cookie and then hand the file to whoever held the link.
+    resp["headers"].clear()
+    handler.path = f"/preview/abc?token={token}&mode=raw"
+    handler._route("GET")
+    assert replies[-1][0] == 401
+    assert "Set-Cookie" not in resp["headers"]
+
 
 def test_gateway_error_maps_to_error_envelope(tmp_path):
     """A GatewayError(code, message) raised anywhere under /api/* is serialized
@@ -1443,7 +2528,7 @@ def test_gateway_error_maps_to_error_envelope(tmp_path):
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
     handler = object.__new__(handler_cls)
-    handler.headers = {}
+    handler.headers = _auth_headers(cfg)
     replies = []
     handler._json = lambda obj, code=200: replies.append((code, obj))
 
@@ -1458,13 +2543,20 @@ def test_gateway_error_maps_to_error_envelope(tmp_path):
 
 
 def test_unhandled_exception_maps_to_500_error_envelope(tmp_path, capsys):
-    """A non-GatewayError exception under /api/* becomes a 500 with the
-    same {"error": str(e)} envelope (and never a raw traceback body)."""
+    """A non-GatewayError exception under /api/* becomes a 500 whose body says
+    nothing about the exception.
+
+    This used to assert `{"error": str(e)}` -- it pinned the leak. An
+    exception nobody wrote a message for carries whatever the raising code
+    happened to interpolate, which in practice is a path, an argv or a
+    credential, so the projector replaces it. See
+    tests/test_public_exception_projector.py for the canary that proves it.
+    """
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
     handler = object.__new__(handler_cls)
-    handler.headers = {}
+    handler.headers = _auth_headers(cfg)
     replies = []
     handler._json = lambda obj, code=200: replies.append((code, obj))
 
@@ -1475,7 +2567,12 @@ def test_unhandled_exception_maps_to_500_error_envelope(tmp_path, capsys):
     handler.path = "/api/v1/anything"
     handler._route("GET")
 
-    assert replies[-1] == (500, {"error": "kaput"})
+    code, body = replies[-1]
+    assert code == 500
+    assert "kaput" not in json.dumps(body)
+    assert body["error"] == gateway_mod.INTERNAL_ERROR_MESSAGE
+    assert body["code"] == "internal_error"
+    assert body["request_id"]
     capsys.readouterr()  # swallow the printed traceback
 
 
@@ -1527,8 +2624,10 @@ def test_ws_upgrade_allows_absent_and_same_origin(tmp_path):
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
     for headers in (
-        {"Host": "127.0.0.1:8760"},
-        {"Origin": "http://127.0.0.1:8760", "Host": "127.0.0.1:8760"},
+        _auth_headers(cfg, {"Host": "127.0.0.1:8760"}),
+        _auth_headers(
+            cfg, {"Origin": "http://127.0.0.1:8760", "Host": "127.0.0.1:8760"}
+        ),
     ):
         handler = object.__new__(handler_cls)
         handler.headers = headers
@@ -1554,7 +2653,11 @@ def test_dns_rebinding_host_header_is_rejected(tmp_path):
 
     def _run(headers, method, path):
         handler = object.__new__(handler_cls)
-        handler.headers = headers
+        # Authenticated on purpose: the Host allowlist must reject a rebind
+        # even for a caller holding a valid credential, because the browser in
+        # this attack *has* the user's cookie. A test that relied on the token
+        # gate to produce the 403 would prove nothing about the Host check.
+        handler.headers = _auth_headers(cfg, headers)
         replies = []
         api_calls = []
         handler._json = lambda obj, code=200: replies.append((code, obj))
@@ -1848,10 +2951,21 @@ def test_lineage_serializer_follows_latest_and_restored_version_edges(tmp_path):
     assert restored["interactions"][0]["files_read"] == ["input-a.txt"]
 
 
-def test_upload_base64_decode_and_raw_fallback(tmp_path):
-    """POST /api/uploads decode reality (docs/webapp-api.md §2): valid base64
-    decodes; non-alphabet chars are silently DISCARDED (not an error); only a
-    residual padding/length error falls back to storing the raw UTF-8 text."""
+def test_upload_decodes_base64_or_refuses_it(tmp_path):
+    """`POST /api/uploads` no longer reinterprets what it cannot decode.
+
+    It used to call `b64decode` without `validate=True`, so non-alphabet
+    characters were silently discarded and the payload decoded to *different
+    bytes* with no error -- the artifact then carried a checksum over content
+    nobody sent. When decoding did fail outright, it stored the raw string's
+    UTF-8 bytes: upload a `.npy` whose payload lost a character and the
+    artifact contained the base64 text, versioned and hashed and
+    indistinguishable from data.
+
+    This test asserted both behaviours, and the API doc recorded them as a
+    documented wart. A wart that silently rewrites scientific input is a
+    defect with a nicer name.
+    """
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     hub = _Hub()
     handler_cls = gateway_mod.make_handler(cfg, hub, runner)
@@ -1871,17 +2985,37 @@ def test_upload_base64_decode_and_raw_fallback(tmp_path):
     assert res["id"] == res["artifact_id"] and res["filename"] == "a.bin"
     assert _bytes(res) == b"\x00\x01binary"
 
-    # non-alphabet chars silently dropped, remainder decoded ("Zm9v!YmFy" → foobar)
+    # Line wrapping is transport formatting and still decodes.
+    wrapped = base64.b64encode(b"\x00\x01binary").decode()
     res = handler._upload(
-        {"filename": "b.bin", "content_base64": "Zm9v!YmFy", "frame_id": fid}
+        {
+            "filename": "wrapped.bin",
+            "content_base64": "\n".join(
+                wrapped[i : i + 4] for i in range(0, len(wrapped), 4)
+            ),
+            "frame_id": fid,
+        }
     )
-    assert _bytes(res) == b"foobar"
+    assert _bytes(res) == b"\x00\x01binary"
 
-    # padding/length error → the ORIGINAL string's UTF-8 bytes stored as-is
-    res = handler._upload(
-        {"filename": "c.bin", "content_base64": "%%% not base64 %%%", "frame_id": fid}
-    )
-    assert _bytes(res) == "%%% not base64 %%%".encode("utf-8")
+    # A stray non-alphabet character is corruption. It used to be dropped, and
+    # "Zm9v!YmFy" decoded to b"foobar" -- plausible bytes, wrong content.
+    with pytest.raises(gateway_mod.GatewayError) as dropped:
+        handler._upload(
+            {"filename": "b.bin", "content_base64": "Zm9v!YmFy", "frame_id": fid}
+        )
+    assert dropped.value.code == 400
+
+    # And text that is not base64 at all is refused rather than stored as-is.
+    with pytest.raises(gateway_mod.GatewayError) as raw:
+        handler._upload(
+            {
+                "filename": "c.bin",
+                "content_base64": "%%% not base64 %%%",
+                "frame_id": fid,
+            }
+        )
+    assert raw.value.code == 400
 
 
 # --- hand-rolled WebSocket wire format (risk register: payload drift) -------
@@ -2009,7 +3143,7 @@ def test_preview_route_forces_html_content_type(tmp_path):
     text/html, whatever the stored content_type says."""
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     handler, sends = _bytes_handler(cfg, runner)
-    handler.headers = {}  # _route consults Origin/Cookie headers
+    handler.headers = _auth_headers(cfg)  # _route consults Origin/Cookie headers
 
     f = st.workspace / "report.md"
     f.write_text("# hi")
@@ -2091,7 +3225,7 @@ def test_body_rejects_unparseable_json_with_an_explicit_4xx(tmp_path):
         assert e.value.code == 400
         assert "must be a JSON object" in e.value.message
 
-    handler.headers = {}  # no Content-Length header at all
+    handler.headers = _auth_headers(cfg)  # no Content-Length header at all
     handler.rfile = io.BytesIO(b'{"ignored": true}')
     assert handler._body() == {}
 
@@ -2154,7 +3288,7 @@ def test_request_body_cache_is_released_after_keepalive_dispatch(tmp_path):
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
     handler = object.__new__(handler_cls)
     handler.path = "/ignored"
-    handler.headers = {"Content-Length": "2"}
+    handler.headers = _auth_headers(cfg, {"Content-Length": "2"})
     handler.rfile = io.BytesIO(b"{}")
     handler.close_connection = False
     replies = []
@@ -2175,7 +3309,7 @@ def test_websocket_upgrade_is_never_reused_as_http_keepalive(tmp_path):
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
     handler = object.__new__(handler_cls)
     handler.path = "/api/v1/ws"
-    handler.headers = {}
+    handler.headers = _auth_headers(cfg)
     handler.close_connection = False
     upgraded = []
     handler._handle_ws = lambda: upgraded.append(True)
@@ -2588,3 +3722,522 @@ def test_kernel_install_route_is_not_gated_by_notebook_repl(tmp_path):
     handler._api("POST", f"/frames/{fid}/kernel/install")
     assert replies[-1][0] == 200  # not 403
     assert hits and hits[0][0] == ["seaborn"]
+
+
+# --------------------------------------------------------------------------
+# a resume cursor is only meaningful inside the daemon run that issued it
+# --------------------------------------------------------------------------
+
+
+class _Recorder:
+    """Collects everything the hub sends to one client."""
+
+    def __init__(self):
+        self.alive = True
+        self.subs = set()
+        self.events = []
+
+    def send_json(self, event):
+        self.events.append(dict(event))
+
+    def replay_begin(self):
+        return next((e for e in self.events if e.get("type") == "replay_begin"), None)
+
+
+def _live_turn(hub, root, count=3):
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    for i in range(count):
+        hub.broadcast(root, {"type": "text_chunk", "frame_id": root, "chunk": str(i)})
+    return max(int(e.get("seq") or 0) for e in hub._live[root]["events"])
+
+
+def test_a_cursor_from_a_previous_daemon_run_is_reported_as_a_gap():
+    """The silent failure this exists for. `_seq` is in-process, so a restart
+    puts it back to zero while the client still holds a cursor from the
+    previous run. Nothing was replayed and no gap was declared, so the client
+    sat there believing it was caught up on a stream it had entirely missed.
+    """
+    before = gateway_mod.WSHub()
+    root = "root-restart"
+    last_seq = _live_turn(before, root)
+    assert last_seq > 0
+
+    restarted = gateway_mod.WSHub()  # a fresh process: empty buffer, seq at 0
+    conn = _Recorder()
+    restarted.add(conn)
+    restarted.subscribe(root, conn, last_seq, before.epoch)
+
+    begin = conn.replay_begin()
+    assert begin is not None, "silence let the client believe it was caught up"
+    assert begin["gap"] is True
+    assert begin["epoch"] == restarted.epoch != before.epoch
+
+
+def test_a_restart_is_detected_even_without_a_client_epoch():
+    """Detection must not depend on the client having been updated.
+
+    The counter sitting below the cursor was the original proof, and it only
+    covers cursors this daemon has not reached. A cursor it *has* reached is
+    indistinguishable from one of its own, so an epoch-less cursor is a gap
+    whatever the counter says — see the paired test below."""
+    restarted = gateway_mod.WSHub()
+    conn = _Recorder()
+    restarted.add(conn)
+    restarted.subscribe("root-old-client", conn, 500)  # no epoch sent
+
+    begin = conn.replay_begin()
+    assert begin is not None
+    assert begin["gap"] is True
+
+
+def test_an_epochless_cursor_the_counter_has_reached_is_still_a_gap():
+    """Codex P1. The numeric check cannot see this one: once the new daemon has
+    emitted at least as many events as the cursor names, the cursor looks
+    placeable, and replay silently filters the new stream's early events out as
+    already seen."""
+    restarted = gateway_mod.WSHub()
+    root = "root-old-tab"
+    _live_turn(restarted, root, count=4)
+
+    conn = _Recorder()
+    restarted.add(conn)
+    restarted.subscribe(root, conn, 2)  # no epoch, and 2 <= our own counter
+
+    begin = conn.replay_begin()
+    assert begin is not None
+    assert begin["gap"] is True
+
+
+def test_a_cursor_within_the_same_run_replays_only_what_was_missed():
+    """The ordinary case must keep working: no gap, and only the tail."""
+    hub = gateway_mod.WSHub()
+    root = "root-same-run"
+    _live_turn(hub, root, count=4)
+    events = hub._live[root]["events"]
+    cursor = int(events[1]["seq"])
+
+    conn = _Recorder()
+    hub.add(conn)
+    hub.subscribe(root, conn, cursor, hub.epoch)
+
+    begin = conn.replay_begin()
+    assert begin["gap"] is False
+    replayed = [e for e in conn.events if e.get("type") == "text_chunk"]
+    assert replayed, "the missed tail must still arrive"
+    assert all(int(e["seq"]) > cursor for e in replayed)
+
+
+def test_a_fresh_subscriber_with_no_cursor_is_not_a_gap():
+    hub = gateway_mod.WSHub()
+    root = "root-fresh"
+    _live_turn(hub, root)
+
+    conn = _Recorder()
+    hub.add(conn)
+    hub.subscribe(root, conn, 0)
+
+    begin = conn.replay_begin()
+    assert begin["gap"] is False
+
+
+def test_a_cursor_older_than_the_retained_window_is_a_gap():
+    """The pre-existing case: the buffer aged past the cursor."""
+    hub = gateway_mod.WSHub()
+    root = "root-aged"
+    _live_turn(hub, root, count=3)
+    # Pretend the client's cursor predates everything still retained.
+    hub._live[root]["events"] = hub._live[root]["events"][-1:]
+
+    conn = _Recorder()
+    hub.add(conn)
+    hub.subscribe(root, conn, 1, hub.epoch)
+
+    assert conn.replay_begin()["gap"] is True
+
+
+def test_every_hub_instance_has_its_own_epoch():
+    assert gateway_mod.WSHub().epoch != gateway_mod.WSHub().epoch
+
+
+def test_a_stale_cursor_declares_the_gap_without_replaying_anything():
+    """Where two invariants meet. The client must learn it is out of sync, and
+    a cursor we cannot place must not wrap around into a full replay — the
+    client refetches on `gap`, so anything sent here is rendered and then
+    immediately discarded."""
+    before = gateway_mod.WSHub()
+    root = "root-stale-no-replay"
+    last = _live_turn(before, root, count=3)
+
+    restarted = gateway_mod.WSHub()
+    _live_turn(restarted, root, count=3)  # a new turn, new numbering
+    conn = _Recorder()
+    restarted.add(conn)
+    restarted.subscribe(root, conn, last + 500, before.epoch)
+
+    assert conn.replay_begin()["gap"] is True
+    assert not [
+        e for e in conn.events if e.get("type") == "text_chunk"
+    ], "a cursor this process cannot place must not trigger a full replay"
+
+
+def test_the_access_token_is_minted_once_and_survives_a_restart(tmp_path):
+    """A token in a closure changed on every boot.
+
+    That is tolerable while the gate is off by default and intolerable once it
+    is on: every cookie already issued stops working, and the user is locked
+    out of their own daemon by a restart. It also has to be readable by the
+    CLI, which must present a credential and cannot import the web server to
+    find out what it is.
+    """
+    from openai4s.server import local_auth
+
+    first = local_auth.load_or_mint(tmp_path)
+    assert first
+    assert local_auth.load_or_mint(tmp_path) == first
+    assert local_auth.read_token(tmp_path) == first
+
+    # Owner-only on POSIX; the file holds a live credential.
+    import os as _os
+
+    mode = (tmp_path / local_auth.TOKEN_FILENAME).stat().st_mode & 0o777
+    if _os.name == "posix":
+        assert mode == 0o600, oct(mode)
+
+    # No temporary left behind by the atomic write.
+    assert not [p.name for p in tmp_path.glob(".*tmp*")]
+
+    # A different data dir is a different daemon.
+    other = tmp_path / "elsewhere"
+    assert local_auth.load_or_mint(other) != first
+
+
+def test_token_comparison_is_constant_time_and_refuses_empties():
+    """`==` on a secret leaks its prefix through timing -- weak over loopback,
+    real over a tunnel. An absent value must never compare equal to an absent
+    expectation, or a daemon with no token would accept anyone."""
+    from openai4s.server import local_auth
+
+    assert local_auth.matches("abc", "abc") is True
+    assert local_auth.matches("abc", "abd") is False
+    assert local_auth.matches(None, "abc") is False
+    assert local_auth.matches("abc", None) is False
+    assert local_auth.matches(None, None) is False
+    assert local_auth.matches("", "") is False
+
+
+def test_the_loopback_gate_is_required_by_default(tmp_path, monkeypatch):
+    """It used to be opt-in on loopback.
+
+    The reasoning was that a single-user local tool needs no gate. But the
+    daemon exposes unauthenticated code execution -- `kernel/execute`,
+    `compute/jobs`, `host.bash` -- and "local" includes every other process on
+    the machine. The Host and Origin guards cover the browser; they do not
+    cover a local process.
+
+    `OPENAI4S_REQUIRE_TOKEN=0` is the escape hatch, and it lives for one minor
+    release. Same variable that used to opt *in*, sense reversed, so a script
+    setting it to 1 keeps working and simply asks for what is now the default.
+    """
+    from openai4s.server import local_auth
+
+    monkeypatch.delenv("OPENAI4S_REQUIRE_TOKEN", raising=False)
+    cfg = _cfg(tmp_path / "default")
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    gateway_mod.make_handler(cfg, _Hub(), runner)
+    assert local_auth.read_token(cfg.data_dir), "loopback did not require a token"
+
+    # The legacy opt-out, honoured on loopback.
+    monkeypatch.setenv("OPENAI4S_REQUIRE_TOKEN", "0")
+    relaxed = _cfg(tmp_path / "relaxed")
+    relaxed_runner = gateway_mod.SessionRunner(relaxed, _Hub())
+    gateway_mod.make_handler(relaxed, _Hub(), relaxed_runner)
+    assert local_auth.read_token(relaxed.data_dir) is None
+
+    # ...and ignored off loopback. A bind anything can route to has no
+    # configuration under which it should answer without a credential.
+    exposed = Config(
+        data_dir=tmp_path / "exposed",
+        host="0.0.0.0",
+        llm=LLMConfig(provider="deepseek", api_key="test-key"),
+        max_turns=3,
+    )
+    exposed_runner = gateway_mod.SessionRunner(exposed, _Hub())
+    gateway_mod.make_handler(exposed, _Hub(), exposed_runner)
+    assert local_auth.read_token(exposed.data_dir), "non-loopback honoured the opt-out"
+
+
+def test_the_cli_presents_the_daemon_credential(tmp_path, monkeypatch):
+    """Every daemon-backed subcommand 401s without this.
+
+    `_daemon_request` sent no credential at all and leaned on a comment saying
+    the CSRF guard passes non-browser clients -- true, and unrelated to the
+    token gate. `OPENAI4S_TOKEN` exists because the token file is owner-only:
+    a daemon under another account (a systemd unit) writes a file this user
+    cannot read, and without an override the CLI would need a chmod or a `su`.
+    """
+    from openai4s.cli.main import _daemon_credential_hint, _daemon_token
+    from openai4s.server import local_auth
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.delenv("OPENAI4S_TOKEN", raising=False)
+
+    # Nothing minted yet: the hint names the path and what to do.
+    assert _daemon_token(cfg) is None
+    assert "OPENAI4S_TOKEN" in _daemon_credential_hint(cfg)
+
+    minted = local_auth.load_or_mint(cfg.data_dir)
+    assert _daemon_token(cfg) == minted
+
+    # The override wins, for the cross-account case it exists for.
+    monkeypatch.setenv("OPENAI4S_TOKEN", "supplied-by-the-operator")
+    assert _daemon_token(cfg) == "supplied-by-the-operator"
+
+    # And the gate accepts what the CLI sends.
+    monkeypatch.delenv("OPENAI4S_TOKEN", raising=False)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {local_auth.TOKEN_HEADER: _daemon_token(cfg)}
+    handler.path = "/api/v1/frames"
+    reached = []
+    handler._json = lambda obj, code=200: reached.append(("json", code))
+    handler._api = lambda method, sub: reached.append(("api", sub))
+    handler._route("GET")
+    assert reached and reached[-1][0] == "api"
+
+
+def _probe_route(handler_cls, headers, path, method="GET"):
+    """Drive `_route` and report what it did: an int status, or ("api", sub)."""
+    handler = object.__new__(handler_cls)
+    handler.headers = headers
+    handler.path = path
+    seen: list[object] = []
+    handler._json = lambda obj, code=200: seen.append(code)
+    handler._api = lambda m, sub: seen.append(("api", sub))
+    handler.send_response = lambda code: seen.append(code)
+    handler.send_header = lambda k, v: None
+    handler.end_headers = lambda: None
+    handler._prepare_request_body = lambda *a, **k: None
+    handler._route(method)
+    return seen[-1] if seen else None
+
+
+def test_a_query_token_bootstraps_only_the_root_page(tmp_path, monkeypatch):
+    """A URL with a credential in it is a shareable credential.
+
+    It gets pasted into chat, logged by a proxy and kept in browser history.
+    The gate accepted `?token=` on *any* GET, so
+    `/api/v1/artifacts/<id>/download?token=…` was a link that hands over the
+    file to whoever holds it -- no redirect, no cookie hand-off, the response
+    body is the payload. Excluding `/api/v1/` and `/static/` narrowed that but
+    did not close it: `/preview/<id>` is neither, and it answers with artifact
+    bytes. Only the root page -- the one URL the product ever prints -- may be
+    bootstrapped, and the 303 strips the credential immediately.
+    """
+    from openai4s.server import local_auth
+
+    monkeypatch.delenv("OPENAI4S_REQUIRE_TOKEN", raising=False)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    token = local_auth.read_token(cfg.data_dir)
+    try:
+        assert _probe_route(handler_cls, {}, f"/?token={token}") == 303
+        assert _probe_route(handler_cls, {}, f"/index.html?token={token}") == 303
+        # Everything else: refused, even with a valid token in the query.
+        # `/preview/<id>` is the one that mattered -- it is not under the API
+        # prefix, so the old subtractive rule bootstrapped it.
+        assert _probe_route(handler_cls, {}, f"/session/abc?token={token}") == 401
+        assert _probe_route(handler_cls, {}, f"/preview/abc?token={token}") == 401
+        assert _probe_route(handler_cls, {}, f"/api/v1/frames?token={token}") == 401
+        assert _probe_route(handler_cls, {}, f"/static/app.js?token={token}") == 401
+        # And a mutation is refused on every path, navigation or not.
+        assert (
+            _probe_route(handler_cls, {}, f"/session/abc?token={token}", "POST") == 401
+        )
+    finally:
+        runner.close()
+
+
+def test_the_gate_accepts_bearer_and_the_explicit_header(tmp_path, monkeypatch):
+    """`Authorization: Bearer` is what a generic client reaches for unprompted.
+
+    Neither spelling is preferred. `X-OpenAI4S-Token` stays because something
+    upstream may already own `Authorization`, and the CLI sends it; Bearer is
+    here so `curl -H` and any SDK work without reading the docs first.
+
+    Both go through one parser, which `/auth/status` also calls -- a status
+    route that answers from its own reasoning is how the old hardcoded "none"
+    survived a gate that was actually on.
+    """
+    from openai4s.server import local_auth
+
+    monkeypatch.delenv("OPENAI4S_REQUIRE_TOKEN", raising=False)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    token = local_auth.read_token(cfg.data_dir)
+    try:
+        for headers in (
+            {"Authorization": f"Bearer {token}"},
+            {"Authorization": f"bearer {token}"},  # RFC 7235: scheme is caseless
+            {local_auth.TOKEN_HEADER: token},
+        ):
+            assert _probe_route(handler_cls, headers, "/api/v1/frames") == (
+                "api",
+                "/frames",
+            ), headers
+        for headers in (
+            {"Authorization": f"Basic {token}"},  # right value, wrong scheme
+            {"Authorization": "Bearer "},
+            {"Authorization": token},  # bare, no scheme
+            {"Authorization": "Bearer not-the-token"},
+        ):
+            assert _probe_route(handler_cls, headers, "/api/v1/frames") == 401, headers
+
+        # /auth/status reports through the same parser, and never leaks the
+        # token itself -- only whether one was accepted.
+        handler = object.__new__(handler_cls)
+        handler.headers = {"Authorization": f"Bearer {token}"}
+        handler.path = "/api/v1/auth/status"
+        seen: list[dict] = []
+        handler._json = lambda obj, code=200: seen.append(obj)
+        handler._api("GET", "/auth/status")
+        assert seen[-1]["authenticated"] is True
+        assert seen[-1]["auth_mode"] == "token"
+        assert token not in json.dumps(seen[-1])
+    finally:
+        runner.close()
+
+
+def test_the_correlation_id_reaches_the_job_thread():
+    """`contextvars` do not cross a `threading.Thread`.
+
+    The comment above `_correlation_id` said the opposite -- that a ContextVar
+    was chosen "because the gateway hands requests to threads *and* the value
+    has to survive into anything those threads schedule". A new thread starts
+    with an empty context, so every structured log line emitted from a turn, a
+    plan or a REPL job carried an empty `request_id`: the id a user quotes off
+    a failed request matched nothing in the log for the work that failed, which
+    is the one place it was supposed to help.
+
+    Two halves, because a unit test of the helper would prove the helper and
+    the defect was that the spawn sites did not use one: the behaviour is
+    asserted here, and that the three request-serving spawns actually go
+    through it is asserted in the companion test below.
+    """
+    from openai4s.observability import (
+        carry_context,
+        correlation_id,
+        new_correlation_id,
+        reset_correlation_id,
+        set_correlation_id,
+    )
+
+    request_id = new_correlation_id()
+    token = set_correlation_id(request_id)
+    try:
+        captured: list[str] = []
+        thread = threading.Thread(
+            target=carry_context(lambda: captured.append(correlation_id()))
+        )
+        thread.start()
+        thread.join(5)
+        assert captured == [request_id], "the spawn helper did not carry the id"
+
+        # ...and a bare thread still does not, which is what makes the helper
+        # load-bearing rather than decorative.
+        bare: list[str] = []
+        plain = threading.Thread(target=lambda: bare.append(correlation_id()))
+        plain.start()
+        plain.join(5)
+        assert bare == [""], "a bare thread carried the id; the helper is moot"
+
+        # The job records the id it was built under, so the failure a user
+        # reads and the log line for the failed work share one id.
+        job = gateway_mod.MessageJob("job-1", "root-1")
+        assert job.request_id == request_id
+        job.finish(error="boom")
+        assert job.wait_result()["request_id"] == request_id
+    finally:
+        reset_correlation_id(token)
+
+
+def test_every_request_serving_spawn_goes_through_the_helper():
+    """The half that would have caught the original defect.
+
+    `carry_context` working proves nothing if the spawn sites do not call it,
+    and that is exactly the state this started in. Read as source because the
+    threads are created inside closures that a real turn would have to reach --
+    and a test that has to run a whole turn to check one keyword argument
+    tends not to be written at all.
+    """
+    import inspect
+    import re as _re
+
+    source = inspect.getsource(gateway_mod)
+    unwrapped = []
+    for name in ("openai4s-turn-", "openai4s-plan-", "openai4s-repl-"):
+        index = source.find(name)
+        assert index > 0, f"the {name} spawn site moved; this test cannot see it"
+        window = source[max(0, index - 400) : index]
+        # The nearest preceding `target=` is this Thread's.
+        targets = _re.findall(r"target=(\w+)", window)
+        if not targets or targets[-1] != "carry_context":
+            unwrapped.append(name)
+    assert not unwrapped, (
+        "these request-serving threads do not carry the caller's correlation "
+        f"id: {unwrapped}"
+    )
+
+
+def test_a_job_built_outside_a_request_mints_its_own_id_rather_than_none():
+    """A direct submit -- the CLI, a recovery replay -- has no HTTP request
+    behind it, and this used to leave the field off entirely. That was the
+    smaller of two wrongs: `run_message` minted its own id for the socket
+    regardless, so the 202 and the job query were nameless while the stream
+    carried an id nothing else knew. One id the caller can quote everywhere
+    beats an honest absence that the next layer contradicts."""
+    from openai4s.observability import reset_correlation_id, set_correlation_id
+
+    token = set_correlation_id("")
+    try:
+        job = gateway_mod.MessageJob("job-2", "root-2")
+        assert job.request_id, "a job built outside a request has no id at all"
+        job.finish(error="boom")
+        result = job.wait_result()
+        assert result["request_id"] == job.request_id
+        assert result["error"] == "boom"
+
+        # Portable: it travels in a header, a JSON body and a log line, so it
+        # has to survive all three unescaped.
+        assert re.fullmatch(r"[A-Za-z0-9_-]{8,64}", job.request_id), job.request_id
+
+        # And minted per job, not shared. Two turns that cannot be told apart
+        # are the defect this id exists to close.
+        other = gateway_mod.MessageJob("job-3", "root-2")
+        assert other.request_id != job.request_id
+    finally:
+        reset_correlation_id(token)
+
+
+def test_daemon_lifetime_threads_do_not_inherit_a_request_id():
+    """The sweepers are deliberately left alone.
+
+    A thread that lives as long as the daemon is not serving the request that
+    happened to start it. Stamping every later sweep with that request's id
+    would be a false attribution, which is worse than a missing one because it
+    gets believed -- the same failure this whole batch has been removing.
+    """
+    import inspect
+
+    source = inspect.getsource(gateway_mod)
+    for name in ("openai4s-kernel-idle-sweeper", "openai4s-share-sweeper"):
+        index = source.find(name)
+        if index < 0:
+            continue
+        window = source[max(0, index - 400) : index]
+        assert "carry_context" not in window, (
+            f"{name} is a daemon-lifetime thread and must not inherit a "
+            "request's correlation id"
+        )

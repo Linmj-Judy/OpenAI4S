@@ -38,7 +38,6 @@ _STATIC_WHITELIST = frozenset(
     {
         "share.js",
         "share.css",
-        "md_renderer.js",
         "scientific_renderers.js",
         "vendor/3Dmol-min.js",
     }
@@ -196,9 +195,9 @@ class ShareRouter:
         headers["Content-Type"] = "application/vnd.openai4s.session+zip"
         headers["Accept-Ranges"] = "bytes"
         headers["Cache-Control"] = "no-store"
-        headers[
-            "Content-Disposition"
-        ] = 'attachment; filename="session.openai4s-session.zip"'
+        headers["Content-Disposition"] = (
+            'attachment; filename="session.openai4s-session.zip"'
+        )
         if sha:
             headers["X-Content-SHA256"] = sha
         return self._file_body(method, request, target, headers)

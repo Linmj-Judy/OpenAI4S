@@ -1,17 +1,19 @@
 """openai4s CLI: serve / status / stop / url / run / init / setup.
 
-  openai4s serve    start the daemon (foreground; use & or nohup to background)
-  openai4s status   is the daemon up? (reads pidfile + /health)
-  openai4s stop     stop the running daemon
-  openai4s url      print the local web UI url
-  openai4s run "<task>"   run one Code-as-Action task (in-process, no daemon)
-  openai4s init     guided first-run model configuration
-  openai4s setup    create/update conda envs from envs/*.yml
-  openai4s jupyter  describe/export/install the optional Jupyter bridge
+openai4s serve    start the daemon (supports --port/--no-browser/--detached)
+openai4s status   is the daemon up? (reads pidfile + /health)
+openai4s stop     stop the running daemon
+openai4s url      print the local web UI url
+openai4s run "<task>"   run one Code-as-Action task (in-process, no daemon)
+openai4s init     guided first-run model configuration
+openai4s setup    create/update conda envs from envs/*.yml
+openai4s jupyter  describe/export/install the optional Jupyter bridge
 """
+
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import json
 import os
@@ -25,24 +27,86 @@ import urllib.request
 from pathlib import Path
 
 from openai4s.config import get_config
+from openai4s.execution.process_group import TERM_GRACE_S
 
 
-def _write_state(cfg) -> None:
-    cfg.pidfile.write_text(str(os.getpid()), "utf-8")
-    cfg.statefile.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "host": cfg.host,
-                "port": cfg.port,
-                "started_at": int(time.time()),
-            }
-        ),
-        "utf-8",
+def _statefile_payload(cfg) -> str:
+    return json.dumps(
+        {
+            "pid": os.getpid(),
+            "pid_start": _process_start_token(os.getpid()),
+            "host": cfg.host,
+            "port": cfg.port,
+            "started_at": int(time.time()),
+        }
     )
 
 
-def _clear_state(cfg) -> None:
+def _acquire_singleton(cfg) -> bool:
+    """Atomically claim the daemon pidfile. True iff we now own the singleton.
+
+    ``O_CREAT|O_EXCL`` makes "create the pidfile or fail" a single atomic step,
+    closing the check-then-write race where two concurrent ``serve`` runs each
+    passed a separate liveness check and then both booted the same data dir. A
+    stale pidfile (its recorded pid is gone) is reclaimed once; a live one
+    means another daemon holds the slot. The statefile is a non-authoritative
+    sidecar written after — the pidfile is the lock.
+    """
+    for reclaim in (True, False):
+        try:
+            fd = os.open(cfg.pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            existing = _read_pid(cfg)
+            if existing and _daemon_alive(cfg, existing):
+                return False
+            if not reclaim:
+                return False  # a concurrent booter won the reclaim
+            try:
+                cfg.pidfile.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        try:
+            # The statefile first, then the pid — the reverse of the obvious
+            # order, and load-bearing since the statefile started carrying the
+            # identity `_daemon_alive` compares against.
+            #
+            # Written second, there was a window holding a readable *new* pid
+            # beside the *previous* generation's record. When the two happen to
+            # name the same pid — negligible on a desktop, the ordinary case in
+            # a container where the daemon lands on the same low pid every boot
+            # — a reader in that window compares this process against its
+            # predecessor's start token, concludes stale, and acts on it: a
+            # second `serve` reclaims a live pidfile, and `stop` reports "not
+            # running" and then deletes the live daemon's state.
+            #
+            # This way round there is no such state. The pidfile is empty until
+            # the record describing it is already on disk, and an empty pidfile
+            # is a case every reader already handles as "no daemon".
+            cfg.statefile.write_text(_statefile_payload(cfg), "utf-8")
+            with os.fdopen(fd, "w") as handle:
+                handle.write(str(os.getpid()))
+        except OSError:
+            _clear_state(cfg, only_if_owned_by=os.getpid())
+            raise
+        return True
+    return False
+
+
+def _clear_state(cfg, *, only_if_owned_by: int | None = None) -> None:
+    """Remove the daemon state files.
+
+    ``only_if_owned_by`` guards the serve path: on a startup failure a booter
+    must delete only the pidfile it actually wrote, never one a concurrent
+    winner now owns (deleting that stranded a live daemon whose port stayed
+    bound while ``status`` and ``stop`` read "not running"). ``stop`` clears
+    unconditionally — it is deliberately removing another process's state after
+    confirming that process is gone.
+    """
+    if only_if_owned_by is not None:
+        current = _read_pid(cfg)
+        if current is not None and current != only_if_owned_by:
+            return
     for p in (cfg.pidfile, cfg.statefile):
         try:
             p.unlink()
@@ -65,27 +129,409 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _url(cfg) -> str:
-    return f"http://{cfg.host}:{cfg.port}/"
+def _process_start_token(pid: int) -> str | None:
+    """An identity for *this* incarnation of ``pid``, or None where unknowable.
+
+    ``os.kill(pid, 0)`` answers "some process has this pid", which is not the
+    question the singleton is asking — "is the daemon we recorded still
+    running". The two come apart wherever pids are reused quickly, and a
+    container is the worst case rather than a corner one: every restart starts
+    a fresh pid namespace at 1, so a pidfile persisted on a volume names a low
+    pid that the *new* container has almost certainly handed to something else
+    — often to the init that just launched this very daemon. `serve` then
+    reports "daemon already running (pid 1)" and exits 1, every time, on the
+    volume whose whole purpose was to make restarts safe.
+
+    Linux exposes the distinguishing fact: field 22 of ``/proc/<pid>/stat`` is
+    the process's start time in clock ticks since boot. Two processes may share
+    a pid, but a process that started at a different moment is a different
+    process. Elsewhere — macOS has no procfs — there is nothing cheap and
+    correct to read, so this returns None and the caller keeps the older,
+    weaker answer instead of guessing.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    # comm (field 2) is the one field that may contain spaces and parentheses,
+    # and it is always parenthesised — so split after its *last* ')' rather
+    # than on whitespace, which a process named "(x) 1 2 3" would otherwise
+    # shift by four fields.
+    close = raw.rfind(b")")
+    if close == -1:
+        return None
+    fields = raw[close + 2 :].split()
+    # Field 22 overall. Fields 1 and 2 are behind us, so it is index 19 here.
+    if len(fields) < 20:
+        return None
+    return fields[19].decode("ascii", "replace")
+
+
+def _recorded_identity(cfg) -> tuple[int | None, str | None]:
+    """The (pid, start token) the running daemon wrote, as far as it is known."""
+    path = getattr(cfg, "statefile", None)
+    if path is None:
+        return (None, None)
+    try:
+        payload = json.loads(Path(path).read_text("utf-8"))
+    except (OSError, ValueError):
+        return (None, None)
+    if not isinstance(payload, dict):
+        return (None, None)
+    pid = payload.get("pid")
+    start = payload.get("pid_start")
+    return (
+        pid if isinstance(pid, int) else None,
+        start if isinstance(start, str) and start else None,
+    )
+
+
+def _daemon_alive(cfg, pid: int) -> bool:
+    """Is the daemon that wrote the pidfile still the process holding ``pid``?
+
+    Liveness first, because it is the cheap half and the only half available
+    off Linux. When the statefile corroborates the pidfile — same pid, and a
+    start token to compare — a mismatched token means the pid was reused and
+    the pidfile is stale.
+
+    A statefile naming a *different* pid is deliberately treated as no
+    information rather than as evidence of staleness. It is written just after
+    the pidfile is claimed, so during that window it still describes the
+    previous generation; reading it as proof would let a second booter declare
+    the live winner stale and reclaim its pidfile — reopening the double-boot
+    race ``O_EXCL`` exists to close.
+    """
+    if not _pid_alive(pid):
+        return False
+    recorded_pid, recorded_start = _recorded_identity(cfg)
+    if recorded_pid != pid or recorded_start is None:
+        return True
+    current = _process_start_token(pid)
+    if current is None:
+        return True
+    return current == recorded_start
+
+
+def _reachable_host(host: str) -> str:
+    """A bind address, rendered as somewhere a client can actually connect.
+
+    A wildcard bind is a statement about which interfaces to listen on, not an
+    address: nothing dials `http://0.0.0.0:8760/`. Every caller of `_url` is
+    either handing the string to a person to open or opening it itself, and
+    both were being given a URL that is wrong on macOS and merely peculiar on
+    Linux. Containers made it the common case rather than the exotic one —
+    `OPENAI4S_HOST=0.0.0.0` is the only way a published port reaches the
+    daemon — so the startup banner a container operator reads, and the
+    `openai4s url` they run to recover their token, both printed an address
+    they then had to know to translate.
+
+    Loopback is the honest rendering: it is reachable from inside the
+    namespace that is listening, and it is what the operator's own port
+    publishing or `kubectl port-forward` puts on the other end.
+    """
+    return "localhost" if host in ("0.0.0.0", "::", "") else host
+
+
+def _url(cfg, *, with_token: bool = True) -> str:
+    """The URL a person can actually open.
+
+    This returned the bare origin, and every human-facing caller used it: the
+    browser auto-open on `serve`, the `status` line, the `url` command, and the
+    macOS .app. Since the access token became required by default on loopback,
+    that URL answers 401 — and so does `/static/app.js`, so the SPA never loads
+    and cannot offer a way in. The one working URL went to stderr, which the
+    .app redirects into a log file nobody is looking at on first launch.
+
+    `with_token=False` is for anywhere the string is not being handed to a
+    person to open — a credential does not belong in a log line or a title.
+    """
+    base = f"http://{_reachable_host(cfg.host)}:{cfg.port}/"
+    if not with_token:
+        return base
+    try:
+        from openai4s.server import local_auth
+
+        token = local_auth.read_token(cfg.data_dir)
+    except Exception:  # noqa: BLE001 — never let this break `serve`
+        token = None
+    return f"{base}?token={token}" if token else base
+
+
+def _sigterm_to_keyboard_interrupt(signum, frame):
+    """Turn `openai4s stop`'s SIGTERM into the Ctrl-C path — nothing more.
+
+    The state files must outlive the process they describe: clearing them
+    here, at signal arrival, deleted the pidfile before the (possibly slow)
+    runner/kernel teardown ran, so a `stop` that timed out told the user to
+    retry against a pidfile the daemon had already removed — the retry and
+    `stop --force` both saw "not running" while the port stayed bound.  The
+    serve loop's finally clears state after teardown completes.
+    """
+    raise KeyboardInterrupt
+
+
+def _bind_failure_message(exc: OSError, cfg) -> str | None:
+    """One clear line naming the env var to fix, or ``None`` to re-raise.
+
+    ``build_server`` does more than bind, so only bind-shaped errnos map to
+    the port: EADDRINUSE and EADDRNOTAVAIL cannot come from anywhere else,
+    while EACCES is blamed on the port only when the port is actually
+    privileged — a read-only data dir raises EACCES too, and that one must
+    stay a traceback pointing at the real path.
+    """
+    prefix = f"error: cannot listen on {cfg.host}:{cfg.port} — "
+    if exc.errno == errno.EADDRINUSE:
+        return prefix + (
+            "address already in use. A previous daemon may still be "
+            "shutting down, or another process holds the port; free it or "
+            "change OPENAI4S_PORT."
+        )
+    if exc.errno == errno.EACCES and cfg.port < 1024:
+        return prefix + (
+            "permission denied. Ports below 1024 are privileged; pick an "
+            "unprivileged one via OPENAI4S_PORT (default 8760)."
+        )
+    if exc.errno == errno.EADDRNOTAVAIL:
+        return prefix + (
+            "this machine has no such address. Check OPENAI4S_HOST "
+            "(127.0.0.1 serves locally)."
+        )
+    return None
+
+
+def _apply_serve_overrides(args, cfg) -> None:
+    """Apply command-line listen overrides to config and the child environment.
+
+    Host and port historically came only from environment variables.  Config's
+    dataclass defaults are evaluated when its module is imported, so changing
+    the environment alone here would be too late for the foreground process.
+    Updating both keeps this process and a detached child on the same address.
+    """
+
+    host = getattr(args, "host", None)
+    port = getattr(args, "port", None)
+    if host:
+        cfg.host = str(host)
+        os.environ["OPENAI4S_HOST"] = str(host)
+    if port is not None:
+        cfg.port = int(port)
+        os.environ["OPENAI4S_PORT"] = str(port)
+
+
+def _tcp_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def _open_daemon(request, *, timeout: float):
+    """Open a local daemon URL without consulting environment proxies.
+
+    Under WSL2 the daemon can be reached through its NAT address rather than
+    loopback.  It is still a local control-plane request, so sending it through
+    an inherited HTTP(S) proxy is both incorrect and a source of false startup
+    failures.
+    """
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
+def _health_ready(cfg) -> bool:
+    """True only when the listener identifies itself as an OpenAI4S daemon."""
+
+    try:
+        with _open_daemon(
+            _url(cfg, with_token=False) + "health", timeout=1
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        # The occupant may be any local service: a JSON body that is not an
+        # object is "not our daemon", never a crash.
+        return (
+            response.status == 200
+            and isinstance(payload, dict)
+            and payload.get("status") == "ok"
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _cleanup_failed_detached_child(process) -> None:
+    """Stop and reap a detached child whose readiness contract failed."""
+
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (ProcessLookupError, OSError):
+        return
+
+    try:
+        process.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.wait(timeout=5)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _cmd_serve_detached(args, cfg) -> int:
+    """Start the same foreground server in a new POSIX session.
+
+    The detached child owns the pid/state files and all shutdown handling.  The
+    parent only redirects its descriptors, waits until the child-owned pidfile
+    and the real ``/health`` response agree, and then returns.  This is
+    intentionally a CLI convenience for Linux/macOS (including WSL2), not a
+    native-Windows kernel path.
+    """
+
+    if os.name != "posix":
+        print(
+            "error: --detached is supported on Linux/macOS; on Windows run "
+            "OpenAI4S inside WSL2.",
+            file=sys.stderr,
+        )
+        return 2
+
+    cfg.ensure_dirs()
+    log_path = cfg.logs_dir / "app.out"
+    command = [
+        sys.executable,
+        "-m",
+        "openai4s",
+        "serve",
+        "--host",
+        str(cfg.host),
+        "--port",
+        str(cfg.port),
+        "--no-browser",
+    ]
+    with log_path.open("ab", buffering=0) as log:
+        process = subprocess.Popen(
+            command,
+            cwd=cfg.data_dir,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+    # A packaged bundle's first start can spend most of a minute on imports and
+    # Store migrations on a slow disk; 30s produced false "did not become
+    # ready" failures for a daemon that was seconds from healthy.
+    ready_timeout = 60.0
+    raw_timeout = os.environ.get("OPENAI4S_DETACHED_READY_TIMEOUT", "")
+    if raw_timeout:
+        try:
+            ready_timeout = max(1.0, float(raw_timeout))
+        except ValueError:
+            pass
+    deadline = time.monotonic() + ready_timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        if _read_pid(cfg) == process.pid and _health_ready(cfg):
+            # Re-check both identities after the request.  Another daemon on
+            # the same address can answer /health, and a child that loses the
+            # bind race can exit while that request is in flight.
+            if process.poll() is not None or _read_pid(cfg) != process.pid:
+                break
+            app_url = _url(cfg)
+            print(f"daemon started (pid {process.pid}) at {app_url}")
+            print(f"log: {log_path}")
+            if not os.environ.get("OPENAI4S_NO_OPEN") and not getattr(
+                args, "no_open", False
+            ):
+                try:
+                    import webbrowser
+
+                    webbrowser.open(app_url)
+                except Exception:
+                    pass
+            return 0
+        time.sleep(0.25)
+
+    _cleanup_failed_detached_child(process)
+    print(
+        f"error: detached daemon did not become ready within {ready_timeout:.0f}s "
+        f"(OPENAI4S_DETACHED_READY_TIMEOUT overrides); inspect {log_path}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def cmd_serve(args) -> int:
-    from openai4s.server import serve
+    from openai4s.server import build_server, run_server
 
     cfg = get_config()
-    existing = _read_pid(cfg)
-    if existing and _pid_alive(existing):
-        print(f"daemon already running (pid {existing}) at {_url(cfg)}")
+    _apply_serve_overrides(args, cfg)
+    if getattr(args, "detached", False):
+        # The parent never claims the singleton: the detached child re-runs
+        # this command and acquires the pidfile under its own pid, which is
+        # exactly the identity the readiness wait checks. A quick liveness
+        # peek keeps the common "already running" answer immediate.
+        existing = _read_pid(cfg)
+        if existing and _daemon_alive(cfg, existing):
+            print(f"daemon already running (pid {existing}) at {_url(cfg)}")
+            return 1
+        return _cmd_serve_detached(args, cfg)
+    # Atomically claim the singleton, covering the whole boot. A plain
+    # read-then-write let a second `serve` racing a slow store open/migration
+    # pass a separate liveness check and boot the same data dir concurrently;
+    # O_EXCL makes the claim one step so exactly one booter wins. Every
+    # build-failure path below clears only the state this process owns.
+    if not _acquire_singleton(cfg):
+        existing = _read_pid(cfg)
+        if existing and _daemon_alive(cfg, existing):
+            print(f"daemon already running (pid {existing}) at {_url(cfg)}")
+        else:
+            print(
+                "another `openai4s serve` is starting on this data dir; "
+                "retry in a moment",
+                file=sys.stderr,
+            )
         return 1
-    _write_state(cfg)
+    my_pid = os.getpid()
+    # Arm the SIGTERM handler before the (possibly slow) build_server: a signal
+    # arriving mid-build must run teardown, not the interpreter's default
+    # terminate, which would orphan the pidfile just claimed above. A startup
+    # that fails puts back the disposition it found, so an in-process caller
+    # does not inherit this one from a `serve` that never served.
+    previous_sigterm = signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
+    # Bind before the banner: "listening" printed ahead of the actual bind made
+    # a port collision look like a crash after a successful start. Binding also
+    # mints the access token, so the URL printed below actually opens.
+    try:
+        httpd = build_server(cfg)
+    except OSError as exc:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        _clear_state(cfg, only_if_owned_by=my_pid)
+        message = _bind_failure_message(exc, cfg)
+        if message is None:
+            raise
+        print(message, file=sys.stderr)
+        return 1
+    except BaseException:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        _clear_state(cfg, only_if_owned_by=my_pid)
+        raise
     print(f"openai4s listening at {_url(cfg)} (model={cfg.llm.model})")
     print("web UI ready. Ctrl-C to stop.")
-
-    def _graceful(signum, frame):
-        _clear_state(cfg)
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, _graceful)
     if not os.environ.get("OPENAI4S_NO_OPEN") and not getattr(args, "no_open", False):
 
         def _open():
@@ -101,10 +547,51 @@ def cmd_serve(args) -> int:
 
         threading.Thread(target=_open, daemon=True).start()
     try:
-        serve(cfg, block=True)
+        # The shared service loop (gateway.run_server): serve_app and this
+        # command must not carry two copies of serve/teardown that can drift.
+        run_server(httpd)
     finally:
-        _clear_state(cfg)
+        _clear_state(cfg, only_if_owned_by=my_pid)
     return 0
+
+
+def _doctor_config():
+    """A config for doctor that does not have to create anything to exist.
+
+    ``get_config()`` calls ``ensure_dirs()``, and that is exactly what fails
+    when ``OPENAI4S_DATA_DIR`` names a file, or a directory this user cannot
+    write to, or one that cannot be created — the startup failure doctor is
+    meant to diagnose. Raising here handed back a traceback instead of the
+    report and its documented exit code 2, in the one situation the command
+    exists for. The plain ``Config`` reads env and defaults and touches
+    nothing; ``doctor``'s data check then reports what is wrong with it.
+    """
+    from openai4s.config import Config
+
+    try:
+        return get_config()
+    except Exception:  # noqa: BLE001 - the bootstrap failure is the diagnosis
+        return Config()
+
+
+def cmd_doctor(args) -> int:
+    """Check whether this installation can actually do the work.
+
+    Deliberately needs no daemon: the situation that motivates running it is
+    usually one where the daemon will not start.
+
+    Exit code is the verdict — 0 for ok, 1 for degraded-but-usable, 2 when a
+    check failed outright — so a setup script can branch on it rather than
+    grepping prose.
+    """
+    from openai4s import doctor
+
+    result = doctor.report(_doctor_config())
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(doctor.render(result))
+    return {doctor.OK: 0, doctor.WARN: 1, doctor.FAIL: 2}[result["status"]]
 
 
 def cmd_verify_package(args) -> int:
@@ -154,12 +641,12 @@ def cmd_diagnostics(args) -> int:
 def cmd_status(args) -> int:
     cfg = get_config()
     pid = _read_pid(cfg)
-    if not pid or not _pid_alive(pid):
+    if not pid or not _daemon_alive(cfg, pid):
         print("daemon: not running")
         return 1
     # confirm via /health
     try:
-        with urllib.request.urlopen(_url(cfg) + "health", timeout=3) as r:
+        with _open_daemon(_url(cfg, with_token=False) + "health", timeout=3) as r:
             health = json.loads(r.read().decode("utf-8"))
         print(f"daemon: running (pid {pid}) at {_url(cfg)}")
         print(f"  model    : {health.get('model')}")
@@ -174,18 +661,63 @@ def cmd_status(args) -> int:
         return 2
 
 
+def _wait_pid_exit(
+    pid: int, *, attempts: int | None = None, interval: float = 0.1
+) -> bool:
+    """Poll until ``pid`` is gone; True means it actually exited.
+
+    The default grace period is ``TERM_GRACE_S`` — the same budget
+    ``execution/process_group.py`` gives a job's SIGTERM — so daemon stops
+    and job stops cannot quietly drift apart.  The pid-shaped ladder itself
+    stays local on purpose: the daemon is not this CLI's child (there is no
+    ``Popen`` to reap, which the group helpers require) and it is not
+    reliably its own process-group leader (under nohup/launchd the pgid may
+    be shared with siblings), so ``killpg`` semantics do not transfer.
+    Leader-only signalling is safe here: kernel workers exit on their
+    manager pipe's EOF when the daemon dies.
+    """
+    if attempts is None:
+        attempts = max(1, round(TERM_GRACE_S / interval))
+    for _ in range(attempts):
+        if not _pid_alive(pid):
+            return True
+        time.sleep(interval)
+    return not _pid_alive(pid)
+
+
 def cmd_stop(args) -> int:
     cfg = get_config()
     pid = _read_pid(cfg)
-    if not pid or not _pid_alive(pid):
+    if not pid or not _daemon_alive(cfg, pid):
         print("daemon: not running")
         _clear_state(cfg)
         return 1
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(50):
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # exited between the aliveness check and the signal
+    stopped = _wait_pid_exit(pid)
+    if not stopped and getattr(args, "force", False):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stopped = _wait_pid_exit(pid)
+    if not stopped:
+        # An in-flight cell can hold shutdown past the grace period. The state
+        # files must outlive the process they describe: clearing them here left
+        # a live daemon on a bound port that `status` and a second `stop` both
+        # called "not running", and the next `serve` crashed into.
+        hint = (
+            "it ignored SIGKILL"
+            if getattr(args, "force", False)
+            else "retry `openai4s stop`, or `openai4s stop --force` to SIGKILL it"
+        )
+        print(
+            f"error: daemon (pid {pid}) is still shutting down — {hint}",
+            file=sys.stderr,
+        )
+        return 2
     _clear_state(cfg)
     print(f"daemon stopped (pid {pid})")
     return 0
@@ -538,20 +1070,286 @@ def cmd_setup(args) -> int:
     return 1 if failed else 0
 
 
-def _daemon_request(cfg, method: str, path: str, body: dict | None = None):
-    """Call the running daemon's REST API; returns (status, parsed_json)."""
+# --------------------------------------------------------------------------
+# environments as a transaction: plan / apply / rollback
+# --------------------------------------------------------------------------
 
-    url = _url(cfg).rstrip("/") + path
+
+def _env_store(cfg, runner=None):
+    from openai4s.kernel.env_generations import EnvironmentStore
+
+    return EnvironmentStore(Path(cfg.data_dir) / "environments", runner=runner)
+
+
+def _env_spec(name: str) -> Path:
+    return _envs_dir() / f"{name}.yml"
+
+
+def _env_verify(prefix: Path) -> tuple[str, list[str]]:
+    """Prove the generation runs before anything points at it.
+
+    A build that exits 0 having produced nothing usable is the false success
+    this step exists to catch, and it is the same rule the compute manager
+    applies to a job that exits 0 having written no outputs. The check used to
+    stop at "a file exists at that path"; it now *starts the interpreter*, in
+    both languages, because a file is not an environment.
+    """
+    from openai4s.kernel.env_generations import probe_interpreter
+
+    return probe_interpreter(prefix)
+
+
+def cmd_env_plan(args) -> int:
+    cfg = get_config()
+    tool = _find_conda_tool() or "conda"
+    store = _env_store(cfg)
+    plans = [store.plan(name, _env_spec(name), tool=tool) for name in args.names]
+    if args.json:
+        print(json.dumps([p.public() for p in plans], indent=2, sort_keys=True))
+    else:
+        for plan in plans:
+            print(f"  [{plan.name}] {plan.action}: {plan.reason}")
+    return 0
+
+
+def cmd_env_apply(args) -> int:
+    from openai4s.kernel.env_generations import EnvironmentError_
+
+    cfg = get_config()
+    tool = _find_conda_tool()
+    if not tool:
+        print("error: no conda/mamba/micromamba found on PATH.", file=sys.stderr)
+        return 1
+    store = _env_store(cfg)
+    failed = 0
+    for name in args.names:
+        spec = _env_spec(name)
+        plan = store.plan(name, spec, tool=tool)
+        if args.dry_run:
+            if plan.changes:
+                print(f"  [{name}] would {plan.action}: {plan.reason}")
+            else:
+                print(f"  [{name}] up to date ({plan.reason})")
+            continue
+        # A real (non-dry-run) no-op still goes through `store.apply`, not a
+        # short-circuit here: its locked validation is what catches the pointer
+        # or spec moving between plan and apply, which a bare "up to date" would
+        # report success over.
+
+        def build(prefix: Path, staged_spec: Path, _tool=tool):
+            # The *staged* spec, never the live one: the manifest records the
+            # hash taken under the apply lock, and building from a file that
+            # can still be edited would make that hash describe something else.
+            return [
+                _tool,
+                "env",
+                "create",
+                "--yes",
+                "--prefix",
+                str(prefix),
+                "-f",
+                str(staged_spec),
+            ]
+
+        try:
+            result = store.apply(plan, spec, tool=tool, build=build, verify=_env_verify)
+        except EnvironmentError_ as e:
+            failed += 1
+            print(f"  [{name}] FAILED: {e}", file=sys.stderr)
+            continue
+        if result.ok and not plan.changes:
+            print(f"  [{name}] up to date ({result.detail or 'no change'})")
+        elif result.ok:
+            print(f"  [{name}] now generation {result.generation.id}")
+        else:
+            failed += 1
+            print(f"  [{name}] FAILED: {result.detail}", file=sys.stderr)
+            print(
+                f"  [{name}] the current environment is unchanged "
+                f"({result.previous or 'none'})",
+                file=sys.stderr,
+            )
+    return 1 if failed else 0
+
+
+def cmd_env_list(args) -> int:
+    store = _env_store(get_config())
+    names = args.names or store.environments()
+    payload = {
+        name: {
+            "current": store.current_id(name),
+            "generations": [g.public() for g in store.list(name)],
+        }
+        for name in names
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        for name, info in payload.items():
+            print(f"  {name}: current={info['current'] or '-'}")
+            for generation in info["generations"]:
+                mark = "*" if generation["generation_id"] == info["current"] else " "
+                print(
+                    f"   {mark} {generation['generation_id']} "
+                    f"{generation['state']} "
+                    f"({generation['package_count']} packages)"
+                )
+    return 0
+
+
+def cmd_env_rollback(args) -> int:
+    from openai4s.kernel.env_generations import EnvironmentError_
+
+    store = _env_store(get_config())
+    try:
+        result = store.rollback(args.name, args.generation)
+    except EnvironmentError_ as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"  [{args.name}] now generation {result.generation.id} (pointer moved)")
+    return 0
+
+
+def cmd_env_recover(args) -> int:
+    store = _env_store(get_config())
+    names = args.names or store.environments()
+    report = {name: store.recover(name) for name in names}
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    for name, info in report.items():
+        print(f"  {name}: current={info['current'] or '-'}")
+        for item in info["abandoned"]:
+            print(f"    abandoned {item['state']}: {item['path']}")
+        if info.get("apply_in_progress"):
+            print("    an apply is currently in progress (holding the lock)")
+    return 0
+
+
+def cmd_benchmark(args) -> int:
+    """Run the versioned workflow benchmark against the real subsystems."""
+    from openai4s.benchmark import load_workflows, run_all
+
+    if args.list:
+        for workflow in load_workflows():
+            print(f"  {workflow.id} v{workflow.version} — {workflow.title}")
+            for case in workflow.cases:
+                print(f"    {case.id} [{case.outcome}] {case.title}")
+        return 0
+    report = run_all()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        for item in report["results"]:
+            mark = "skip" if item["skipped"] else ("ok  " if item["passed"] else "FAIL")
+            line = f"  [{mark}] {item['case_id']} ({item['expected_outcome']})"
+            if item["detail"]:
+                line += f" — {item['detail']}"
+            print(line)
+        print(
+            f"\n{report['passed']} passed, {report['failed']} failed, "
+            f"{report['skipped']} skipped "
+            f"across {report['workflows']} workflow(s)"
+        )
+    # Zero workflows is a failure, not a pass. An installed wheel that did not
+    # ship the manifests would otherwise report "0 failed" and exit 0 — a
+    # silent green on the suite that is supposed to decide whether a release is
+    # good. There is always at least one workflow in a correct install.
+    if report["workflows"] == 0:
+        print(
+            "error: no benchmark workflows were found; the manifests are "
+            "missing from this installation",
+            file=sys.stderr,
+        )
+        return 1
+    return 1 if report["failed"] else 0
+
+
+def _daemon_token(cfg) -> str | None:
+    """The credential this CLI presents, or None when there is none to find.
+
+    Two sources, in this order. `OPENAI4S_TOKEN` exists because the token file
+    is owner-only: a daemon running under another account (a systemd unit, say)
+    writes a file this user cannot read, and without an override the CLI would
+    be unusable without changing permissions or switching user.
+
+    Never a query parameter. A URL carrying a credential is logged by proxies
+    and kept in history, and the daemon refuses query tokens on mutations for
+    that reason.
+    """
+    override = (os.environ.get("OPENAI4S_TOKEN") or "").strip()
+    if override:
+        return override
+    from openai4s.server import local_auth
+
+    return local_auth.read_token(cfg.data_dir)
+
+
+def _daemon_credential_hint(cfg) -> str:
+    """Why the CLI has no token, phrased so the reader can act on it."""
+    from openai4s.server import local_auth
+
+    path = local_auth.token_path(cfg.data_dir)
+    if path.exists():
+        return (
+            f"error: cannot read the daemon's access token at {path} "
+            "(it is owner-only). Run this as the user the daemon runs as, or "
+            "set OPENAI4S_TOKEN to the token that daemon printed at startup."
+        )
+    return (
+        f"error: no daemon access token at {path}. Start the daemon with "
+        "`openai4s serve`, or set OPENAI4S_TOKEN if it runs elsewhere."
+    )
+
+
+def _daemon_request(cfg, method: str, path: str, body: dict | None = None):
+    """Call the running daemon's REST API; returns (status, parsed_json).
+
+    `path` is relative to the API root -- "/shares", not "/api/shares". Every
+    `openai4s share` subcommand passed the latter, and the daemon serves the
+    API only under `/api/v1`, so all nine requests answered with the daemon's
+    own "the API is versioned" 404 -- nine and not eight because `share create
+    latest` resolves the session with a `GET /frames` of its own before it
+    posts. The whole feature had never reached a route, including the
+    `openai4s share import <url>` line the generated share page tells a
+    recipient to run.
+
+    The version is joined from `contract.API_ROOT`, the constant the gateway
+    routes on, so the two cannot drift.
+    """
+    from openai4s.server import contract
+
+    if path.startswith("/api/"):
+        # A caller supplying its own prefix is the bug this signature exists to
+        # prevent, and papering over it would be wrong: a merely-wrong path
+        # produces a 404 that nobody reads as a defect.
+        raise ValueError(
+            f"path must be relative to the API root, not {path!r} "
+            f"(it is joined with {contract.API_ROOT})"
+        )
+    url = _url(cfg, with_token=False).rstrip("/") + contract.API_ROOT + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    # The gate is required by default now, so every daemon-backed subcommand
+    # has to present a credential. Sent as a header rather than `?token=`,
+    # which the daemon refuses on mutations anyway.
+    from openai4s.server import local_auth
+
+    token = _daemon_token(cfg)
+    if token:
+        req.add_header(local_auth.TOKEN_HEADER, token)
     # The daemon's CSRF guard passes non-browser clients (no Origin header).
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with _open_daemon(req, timeout=300) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as error:
         raw = error.read().decode("utf-8", "replace")
+        if error.code == 401 and not token:
+            # A bare 401 tells the reader nothing they can act on. Say which
+            # file could not be read and what to do instead.
+            print(_daemon_credential_hint(cfg), file=sys.stderr)
         try:
             return error.code, json.loads(raw)
         except ValueError:
@@ -560,7 +1358,7 @@ def _daemon_request(cfg, method: str, path: str, body: dict | None = None):
 
 def _require_daemon(cfg) -> bool:
     pid = _read_pid(cfg)
-    if not pid or not _pid_alive(pid):
+    if not pid or not _daemon_alive(cfg, pid):
         print(
             "error: daemon is not running — start it with `openai4s serve`",
             file=sys.stderr,
@@ -604,7 +1402,7 @@ def cmd_share(args) -> int:
         if action == "create":
             root = args.session
             if root == "latest":
-                _, frames = _daemon_request(cfg, "GET", "/api/frames")
+                _, frames = _daemon_request(cfg, "GET", "/frames")
                 items = frames.get("frames") if isinstance(frames, dict) else frames
                 if not items:
                     print("error: no sessions found", file=sys.stderr)
@@ -615,9 +1413,7 @@ def cmd_share(args) -> int:
                 body["title"] = args.title
             if args.expires:
                 body["expires_in"] = _parse_duration(args.expires)
-            status, rec = _daemon_request(
-                cfg, "POST", f"/api/frames/{root}/shares", body
-            )
+            status, rec = _daemon_request(cfg, "POST", f"/frames/{root}/shares", body)
         elif action == "update":
             ubody: dict = {}
             if getattr(args, "no_expiry", False):
@@ -625,25 +1421,25 @@ def cmd_share(args) -> int:
             elif args.expires:
                 ubody["expires_in"] = _parse_duration(args.expires)
             status, rec = _daemon_request(
-                cfg, "PUT", f"/api/shares/{args.share_id}", ubody or None
+                cfg, "PUT", f"/shares/{args.share_id}", ubody or None
             )
         elif action == "list":
-            status, rec = _daemon_request(cfg, "GET", "/api/shares")
+            status, rec = _daemon_request(cfg, "GET", "/shares")
         elif action == "revoke":
-            status, rec = _daemon_request(cfg, "DELETE", f"/api/shares/{args.share_id}")
+            status, rec = _daemon_request(cfg, "DELETE", f"/shares/{args.share_id}")
         elif action == "enable":
             status, rec = _daemon_request(
-                cfg, "PUT", "/api/share/settings", {"enabled": True}
+                cfg, "PUT", "/share/settings", {"enabled": True}
             )
         elif action == "disable":
             status, rec = _daemon_request(
-                cfg, "PUT", "/api/share/settings", {"enabled": False}
+                cfg, "PUT", "/share/settings", {"enabled": False}
             )
         elif action == "status":
-            status, rec = _daemon_request(cfg, "GET", "/api/share/status")
+            status, rec = _daemon_request(cfg, "GET", "/share/status")
         elif action == "import":
             status, rec = _daemon_request(
-                cfg, "POST", "/api/sessions/import-url", {"url": args.url}
+                cfg, "POST", "/sessions/import-url", {"url": args.url}
             )
         else:  # pragma: no cover
             print("error: unknown share action", file=sys.stderr)
@@ -728,10 +1524,34 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="openai4s", description="openai4s CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("serve", help="start the daemon (foreground)")
-    ps.add_argument("--no-open", action="store_true", help="don't open a browser")
+    ps = sub.add_parser("serve", help="start the daemon")
+    ps.add_argument("--host", help="listen host (default: OPENAI4S_HOST or 127.0.0.1)")
+    ps.add_argument(
+        "--port",
+        type=_tcp_port,
+        help="listen port (default: OPENAI4S_PORT or 8760)",
+    )
+    ps.add_argument(
+        "--no-open",
+        "--no-browser",
+        dest="no_open",
+        action="store_true",
+        help="don't open a browser",
+    )
+    ps.add_argument(
+        "--detached",
+        action="store_true",
+        help="run in the background (Linux/macOS, including WSL2)",
+    )
     ps.set_defaults(fn=cmd_serve)
     sub.add_parser("status", help="check daemon status").set_defaults(fn=cmd_status)
+    pdoc = sub.add_parser(
+        "doctor",
+        help="check model, runtime, isolation, disk, connectors and remote "
+        "compute (no daemon needed)",
+    )
+    pdoc.add_argument("--json", action="store_true", help="machine-readable report")
+    pdoc.set_defaults(fn=cmd_doctor)
     pv = sub.add_parser(
         "verify-package",
         help="verify an exported session/evidence package (no daemon needed)",
@@ -745,7 +1565,13 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", help="destination zip (default ./openai4s-diagnostics.zip)"
     )
     pd.set_defaults(fn=cmd_diagnostics)
-    sub.add_parser("stop", help="stop the daemon").set_defaults(fn=cmd_stop)
+    pstop = sub.add_parser("stop", help="stop the daemon")
+    pstop.add_argument(
+        "--force",
+        action="store_true",
+        help="escalate to SIGKILL if the daemon does not exit in time",
+    )
+    pstop.set_defaults(fn=cmd_stop)
     sub.add_parser("url", help="print the web UI url").set_defaults(fn=cmd_url)
 
     pr = sub.add_parser("run", help="run one Code-as-Action task in-process")
@@ -800,6 +1626,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="update existing envs without pruning user-installed packages",
     )
     pu.set_defaults(fn=cmd_setup)
+
+    pb = sub.add_parser(
+        "benchmark",
+        help="run the versioned workflow benchmark against the real subsystems",
+    )
+    pb.add_argument("--json", action="store_true", help="machine-readable report")
+    pb.add_argument("--list", action="store_true", help="list workflows and cases")
+    pb.set_defaults(fn=cmd_benchmark)
+
+    pe = sub.add_parser(
+        "env",
+        help="environments as a transaction: plan, apply, roll back",
+    )
+    esub = pe.add_subparsers(dest="env_action", required=True)
+    ep = esub.add_parser("plan", help="what would change; touches nothing")
+    ep.add_argument("names", nargs="*", default=list(_DEFAULT_ENVS))
+    ep.add_argument("--json", action="store_true")
+    ep.set_defaults(fn=cmd_env_plan)
+    ea = esub.add_parser(
+        "apply", help="build a new generation and switch to it if it verifies"
+    )
+    ea.add_argument("names", nargs="*", default=list(_DEFAULT_ENVS))
+    ea.add_argument("--dry-run", action="store_true")
+    ea.set_defaults(fn=cmd_env_apply)
+    el = esub.add_parser("list", help="generations, and which one is current")
+    el.add_argument("names", nargs="*")
+    el.add_argument("--json", action="store_true")
+    el.set_defaults(fn=cmd_env_list)
+    er = esub.add_parser("rollback", help="point at a generation already on disk")
+    er.add_argument("name")
+    er.add_argument("generation")
+    er.set_defaults(fn=cmd_env_rollback)
+    ev = esub.add_parser("recover", help="what a restart should know")
+    ev.add_argument("names", nargs="*")
+    ev.add_argument("--json", action="store_true")
+    ev.set_defaults(fn=cmd_env_recover)
 
     pj = sub.add_parser(
         "jupyter",

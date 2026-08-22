@@ -5,9 +5,13 @@ protocol. When the worker emits a `host_call` frame mid-execution, this manager
 routes it to the host RPC dispatcher and writes back a `host_response` frame —
 this is the inner synchronous RPC loop.
 """
+
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -18,12 +22,75 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.kernel.environment import build_kernel_environment
+from openai4s.kernel.sink_drain import CAP_BYTES as _SINK_CAP
+from openai4s.kernel.sink_drain import SinkCapture, SinkDirectory
 from openai4s.security.sandbox import KernelSandbox, create_kernel_sandbox
 
 _WORKER = Path(__file__).resolve().parent / "worker.py"
 
 # A host-call dispatcher: (method:str, args:list) -> data. Raises to signal error.
 Dispatcher = Callable[[str, list], Any]
+
+
+#: The worker's stderr tail, in bytes. Generous enough that a traceback plus a
+#: chatty R `system()` fits; the point is that it is a ceiling on what the
+#: daemon allocates, not on what the caller is shown.
+_STDERR_TAIL_BYTES = 64 * 1024
+_SKILL_SIDECAR_CAPTURE_B64_BYTES = 10_000_000
+
+
+class _StderrTail:
+    """The last N bytes of a stream, bounded as it arrives.
+
+    Bytes rather than lines, and a bound rather than a count, because the
+    producers named at the drain site emit whatever a child wrote to fd2 --
+    including one line of arbitrary length. `deque(maxlen=400)` bounded the
+    number of lines and nothing else.
+
+    Reports what it saw, kept and dropped, which is the per-channel accounting
+    plan section 7.4 asks every bounded channel for; the kernel-stderr channel
+    had none.
+    """
+
+    __slots__ = ("_budget", "_buf", "seen_bytes", "dropped_bytes")
+
+    def __init__(self, budget: int) -> None:
+        self._budget = int(budget)
+        self._buf = bytearray()
+        self.seen_bytes = 0
+        self.dropped_bytes = 0
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        self.seen_bytes += len(data)
+        self._buf.extend(data)
+        excess = len(self._buf) - self._budget
+        if excess > 0:
+            del self._buf[:excess]
+            self.dropped_bytes += excess
+
+    @property
+    def retained_bytes(self) -> int:
+        return len(self._buf)
+
+    @property
+    def truncated(self) -> bool:
+        return self.dropped_bytes > 0
+
+    def text(self) -> str:
+        # A budget cut lands wherever the byte count ran out, which is
+        # mid-character often enough to matter; `replace` keeps the tail
+        # readable rather than raising on the boundary.
+        return self._buf.decode("utf-8", "replace")
+
+    # The death path joins the tail with `"".join(...)`, which is what the
+    # deque supported. Staying iterable keeps that call site unchanged.
+    def __iter__(self):
+        return iter((self.text(),))
+
+    def __bool__(self) -> bool:
+        return bool(self._buf)
 
 
 class KernelBusyError(RuntimeError):
@@ -41,6 +108,7 @@ class Kernel:
         env_name: str | None = None,
         argv: list[str] | None = None,
         sandbox: KernelSandbox | None = None,
+        capture_sinks: bool = False,
     ):
         self.dispatcher = dispatcher
         self.mode = mode
@@ -67,16 +135,49 @@ class Kernel:
         # reader racing an executing Cell's host_call/response loop.
         self._protocol_transaction_lock = threading.Lock()
         self._action_context_local = threading.local()
+        # Sidecar source capture is a generation-wide budget. Keeping it on
+        # the manager prevents a Cell from resetting accounting by clearing a
+        # worker-side diagnostic list between execute requests.
+        self._skill_sidecar_capture_b64_bytes = 0
+        self._skill_sidecar_capture_failed = False
+        self._skill_sidecar_attestation_key = b""
+        self._skill_sidecar_attestation_ids: set[str] = set()
         self.generation = 0  # bumped on every (re)spawn
         self.authorization_generation = f"kernel:{uuid.uuid4()}"
+        # A worker that cannot bound its own output between top-level
+        # expressions (r_worker.R) sinks to a fifo per cell and lets the host
+        # do the bounding. Created here, so a temp directory where fifos cannot
+        # be made refuses the kernel instead of producing one whose cells
+        # silently have no cap.
+        self._sinks: "SinkDirectory | None" = None
+        if capture_sinks:
+            self._sinks = SinkDirectory(self._sandbox.status.temp_dir)
         try:
             self._proc = self._spawn()
         except Exception:
+            if self._sinks is not None:
+                self._sinks.close()
             self._sandbox.close()
             raise
 
     def _spawn(self) -> "subprocess.Popen":
+        # Fail closed on an unsupported platform, here rather than in a warning
+        # at onboarding: every Python and R kernel passes through this method,
+        # so there is no route that reaches a subprocess without being asked.
+        # A program that warns and proceeds has made a different promise from
+        # one that refuses, and a half-working kernel is the worse outcome for
+        # a product whose claim is that its results can be trusted.
+        from openai4s.platform_support import require_supported
+
+        require_supported()
         command = self.argv or [self.python, "-u", str(_WORKER)]
+        child_environment = self._child_env()
+        if self.argv is None:
+            self._skill_sidecar_attestation_key = os.urandom(32)
+            self._skill_sidecar_attestation_ids.clear()
+        else:
+            self._skill_sidecar_attestation_key = b""
+            self._skill_sidecar_attestation_ids.clear()
         proc = subprocess.Popen(
             self._sandbox.wrap_command(command),
             stdin=subprocess.PIPE,
@@ -85,20 +186,98 @@ class Kernel:
             text=True,
             bufsize=1,
             cwd=self.cwd,
-            env=self._sandbox.apply_environment(self._child_env()),
+            env=self._sandbox.apply_environment(child_environment),
         )
+        if self.argv is None:
+            # Give the Python worker its generation key over the existing
+            # private protocol before any Cell can run. Environment variables
+            # are the wrong channel: unsetenv() does not erase Linux's initial
+            # /proc/self/environ memory, so a Cell could recover the key and
+            # forge a sidecar-capture frame.
+            assert proc.stdin is not None and proc.stdout is not None
+            initialization_id = f"initialize-{uuid.uuid4()}"
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "type": "initialize",
+                        "id": initialization_id,
+                        "skill_attestation_key": (
+                            self._skill_sidecar_attestation_key.hex()
+                        ),
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            initialized = False
+            diagnostic_frames = 0
+            while diagnostic_frames <= 8:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    break
+                if frame.get("type") == "log":
+                    diagnostic_frames += 1
+                    continue
+                initialized = (
+                    frame.get("type") == "initialized"
+                    and frame.get("id") == initialization_id
+                )
+                break
+            if not initialized:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                raise RuntimeError("kernel worker attestation initialization failed")
         # Drain stderr continuously into a bounded tail. Without this, a cell
         # whose child processes write to inherited fd2 (R `system()`, an
         # uncaptured subprocess in python) fills the 64KB pipe and deadlocks
         # the cell forever — nothing used to read stderr until worker death.
         # The tail keeps the death diagnostics the old blocking read provided.
-        tail: deque[str] = deque(maxlen=400)
-        self._stderr_tail = tail
+        #
+        # Bounded in BYTES, at the read. This was `for line in stream` into a
+        # `deque(maxlen=400)`: an unbounded `readline()` whose only cap was a
+        # line COUNT applied after the allocation, so one producer emitting a
+        # single enormous line -- which is what the comment above says reaches
+        # here -- allocated all of it before any limit applied. That is the
+        # pattern `mcp_client.py` and `jobs.py` were both changed to remove,
+        # and this drain was written after those fixes without adopting them.
+        #
+        # `.buffer` because the pipe is `text=True` for the stdout protocol
+        # frames and cannot be opened per-stream; the raw reader underneath it
+        # is where a byte budget can mean bytes.
+        self._stderr_tail = _StderrTail(_STDERR_TAIL_BYTES)
+        tail = self._stderr_tail
+        # `os.read` on the descriptor, not `BufferedReader.read`. Both give
+        # bytes, and only one of them is safe here: this thread is a daemon, and
+        # a daemon parked inside a buffered read holds that buffer's lock when
+        # the interpreter finalises. The whole suite passed and then aborted
+        # with `_enter_buffered_busy: could not acquire lock ... at interpreter
+        # shutdown` -- a clean exit turned into SIGABRT by the drain alone.
+        # `os.read` also returns as soon as anything is available rather than
+        # waiting to fill the request, which is what a drain wants.
+        try:
+            stderr_fd = proc.stderr.fileno()
+        except (AttributeError, OSError, ValueError):  # pragma: no cover
+            stderr_fd = -1
 
-        def _drain(stream=proc.stderr, sink=tail) -> None:
+        def _drain(fd: int = stderr_fd, sink=tail) -> None:
+            if fd < 0:
+                return
             try:
-                for line in stream:
-                    sink.append(line)
+                while True:
+                    chunk = os.read(fd, 8192)
+                    if not chunk:
+                        return
+                    sink.feed(chunk)
             except Exception:  # noqa: BLE001 — EOF/close ends the drain
                 pass
 
@@ -160,20 +339,33 @@ class Kernel:
                 if action_context is not None
                 else inherited_context or {}
             )
+            capture: SinkCapture | None = None
             try:
                 if not self.is_alive():
                     raise RuntimeError("kernel worker is not alive")
                 cell_id = str(cell_id or uuid.uuid4())
-                self._send(
-                    {
-                        "type": "execute",
-                        "id": cell_id,
-                        "code": code,
-                        "origin": origin,
-                    }
-                )
+                request: dict[str, Any] = {
+                    "type": "execute",
+                    "id": cell_id,
+                    "code": code,
+                    "origin": origin,
+                }
+                if self._sinks is not None:
+                    # Opened before the request is sent, so the worker's
+                    # blocking open finds a reader already waiting and never
+                    # blocks on one that has not arrived.
+                    capture = self._sinks.open(
+                        cap=_SINK_CAP, on_chunk=on_chunk if on_chunk else None
+                    )
+                    request["sink_out"] = capture.out_path
+                    request["sink_err"] = capture.err_path
+                self._send(request)
 
                 stdout_chunks: list[str] = []
+                sidecar_loads: list[dict[str, Any]] = []
+                pending_sidecar_attestations: dict[str, str] = {}
+                sidecar_capture_bytes = self._skill_sidecar_capture_b64_bytes
+                sidecar_capture_failed = self._skill_sidecar_capture_failed
                 while True:
                     frame = self._readline()
                     if frame is None:
@@ -182,12 +374,61 @@ class Kernel:
                         import time as _time
 
                         _time.sleep(0.05)  # let the drain thread flush the last lines
-                        err = "".join(getattr(self, "_stderr_tail", []) or [])
+                        tail = getattr(self, "_stderr_tail", None)
+                        err = "".join(tail or [])
+                        # The tail's own accounting, which until now was
+                        # computed one attribute away and dropped on the floor.
+                        # `record_diagnostic` is the reader: an operator handed
+                        # 64 KiB of a 20 MB stream, with nothing saying so, is
+                        # reading the end of a failure as though it were the
+                        # whole of it. Redacted from the user by
+                        # `public_exception` before publication, as before.
+                        if getattr(tail, "truncated", False):
+                            err += (
+                                f" (stderr tail: {tail.retained_bytes} of "
+                                f"{tail.seen_bytes} bytes kept, "
+                                f"{tail.dropped_bytes} dropped)"
+                            )
                         raise RuntimeError(f"kernel worker exited unexpectedly: {err}")
                     ftype = frame.get("type")
                     if ftype == "response":
-                        if stdout_chunks and not frame.get("stdout"):
+                        if pending_sidecar_attestations:
+                            self._skill_sidecar_attestation_ids.update(
+                                pending_sidecar_attestations
+                            )
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                        if capture is not None and frame.get("sink_capture"):
+                            # The worker declares it sank to the host's fifos,
+                            # so the host — not the worker — is what has the
+                            # cell's output. A worker that did not (the R
+                            # protocol fixture) keeps its own fields.
+                            frame["stdout"], frame["stderr"] = capture.finish()
+                            # What was read and what was kept, reported rather
+                            # than inferred. A capped `stdout` looks the same
+                            # whether the host read 300 MB and declined 299 of
+                            # them or the worker quietly dropped them before
+                            # they were ever written — R's fifo() defaults to
+                            # non-blocking, and that second reading is what it
+                            # produces. These are the only fields that tell
+                            # those two apart.
+                            usage = frame.get("usage")
+                            if isinstance(usage, dict):
+                                usage.update(capture.counters())
+                        elif stdout_chunks and not frame.get("stdout"):
                             frame["stdout"] = "".join(stdout_chunks)
+                        # A successful sidecar import is published before the
+                        # Cell resumes, so clearing/replacing objects in the
+                        # persistent user namespace cannot retract it. Prefer
+                        # those manager-held frames over the worker response's
+                        # legacy diagnostic-list snapshot.
+                        # Never trust the worker response's user-visible legacy
+                        # mirror. Only independently MAC-authenticated protocol
+                        # frames are recovery evidence.
+                        frame.pop("skill_sidecar_loads", None)
+                        if sidecar_loads:
+                            frame["skill_sidecar_loads"] = sidecar_loads
                         # Host-side annotation, not a protocol field: the
                         # observation formatter needs somewhere inside the
                         # workspace to spill an oversized stdout, and the
@@ -204,10 +445,108 @@ class Kernel:
                         stdout_chunks.append(text)
                         if on_chunk is not None and text:
                             on_chunk(text)
+                    elif ftype == "skill_sidecar_load":
+                        if sidecar_capture_failed:
+                            if not sidecar_loads:
+                                sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            continue
+                        event = frame.get("event")
+                        if frame.get("id") != cell_id or not isinstance(event, dict):
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                            continue
+                        event = dict(event)
+                        attestation_mac = event.pop("attestation_mac", None)
+                        encoded_event = json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        expected_mac = hmac.new(
+                            self._skill_sidecar_attestation_key,
+                            encoded_event,
+                            hashlib.sha256,
+                        ).hexdigest()
+                        if (
+                            len(self._skill_sidecar_attestation_key) != 32
+                            or not isinstance(attestation_mac, str)
+                            or not hmac.compare_digest(attestation_mac, expected_mac)
+                        ):
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                            continue
+                        event_name = event.get("event")
+                        attestation_id = event.get("attestation_id")
+                        if event_name == "sidecar_capture_started":
+                            source_sha256 = event.get("sha256")
+                            if (
+                                not isinstance(attestation_id, str)
+                                or not attestation_id
+                                or attestation_id in pending_sidecar_attestations
+                                or attestation_id in self._skill_sidecar_attestation_ids
+                                or not isinstance(source_sha256, str)
+                                or len(source_sha256) != 64
+                                or any(
+                                    char not in "0123456789abcdef"
+                                    for char in source_sha256
+                                )
+                            ):
+                                sidecar_loads.append({"event": "invalid_sidecar_event"})
+                                sidecar_capture_failed = True
+                                self._skill_sidecar_capture_failed = True
+                                continue
+                            pending_sidecar_attestations[attestation_id] = source_sha256
+                            continue
+                        if event_name == "invalid_sidecar_event":
+                            if isinstance(attestation_id, str):
+                                pending_sidecar_attestations.pop(attestation_id, None)
+                                if attestation_id:
+                                    self._skill_sidecar_attestation_ids.add(
+                                        attestation_id
+                                    )
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                            continue
+                        source_b64 = event.get("source_b64")
+                        source_sha256 = event.get("sha256")
+                        expected_sha256 = (
+                            pending_sidecar_attestations.pop(attestation_id, None)
+                            if isinstance(attestation_id, str)
+                            else None
+                        )
+                        if (
+                            expected_sha256 is None
+                            or source_sha256 != expected_sha256
+                            or not isinstance(source_b64, str)
+                        ):
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                            continue
+                        self._skill_sidecar_attestation_ids.add(attestation_id)
+                        sidecar_capture_bytes += len(source_b64)
+                        if sidecar_capture_bytes > _SKILL_SIDECAR_CAPTURE_B64_BYTES:
+                            sidecar_loads.append({"event": "invalid_sidecar_event"})
+                            sidecar_capture_failed = True
+                            self._skill_sidecar_capture_failed = True
+                            continue
+                        self._skill_sidecar_capture_b64_bytes = sidecar_capture_bytes
+                        recorded_event = dict(event)
+                        recorded_event.pop("attestation_id", None)
+                        sidecar_loads.append(recorded_event)
                     elif ftype == "log":
                         # diagnostic from worker; ignore or log
                         pass
             finally:
+                if capture is not None:
+                    # Unconditional: an interrupt, a dead worker or a raising
+                    # host call all leave a fifo and two reader threads behind,
+                    # and the reader is what keeps a blocked writer moving.
+                    capture.close()
                 if previous_context is marker:
                     try:
                         del self._active_action_context
@@ -303,11 +642,16 @@ class Kernel:
         and self-disarms, so the interrupt stops the cell but keeps the kernel
         (and its namespace) alive.
         """
-        import os
         import signal
 
+        sender = getattr(self._sandbox, "send_interrupt", None)
+        if callable(sender) and sender(self._proc.pid, signal.SIGINT):
+            return
         try:
-            os.kill(self._proc.pid, signal.SIGINT)
+            # Popen owns the direct child identity and synchronizes its poll /
+            # signal path. Bubblewrap's numeric grandchild never reaches here;
+            # KernelSandbox pins that target with a pidfd above.
+            self._proc.send_signal(signal.SIGINT)
         except (ProcessLookupError, OSError):
             pass
 
@@ -397,6 +741,8 @@ class Kernel:
                 pass
         self.authorization_generation = f"kernel:{uuid.uuid4()}"
         self._proc = self._spawn()
+        self._skill_sidecar_capture_b64_bytes = 0
+        self._skill_sidecar_capture_failed = False
         self.generation += 1
 
     def is_alive(self) -> bool:
@@ -416,6 +762,8 @@ class Kernel:
                     stream and stream.close()
                 except Exception:  # noqa: BLE001
                     pass
+            if self._sinks is not None:
+                self._sinks.close()
             self._sandbox.close()
 
     def __enter__(self) -> "Kernel":

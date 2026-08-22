@@ -7,6 +7,7 @@ is thin, all real work is host-side.
 v0.1 surface: host.llm, host.artifacts, host.artifact_path, host.delegate,
 host.submit_output. Enough to prove the Code-as-Action loop end-to-end.
 """
+
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -619,11 +620,20 @@ class _Host:
         input_version_ids: list[str] | None = None,
         producing_cell_id: str | None = None,
         priority: int = 0,
+        source: Any = None,
     ) -> dict:
         """Register a workspace file as a versioned artifact. Returns {version_id,...}.
 
         `input_version_ids` records data lineage edges from those inputs to
         this output.
+
+        `source` records where the data came from when the artifact was derived
+        from something retrieved. Pass the `provenance` envelope a
+        `host.science.search(...)` result carries: it names the database, the
+        exact request, when it was fetched, and the hash of the bytes that came
+        back. Without it a saved result answers "what is this" but not "when
+        was this true, and was it the same data I am looking at" -- which is
+        the difference between a file and evidence.
         """
         return self._call(
             "save_artifact",
@@ -635,6 +645,7 @@ class _Host:
                     "input_version_ids": input_version_ids or [],
                     "producing_cell_id": producing_cell_id,
                     "priority": priority,
+                    "source": source,
                 }
             ],
         )
@@ -828,7 +839,7 @@ class _Host:
         return self._call("search_skills", [{"query": query, "limit": limit}])
 
     def skill(self, name: str) -> dict:
-        """Load one skill's full recipe by exact name (opencode `skill` tool)."""
+        """Return one skill's metadata by exact name, without its recipe body."""
         return self.skills.get(name)
 
     def load_skill(self, name: str) -> dict:
@@ -896,6 +907,24 @@ class _Host:
         """List a workspace directory."""
         return self._call("list_dir", [{"path": path}])
 
+    def materialise_artifact(
+        self, version_id: str, *, filename: str | None = None
+    ) -> dict:
+        """Bring another session's artifact version into this session.
+
+        Use this instead of opening another session's file by path. The file
+        arrives as *this* session's Artifact, with a lineage edge back to where
+        it came from, so an analysis built on it keeps a resolvable provenance
+        even if the source session is later deleted or reverted.
+
+        Same project only. A version in another project raises the same
+        `KeyError` an absent one does.
+        """
+        spec: dict = {"version_id": version_id}
+        if filename:
+            spec["filename"] = filename
+        return self._call("materialise_artifact", [spec])
+
     def web_fetch(
         self,
         url: str,
@@ -903,8 +932,18 @@ class _Host:
         format: str = "markdown",
         timeout: float = 30,
         max_chars: int = 20000,
+        method: str = "GET",
+        user_agent: str | None = None,
     ) -> dict:
-        """Fetch a URL and return its content as markdown/text/html/json."""
+        """Fetch a URL and return its content as markdown/text/html/json.
+
+        ``method="HEAD"`` asks only whether the resource exists and returns
+        ``{"exists": True, ...}`` with no content. ``user_agent`` overrides the
+        default one, which Crossref and OpenAlex require before they will serve
+        their polite pool. Both exist because without them a skill that needed
+        either used raw ``urllib``, and such a request is subject to neither the
+        egress allowlist nor the SSRF guard.
+        """
         return self._call(
             "web_fetch",
             [
@@ -913,14 +952,43 @@ class _Host:
                     "format": format,
                     "timeout": timeout,
                     "max_chars": max_chars,
+                    "method": method,
+                    "user_agent": user_agent,
                 }
             ],
         )
 
+    def web_download(
+        self,
+        url: str,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        timeout: float = 60,
+        user_agent: str | None = None,
+    ) -> dict:
+        """Download a URL to a workspace file. Returns path/bytes/sha256.
+
+        For content `web_fetch` cannot represent as text -- an archive, a
+        compressed dataset, a binary structure file. ``path`` is resolved
+        against the session workspace and an escape is refused before the
+        request is made, so a rejected path does not even reveal whether the
+        URL was reachable.
+        """
+        spec: dict = {"url": url, "path": path, "timeout": timeout}
+        if max_bytes is not None:
+            spec["max_bytes"] = max_bytes
+        if user_agent:
+            spec["user_agent"] = user_agent
+        return self._call("web_download", [spec])
+
     def web_search(
         self, query: str, *, num_results: int = 8, timeout: float = 20
     ) -> dict:
-        """Live web search (keyless). Returns {results:[{title,url,snippet}]}."""
+        """Live search: Agent Plan uses Doubao; otherwise fallback engines.
+
+        Returns ``{results: [{title, url, snippet}], source, count}``.
+        """
         return self._call(
             "web_search",
             [{"query": query, "num_results": num_results, "timeout": timeout}],

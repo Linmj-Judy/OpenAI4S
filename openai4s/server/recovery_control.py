@@ -47,22 +47,17 @@ class RecoveryActionPlan:
 
 
 class RecoveryStore(Protocol):
-    def append_recovery_event(self, **fields: Any) -> dict:
-        ...
+    def append_recovery_event(self, **fields: Any) -> dict: ...
 
-    def list_recovery_events(self, **filters: Any) -> list[dict]:
-        ...
+    def list_recovery_events(self, **filters: Any) -> list[dict]: ...
 
-    def get_session_branch(self, branch_id: str) -> dict | None:
-        ...
+    def get_session_branch(self, branch_id: str) -> dict | None: ...
 
-    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None:
-        ...
+    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None: ...
 
     def latest_kernel_generation(
         self, root_frame_id: str, language: str, *, branch_id: str | None = None
-    ) -> dict | None:
-        ...
+    ) -> dict | None: ...
 
 
 class RecoveryControlService:
@@ -246,11 +241,15 @@ class RecoveryControlService:
                 (
                     unavailable
                     if not restorable
-                    else "recovery already running"
-                    if busy
-                    else "kernel is already active"
-                    if not recoverable_state
-                    else None
+                    else (
+                        "recovery already running"
+                        if busy
+                        else (
+                            "kernel is already active"
+                            if not recoverable_state
+                            else None
+                        )
+                    )
                 ),
                 requires_ticket=True,
             ),
@@ -260,16 +259,25 @@ class RecoveryControlService:
                 (
                     unavailable
                     if not restorable
-                    else "latest recovery is not partial or failed"
-                    if latest_state not in {"partial", "failed"}
-                    else "recovery already running"
-                    if busy
-                    else None
+                    else (
+                        "latest recovery is not partial or failed"
+                        if latest_state not in {"partial", "failed"}
+                        else "recovery already running" if busy else None
+                    )
                 ),
                 requires_ticket=True,
             ),
-            _action("inspect_log", True, None),
-            _action("continue_view_only", True, None),
+            # `inspect_log` and `continue_view_only` used to be advertised here
+            # as always-available. Nothing could invoke either: no route
+            # accepted them, the client's sanitiser dropped them, and
+            # `prepare_action` below refuses both as read-only. Neither named
+            # a real capability, and both were already satisfied by the card
+            # itself — it renders the recovery log inline, and a session
+            # pending recovery is view-only until someone recovers it.
+            #
+            # This list is a menu of mutations the caller may invoke. Anything
+            # in it that cannot be invoked is a promise the API does not keep,
+            # so nothing goes back in without a route to reach it.
             _action(
                 "restart_fresh",
                 not busy,

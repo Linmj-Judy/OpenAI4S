@@ -9,6 +9,9 @@
 **一个开源的混合式科研智能体。**<br/>
 <sub>原生 JSON 工具负责编排与权限；持久 Python/R 内核负责科学执行。</sub>
 
+**由北京大学—元空AI联合实验室推出。**<br/>
+<sub>Launched by the Peking University–YuanKong Intelligence AI Joint Research Laboratory.</sub>
+
 <p>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-d97706.svg"></a>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3fb950.svg">
@@ -71,6 +74,7 @@ host.save_artifact(plot(frames))             # ……上下文里只留 "<DataFr
 
 ## 📣 更新
 
+- **`2026-08-04`** 🔭 **`main` —— 通往 `v0.2.0` 的路上** —— **只读会话共享**（经出站 relay 隧道，`openai4s share` / `openai4s relay`）、**七个规范化的公共数据库连接器**（检索结果自带来源与时间）、带版本的 **`/api/v1`** 接口（keyset 分页、统一错误信封、可续传的 WebSocket 游标）、**环境即事务**（`openai4s env plan|apply|rollback`）、脱敏的 `doctor` / `diagnostics` 支持包、默认关闭且可撤销的遥测、逆合成规划 Skill，以及一套 **10 workflow / 20 case 的基准**——它跑在真实的 Store、内核与 dispatcher 上。Linux 与 Windows 桌面包已构建并验证，**将随下一个 release 一并发布**。
 - **`2026-07-15`** 🍎 **`v0.1.0` —— macOS 应用** —— 一键、免工具链的 Apple Silicon `.dmg`，内嵌 Python 与完整默认内核科学栈（rdkit · scanpy · 单细胞栈），并支持 PyPI 安装（`pip install openai4s`）与自动化发布。**第一次用？→ [上手指南](docs/startup-guide.md)。**
 - **`2026-07-06`** 🎉 **代码开源** —— 纯标准库 Code-as-Action 引擎、科研 Web 应用、24 个科学 Skill、BYOC 远程计算。
 
@@ -84,8 +88,26 @@ host.save_artifact(plot(frames))             # ……上下文里只留 "<DataFr
 - **🔌 一行切换多供应商** —— `ark`(doubao · glm · kimi · deepseek · minimax)加官方 `chatgpt · claude · gemini`,都由一个 `host.llm` 统一封装;在 UI 里即可切换。
 - **🖥️ 科研工作台** —— 实时流式事件、版本化 Artifact、溯源、Action Timeline，以及**默认只读的 Notebook**。只有显式开启开发标志后，才能对共享 Python/R 内核输入多行代码。
 - **🔐 分层本地执行防护** —— 严格子进程环境 allowlist、持久审批、与 generation 绑定的一次性 `host.bash` capability，以及 macOS Seatbelt/Linux bubblewrap 沙箱适配器；降级与 fail-closed 状态会显式呈现。
-- **🔬 33 个内置 Skill** —— GPU/模型科学 Skill(AlphaFold2 · ESMFold2 · Boltz · Chai-1 · OpenFold3 · ProteinMPNN · ESM-2 · Evo2 · Borzoi · scGPT · scVI · DiffDock ……)+ 科研工作流 Skill。Skill 是**代码配方**,不是 JSON schema。
+- **🔬 602 个内置 Skill** —— 41 份由 OpenAI4S 筛选维护的 GPU/模型科学、科研工作流与平台操作配方，加上固定版本、MIT 许可的 GPTomics/bioSkills 全部 561 份配方。Skill 是**代码配方**,不是 JSON schema；大型第三方集合按需搜索，在常驻 prompt 中只占一行。用户自撰的 Skill 只落在数据目录里，无法顶替内置 Skill 的信任等级。
 - **☁️ BYOC 远程计算** —— 在 provider 已配置且可达时，可通过 `ssh:<alias>` 或内置 **NVIDIA NIM** 集成投送 GPU 作业。通用远程计算仍属 Prototype；`host.fold` 遵守严格的不伪造策略。
+- **🔗 只读会话共享** —— 把一个会话发布成快照，拿到链接的人可以查看并导入自己的本地实例，全程经由**你自己运行**的 relay。守护进程从不监听公网端口，只向外拨号。记忆、权限状态与 Key 一律不外流，残留密钥会让发布 fail closed。→ [Web 共享](docs/webshare.md)
+- **🔎 带来源的科学检索** —— 七个规范化的公共数据库连接器（UniProt · RCSB PDB · Ensembl · ChEMBL · PubChem · arXiv · OpenAlex）。检索到的记录自带来源与时间，但不带取回它的 API Key。
+- **🧰 不止能跑，还能运维** —— 带版本的 `/api/v1`（keyset 分页、统一错误信封、correlation ID、可续传的 WebSocket 游标）、启动即要求本地凭据、脱敏的 `doctor` / `diagnostics` 支持包，以及默认关闭、一撤销就连同身份一起销毁的遥测。
+
+---
+
+## 📦 当前已交付的能力
+
+当前代码树的能力地图——按平面列出已实现且可达的部分。
+
+| 平面 | 已实现 |
+|---|---|
+| **控制与编排** | 基于类的原生 `Tool` · 追加式 Action Ledger · 带持久状态机的 plan/review · 会归档原始切片的上下文压缩 · 可中途叫停的并发子代理委派（fanout 48、depth 4）· 子代理无法自行放宽的 Specialist 白名单 · MCP 连接器 · 跨会话记忆 |
+| **科学执行** | 持久的 Python **与** R 内核 · cell 执行中途的同步 `host` RPC · 对象级数据血缘 · 版本化 Artifact · 按内核 *generation* 记录的环境溯源（绝不借用守护进程的）· 后台执行 · 602 个 Skill（41 个精选维护 + 561 个固定版本 bioSkills）· 带 ABA 安全看门狗恢复的 FIFO 执行协调器 |
+| **数据与检索** | 七个规范化公共数据库连接器（UniProt · RCSB PDB · Ensembl · ChEMBL · PubChem · arXiv · OpenAlex），记录自带来源与时间 · 覆盖其中三个的每日金丝雀 · 以 Agent Plan Key 授权的**豆包搜索 Custom 版**作为联网搜索主选 · Tavily 与免密钥搜索作为备用 · 托管的 DataPro 专业数据集检索 |
+| **工作台** | 实时流式 · Action Timeline · 默认只读的 Notebook · 分支 fork/激活/revert · 带明确 Partial/Failed 状态的验证式恢复 · 锁定到所指版本的 `@file` 引用 · 2D 化学/基因组/序列/MSA/LaTeX 渲染器 · Markdown 与 `.ipynb` 导出 |
+| **共享与可移植** | 经由你自己运行的 relay 的只读会话共享 · 隔离的可移植 Session 包 · 可选的、接到同一批内核上的 Jupyter KernelSpec 桥 |
+| **运维、安全与发布** | `/api/v1` 与启动凭据 · Seatbelt/bubblewrap 沙箱适配器，降级与 fail-closed 状态显式呈现 · 无人值守时默认拒绝的持久审批 · 脱敏诊断 · 可撤销遥测 · 环境即事务 · 跑在真实 Store、内核与 dispatcher 上的 10 workflow/20 case 基准 · 公开前先验证产物的分阶段发布流水线 |
 
 ---
 
@@ -127,7 +149,7 @@ Apple Silicon 用户可以完全跳过 clone：从 [最新 Release](https://gith
 **首次运行 —— 先配模型，再配搜索。** 启动应用后会打开工作台 `http://127.0.0.1:8760/`。启动不带任何 Key，因此：
 
 1. **模型 API** —— 打开 **设置 ⚙ → 模型**，选协议（**ark 兼容协议** 对应豆包/GLM/Kimi/DeepSeek/MiniMax，或 **OpenAI** / **Anthropic 兼容协议**），粘贴 **API Key**，点 **新增**，再点 **设为当前**。最省钱：用火山方舟 ¥9.9/月 套餐的 `ark` 协议。
-2. **搜索 API** *（可选、推荐）* —— 打开 **设置 ⚙ → 网络**，保持 **允许联网** 打开，到 **[tavily.com](https://tavily.com)** 注册，把 Key 粘进 **搜索 API Key（Tavily）** → **保存**。不填 Key，联网搜索仍会退回免密钥抓取。
+2. **搜索 API** *（可选、推荐）* —— 打开 **设置 ⚙ → 网络**，保持 **允许联网** 打开，把火山方舟 **Agent Plan Key** 粘进主选的**豆包搜索 Custom 版**卡片 → **保存凭证**。当前 Ark 模型已使用同一个 Key 时会自动复用。Tavily 与免密钥引擎仍作为备用；豆包专用健康检查不会把备用结果冒充豆包成功。
 
 完整流程（安装 → Gatekeeper → 模型 → 搜索 → R 内核）见：**[上手指南](docs/startup-guide.md)**。
 
@@ -138,7 +160,39 @@ sudo ln -sf /Applications/OpenAI4S.app/Contents/Resources/runtime/bin/openai4s /
 openai4s setup        # 仅当你需要 R 内核：需要先装 micromamba/mamba/conda
 ```
 
-R 内核未被打包（它需要一个 conda 环境）。Intel Mac 与 Linux 请改用 PyPI 安装（`pip install openai4s`）。
+R 内核未被打包（它需要一个 conda 环境）。Intel Mac 请改用 PyPI 安装（`pip install openai4s`）。
+
+### Linux 应用（无需任何工具链）
+
+> [!NOTE]
+> **Linux 与 Windows 安装包将随下一个 release 发布。** 它们已在 `main` 上构建并验证，但已发布的 `v0.1.0` 只带 macOS 镜像。在此之前，请用上面的源码方式，或 `pip install openai4s`。下面两节描述的是这两个包发布后的形态。
+
+从 [最新 Release](https://github.com/PKU-YuanGroup/OpenAI4S/releases/latest) 下载 `OpenAI4S-<version>-linux-x86_64.tar.gz`，解包到任意位置直接运行。内嵌的 Python 和预装科学栈与 macOS 镜像完全一致，只是形态换成了一个可任意移动的目录：
+
+```bash
+tar -xzf OpenAI4S-*-linux-x86_64.tar.gz && cd OpenAI4S-*-linux-x86_64
+./OpenAI4S          # 启动守护进程并打开 http://127.0.0.1:8760/
+./install.sh        # 可选：把 `openai4s` 挂到 PATH，并注册应用菜单项
+```
+
+`install.sh` 是单用户级的、不需要 root——它只往 `$HOME` 里写；`./uninstall.sh` 会撤销这些改动，而 `~/.openai4s` 里的数据原样保留。建议装上 `bubblewrap`（`apt install bubblewrap`）让 cell 在沙箱里跑；没有它，默认的 `OPENAI4S_KERNEL_SANDBOX=auto` 会明确报告内核处于降级、未隔离状态。目前只发布 `x86_64`——arm64 Linux 请改用 PyPI 安装（`pip install openai4s`）。
+
+### Windows（经由 WSL2）
+
+下载 `OpenAI4S-<version>-windows-x86_64.zip`，解压后双击 `OpenAI4S.cmd`。首次运行会检查 WSL2 与可工作的 bubblewrap 0.8.0+ 沙箱，校验并安装随包 Linux payload，创建 `~/.local/bin/openai4s`，在 WSL 中启动守护进程，再用 Windows 浏览器打开带本地登录引导的安全 URL。应用本体不下载、不 `pip`、不装工具链；支持基线是 Ubuntu 24.04，启动器可配置国内 PyPI/Conda 镜像以及 WSL 可访问的代理。详见双语 [Windows/WSL2 指南](docs/windows-wsl.md)。
+
+**原生 Windows 不受支持，而且程序会直接拒绝在那里启动内核**，不是「先警告再照跑」——内核要拉起 POSIX 子进程，R 通道靠 shell 重定向走文件描述符 3 和 4，沙箱也没有 Windows 后端。WSL2 报告自己是 Linux，所以这个包跑的就是其他平台跑的同一个构建。如果你还没有 WSL2，启动器会停下来并给出那条确切的命令（管理员 PowerShell 里的 `wsl --install`）。详见：**[平台支持矩阵](docs/platforms.md)**。
+
+### 🐳 Docker 与 Kubernetes
+
+```bash
+docker compose up -d --build          # http://127.0.0.1:8760/
+docker compose exec openai4s openai4s url   # 带令牌、可直接打开的 URL
+```
+
+镜像由本仓库构建——Debian-slim 上的 CPython、wheel，以及 `science` extra——以非特权用户运行，只有一个挂在 `/data` 的卷。模型 key 用 `OPENAI4S_SECRET_LLM_LLM_API_KEY` 传入（在集群里就是一个 `Secret`）；镜像从环境读取凭据，不会把任何凭据形状的东西写到卷上。上集群则是 `kubectl apply -f deploy/kubernetes.yaml`：一个单副本 Deployment、一个 `ReadWriteOnce` 声明、一个 ClusterIP Service，探针打在 `/health` 上。
+
+目前还没有发布镜像，请从检出的源码自行构建。公开它之前有两件事值得知道。在容器内绑定 `0.0.0.0` 会让访问令牌变成强制、同时关掉防 DNS 重绑定的 `Host` 白名单，于是挡在那些会执行代码的端点前面的就只剩令牌——这也是为什么 compose 只发布到 loopback、Service 只用 `ClusterIP`。另外，非特权容器无法给 bubblewrap 它所需要的命名空间，因此内核沙箱会可见地降级、由容器充当边界；那是一道更粗的边界，**[容器指南](docs/docker.md)** 写清楚了它不再覆盖什么。
 
 ---
 
@@ -148,30 +202,49 @@ R 内核未被打包（它需要一个 conda 环境）。Intel Mac 与 Linux 请
 
 | 文档 | 内容 |
 |---|---|
-| [**上手指南**](docs/startup-guide.md) | macOS `.dmg` 全流程：安装、Gatekeeper，以及配置模型 + Tavily 搜索 Key |
+| [**上手指南**](docs/startup-guide.md) | macOS `.dmg` 全流程：安装、Gatekeeper、配置模型，以及用一个 Agent Plan Key 授权豆包搜索（Tavily/免密钥备用） |
 | [**架构**](docs/architecture.md) | 混合动作路由、Action Ledger、`host` RPC 与惰性内核 |
 | [**后端扩展指南**](docs/backend-extension-guide.md) | 新 Tool、Host service、repository 与 session 行为应归属的位置 |
-| [**Skills**](docs/skills.md) | 33 个内置 Skill + 如何自撰 |
+| [**Skills**](docs/skills.md) | 41 个精选 Skill + 561 个固定版本 bioSkills + 如何自撰 |
 | [**远程计算**](docs/compute.md) | BYOC GPU 作业、`host.fold`、自动预置 |
+| [**科学连接器**](docs/science-connectors.md) | 七个公共数据库、各自的过滤条件与检索溯源 |
 | [**Web 应用**](docs/webapp.md) | UI 功能、Action Timeline、只读 Notebook、Artifact 与实现状态 |
+| [**Web 共享**](docs/webshare.md) | 只读会话共享、信任模型，以及如何运行自己的 relay |
 | [**Jupyter 适配器**](docs/jupyter.md) | 可选的独立 Python/R KernelSpec、安装命令与兼容边界 |
 | [**配置**](docs/configuration.md) | 模型供应商、环境变量、conda 环境、CLI |
+| [**Docker / Kubernetes**](docs/docker.md) | 镜像、`compose.yaml`、集群清单，以及通配绑定究竟改变了什么 |
+| [**平台支持**](docs/platforms.md) | 各操作系统的支持等级，以及原生 Windows 为何拒绝启动内核 |
+| [**Windows / WSL2**](docs/windows-wsl.md) | Ubuntu 24.04 安装、沙箱自检、生命周期命令、国内镜像与 localhost 代理说明 |
 | [**安全**](docs/security.md) | 纵深防御安全层与远程访问说明 |
 
 ---
 
 ## 🗺️ 路线图
 
+### 已交付
+
 - [x] 交付下一代工作台地基：分支激活与追加式 Revert/Undo 投影、带明确 Partial/Failed
   状态的验证式恢复、依赖级过期传播、持久化委派、隔离的可移植 Session 包、检查点化的
   plan/review/memory 状态，以及专用的 2D 化学/基因组/序列/MSA/LaTeX 渲染器。内存中的
   任意命名空间对象有意不做序列化；除非有安全配方能重建并验证它们，否则恢复始终是
   Partial，而且只有带可证明检查点映射的记录才提供 Fork，更早的历史会返回 409。
+- [x] 经由你自己运行的出站 relay 实现只读会话共享：守护进程从不监听公网端口，残留密钥
+  会让发布 fail closed。
+- [x] 端到端科研工作流的**可执行**基准 —— 10 workflow / 20 case 跑在真实的 Store、内核
+  管理器、host dispatcher 与计算管理器上；声明为 `failure` / `permission_denied` /
+  `recovered` / `provenance` 的用例，一旦运行*成功*即判定失败。对外发布可横向比较的
+  公开成绩仍在后面。
+- [x] 环境即事务（`openai4s env plan|apply|rollback`）：generation 全新构建、验证通过后
+  才被原子地指向，因此 Artifact 的溯源可以指名一个不可变的环境。
+
+### 下一步
+
+- [ ] **发布 Windows 与 Linux 桌面包**，与 macOS 镜像并列，让每个受支持的平台都能免工具链安装。
+- [ ] **NVIDIA 科学计算套件** —— 在现有 NVIDIA NIM 集成之外，把 **BioNeMo**（生物分子基础模型）与 **Parabricks**（GPU 加速的基因组学流水线）作为一等公民接入 Skill 与 BYOC 后端。
+- [ ] 本地 GPU 模型服务,让结构/设计类 Skill 无需远程计算即可运行。
+- [ ] SSH + NVIDIA NIM 之外的更多 BYOC 提供方(Modal / SLURM)。
 - [ ] 在可用平台上加强 bubblewrap 之外的 Linux 隔离（例如 seccomp），并扩展打包后沙箱冒烟验证。
 - [ ] DuckDuckGo 之外的免密钥 `web_search`(抗限流)。
-- [ ] SSH + NVIDIA NIM 之外的更多 BYOC 提供方(Modal / SLURM)。
-- [ ] 端到端科研工作流的公开基准。
-- [ ] 本地 GPU 模型服务,让结构/设计类 Skill 无需远程计算即可运行。
 
 ---
 
@@ -220,27 +293,16 @@ uv run pre-commit run --all-files   # 全量格式化 + lint
 
 ---
 
-## ✨ Star 历史
-
-<a href="https://www.star-history.com/?repos=PKU-YuanGroup%2FOpenAI4S&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=PKU-YuanGroup/OpenAI4S&type=date&theme=dark&legend=top-left&sealed_token=tXwdGRCr3f-z1z8jgUOb1LUaPHwq9008wrTkaLBHVH4lQQDeSr_uyDT_1NcLONdaOxKx9l0uvSHEToe73WVGac02UiFVnXE-W_0z8C1AFwJfPJ0S87FJYQ" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=PKU-YuanGroup/OpenAI4S&type=date&legend=top-left&sealed_token=tXwdGRCr3f-z1z8jgUOb1LUaPHwq9008wrTkaLBHVH4lQQDeSr_uyDT_1NcLONdaOxKx9l0uvSHEToe73WVGac02UiFVnXE-W_0z8C1AFwJfPJ0S87FJYQ" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=PKU-YuanGroup/OpenAI4S&type=date&legend=top-left&sealed_token=tXwdGRCr3f-z1z8jgUOb1LUaPHwq9008wrTkaLBHVH4lQQDeSr_uyDT_1NcLONdaOxKx9l0uvSHEToe73WVGac02UiFVnXE-W_0z8C1AFwJfPJ0S87FJYQ" />
- </picture>
-</a>
-
----
-
 ## ✏️ 引用
 
 ```bibtex
 @software{openai4s2026,
-  title  = {OpenAI4S: An Open-Source Code-as-Action Scientific Research Agent},
-  author = {OpenAI4S contributors},
-  year   = {2026},
-  url    = {https://github.com/PKU-YuanGroup/OpenAI4S},
-  note   = {Open AI for Scientist —— 对 Code-as-Action 范式的纯标准库开源复现}
+  title        = {OpenAI4S: An Open-Source Code-as-Action Scientific Research Agent},
+  author       = {OpenAI4S contributors},
+  organization = {Peking University Shenzhen Graduate School--YuanKong Intelligence AI Agent Joint Research Laboratory},
+  year         = {2026},
+  url          = {https://github.com/PKU-YuanGroup/OpenAI4S},
+  note         = {Open AI for Scientist —— 对 Code-as-Action 范式的纯标准库开源复现}
 }
 ```
 
@@ -248,12 +310,21 @@ uv run pre-commit run --all-files   # 全量格式化 + lint
 
 <!-- CONTRIBUTORS:START -->
 <a href="https://github.com/Nobody-Zhang" title="Nobody-Zhang"><img src=".github/contributors/Nobody-Zhang.png" width="64" height="64" alt="Nobody-Zhang" /></a>
-<a href="https://github.com/Grace-xyx" title="Grace-xyx"><img src=".github/contributors/Grace-xyx.png" width="64" height="64" alt="Grace-xyx" /></a>
 <a href="https://github.com/wangyu-sd" title="wangyu-sd"><img src=".github/contributors/wangyu-sd.png" width="64" height="64" alt="wangyu-sd" /></a>
+<a href="https://github.com/HowardLi1984" title="HowardLi1984"><img src=".github/contributors/HowardLi1984.png" width="64" height="64" alt="HowardLi1984" /></a>
+<a href="https://github.com/YuyangSunshine" title="YuyangSunshine"><img src=".github/contributors/YuyangSunshine.png" width="64" height="64" alt="YuyangSunshine" /></a>
+<a href="https://github.com/Lyu6PosHao" title="Lyu6PosHao"><img src=".github/contributors/Lyu6PosHao.png" width="64" height="64" alt="Lyu6PosHao" /></a>
+<a href="https://github.com/Grace-xyx" title="Grace-xyx"><img src=".github/contributors/Grace-xyx.png" width="64" height="64" alt="Grace-xyx" /></a>
+<a href="https://github.com/ClarenceYC" title="ClarenceYC"><img src=".github/contributors/ClarenceYC.png" width="64" height="64" alt="ClarenceYC" /></a>
+<a href="https://github.com/Linmj-Judy" title="Linmj-Judy"><img src=".github/contributors/Linmj-Judy.png" width="64" height="64" alt="Linmj-Judy" /></a>
 <a href="https://github.com/yusowa0716" title="yusowa0716"><img src=".github/contributors/yusowa0716.png" width="64" height="64" alt="yusowa0716" /></a>
+<a href="https://github.com/riiiiiiin" title="riiiiiiin"><img src=".github/contributors/riiiiiiin.png" width="64" height="64" alt="riiiiiiin" /></a>
+<a href="https://github.com/jiangzx25" title="jiangzx25"><img src=".github/contributors/jiangzx25.png" width="64" height="64" alt="jiangzx25" /></a>
+<a href="https://github.com/stau-7001" title="stau-7001"><img src=".github/contributors/stau-7001.png" width="64" height="64" alt="stau-7001" /></a>
+<a href="https://github.com/EQSTLab" title="EQSTLab"><img src=".github/contributors/EQSTLab.png" width="64" height="64" alt="EQSTLab" /></a>
 <!-- CONTRIBUTORS:END -->
 
-<sub>由 <code>scripts/update_contributors.py</code> 从 GitHub <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">贡献者图谱</a>自动生成(Contributors 工作流)。</sub>
+<sub>由 <code>scripts/update_contributors.py</code> 每日根据 GitHub <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">贡献者图谱</a>与维护中的公开署名名单自动生成。</sub>
 
 ---
 

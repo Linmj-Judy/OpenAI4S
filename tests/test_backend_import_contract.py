@@ -40,14 +40,39 @@ FACADE_EXPORTS: dict[str, frozenset[str]] = {
             "PROVIDERS",
             "chat",
             "get_model_capabilities",
+            "llm_failure_code",
             "provider_specs",
             "supports_vision",
+            # The triple-aware sibling. `supports_vision` answers for the
+            # provider's default model at its default endpoint, which is not
+            # what a configured session sends; the gateway's pre-flight has to
+            # ask about the exact provider+endpoint+model a call would use.
+            "supports_vision_for",
         }
     ),
     "openai4s.webtools": frozenset(
-        {"NetworkDisabled", "network_allowed", "web_fetch", "web_search"}
+        {
+            "NetworkDisabled",
+            # Both refusals are part of the public surface because the control
+            # tools have to catch them by name: the Host's soft-fail contract
+            # turns a single-key {"error": ...} into a RuntimeError the cell can
+            # handle, and a traceback escaping the dispatcher is not that.
+            "ResponseTooLarge",
+            "SSRFBlocked",
+            # The SSRF check itself, not just the exception it raises. Two
+            # subsystems apply it now: `_http_get` per redirect hop, and the
+            # managed-endpoint readiness probe, whose target URL is
+            # agent-supplied. A guard two subsystems depend on is surface; the
+            # alternative was `host/endpoints.py` reaching for `_guard_url`
+            # across a package boundary, which this test refused.
+            "guard_url",
+            "network_allowed",
+            "web_download",
+            "web_fetch",
+            "web_search",
+        }
     ),
-    "openai4s.mcp_client": frozenset({"manager"}),
+    "openai4s.mcp_client": frozenset({"disconnect_if_initialized", "manager"}),
     "openai4s.permissions": frozenset({"PermissionBroker", "broker"}),
     "openai4s.egress": frozenset(
         {
@@ -66,7 +91,9 @@ FACADE_EXPORTS: dict[str, frozenset[str]] = {
         }
     ),
     "openai4s.agent.loop": frozenset({"Agent", "run_task"}),
-    "openai4s.server.gateway": frozenset({"build_app_server", "serve_app"}),
+    "openai4s.server.gateway": frozenset(
+        {"build_app_server", "run_server", "serve_app"}
+    ),
 }
 
 # Existing boundary violations.  Do not add to this list: move the consumer to

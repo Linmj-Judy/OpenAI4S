@@ -4,6 +4,7 @@ The helpers in this module are intentionally pure stdlib. They normalize route
 exports from retrosynthesis backends, rank candidate routes, and render compact
 HTML/Markdown artifacts for human review.
 """
+
 from __future__ import annotations
 
 import base64
@@ -277,6 +278,33 @@ def canonicalize_smiles(smiles: str) -> str:
     return Chem.MolToSmiles(mol, canonical=True)
 
 
+#: Switches this function emits itself. ``extra_args`` may not repeat or
+#: abbreviate one: ``aizynthcli`` builds its parser with argparse's default
+#: ``allow_abbrev=True`` and applies last-value-wins, so a later ``--out`` or
+#: ``--conf`` silently redirects the export or the configuration the caller
+#: believes it set. Prefix matching is what makes the check hold — an
+#: exact-match check would block ``--output`` while waving ``--out`` through.
+COMMAND_OWNED_SWITCHES = frozenset({"--config", "--smiles", "--output"})
+
+
+def reject_owned_switches(
+    extra_args: Iterable[str], *, owned: Iterable[str] = COMMAND_OWNED_SWITCHES
+) -> None:
+    """Raise if an extra argument would override a switch the caller set."""
+    owned_set = frozenset(owned)
+    for value in extra_args:
+        switch = str(value).strip().split("=", 1)[0]
+        if not switch.startswith("-"):
+            continue
+        conflicting = sorted(item for item in owned_set if item.startswith(switch))
+        if conflicting:
+            raise ValueError(
+                f"extra_args entry {switch} must not repeat or abbreviate "
+                + " / ".join(conflicting)
+                + "; pass it through the dedicated argument instead"
+            )
+
+
 def build_aizynth_command(
     smiles: str,
     config_path: str,
@@ -296,7 +324,9 @@ def build_aizynth_command(
     if output_path:
         command.extend(["--output", str(Path(output_path).expanduser())])
     if extra_args:
-        command.extend(str(arg) for arg in extra_args)
+        extras = [str(arg) for arg in extra_args]
+        reject_owned_switches(extras)
+        command.extend(extras)
     if conda_env:
         return ["conda", "run", "-n", conda_env, *command]
     return command
@@ -756,9 +786,11 @@ def _candidate_match_level(value: Any) -> str:
         "class": "reaction_class",
     }.get(
         normalized,
-        normalized
-        if normalized in {"exact_substrate", "close_analog", "reaction_class"}
-        else "unknown",
+        (
+            normalized
+            if normalized in {"exact_substrate", "close_analog", "reaction_class"}
+            else "unknown"
+        ),
     )
 
 
@@ -1604,9 +1636,11 @@ def normalize_reaction_evidence(
         pairs = (
             (
                 key,
-                _evidence_entries_from_item(value)
-                if isinstance(value, dict)
-                else value,
+                (
+                    _evidence_entries_from_item(value)
+                    if isinstance(value, dict)
+                    else value
+                ),
             )
             for key, value in source.items()
         )
@@ -2445,18 +2479,18 @@ def _interactive_andor_payload(
             details["Validation plan"] = validation_plan
         details["Annotation key"] = annotation_key
         details["Evidence status"] = evidence_summary["status"]
-        details[
-            "Evidence coverage"
-        ] = f"{evidence_summary['coverage']}/100 heuristic coverage"
+        details["Evidence coverage"] = (
+            f"{evidence_summary['coverage']}/100 heuristic coverage"
+        )
         if evidence_summary["records"]:
             details["Supporting evidence"] = [
                 _evidence_detail_record(record)
                 for record in evidence_summary["records"]
             ]
         else:
-            details[
-                "Evidence caveat"
-            ] = "No external evidence record is attached. LLM-generated conditions or yields remain hypotheses."
+            details["Evidence caveat"] = (
+                "No external evidence record is attached. LLM-generated conditions or yields remain hypotheses."
+            )
         note = _unrecognized_reaction_note(backend_class)
         if note:
             details["Backend caveat"] = note
@@ -2791,11 +2825,15 @@ def _reaction_evidence_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     status = (
         "Verified exact-substrate evidence"
         if has_verified_exact
-        else "Verified analogue or class evidence"
-        if has_verified
-        else "Retrieved source candidates need review"
-        if has_candidates
-        else "Unverified evidence supplied"
+        else (
+            "Verified analogue or class evidence"
+            if has_verified
+            else (
+                "Retrieved source candidates need review"
+                if has_candidates
+                else "Unverified evidence supplied"
+            )
+        )
     )
     return {"coverage": coverage, "status": status, "records": normalized}
 
@@ -3400,9 +3438,9 @@ def _layout_svg_tree(
             "meta": _node_meta_label(item, depth),
             "class": _node_visual_class(item, depth, bool(children)),
             "full": _node_display_label(item),
-            "structure_src": structure_sources["primary"]
-            if structure_sources
-            else None,
+            "structure_src": (
+                structure_sources["primary"] if structure_sources else None
+            ),
             "structure_fallback_src": (
                 structure_sources["fallback"] if structure_sources else None
             ),

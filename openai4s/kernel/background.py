@@ -14,12 +14,25 @@ Each background job owns its OWN kernel subprocess (so a long cell never blocks
 the foreground kernel). stdout is streamed live into a thread-safe buffer that
 exec_peek reads at any time.
 """
+
 from __future__ import annotations
 
 import threading
 import time
 import uuid
 from typing import Any
+
+#: Head cap on what a background cell's buffer retains, matching the worker's
+#: own `MAX_OUTPUT` so `exec_peek` and the final response truncate at the same
+#: point rather than disagreeing about what the cell printed.
+#:
+#: The worker now bounds its own stream, so in practice this is a backstop --
+#: but it is the buffer's own contract that was missing. `_buf` was an
+#: unbounded list appended to per chunk, and `stdout_so_far` re-joined all of
+#: it on every peek, so a chatty long-running cell grew the daemon's memory for
+#: the life of the job and made each poll more expensive than the last.
+MAX_PEEK_CHARS = 1_000_000
+_TRUNCATION_MARKER = f"\n...(truncated at {MAX_PEEK_CHARS} characters)"
 
 
 class _BackgroundJob:
@@ -28,6 +41,8 @@ class _BackgroundJob:
         "code",
         "status",
         "_buf",
+        "_buf_len",
+        "_buf_truncated",
         "_lock",
         "_kernel",
         "_thread",
@@ -43,6 +58,8 @@ class _BackgroundJob:
         self.code = code
         self.status = "running"  # running|done|failed|interrupted
         self._buf: list[str] = []
+        self._buf_len = 0
+        self._buf_truncated = False
         self._lock = threading.Lock()
         self._kernel: Any = None
         self._thread: threading.Thread | None = None
@@ -53,12 +70,23 @@ class _BackgroundJob:
         self.interrupted = False
 
     def _on_chunk(self, text: str) -> None:
+        if not text:
+            return
         with self._lock:
-            self._buf.append(text)
+            room = MAX_PEEK_CHARS - self._buf_len
+            if room <= 0:
+                self._buf_truncated = True
+                return
+            kept = text[:room]
+            self._buf.append(kept)
+            self._buf_len += len(kept)
+            if len(kept) < len(text):
+                self._buf_truncated = True
 
     def stdout_so_far(self) -> str:
         with self._lock:
-            return "".join(self._buf)
+            value = "".join(self._buf)
+            return value + _TRUNCATION_MARKER if self._buf_truncated else value
 
     def peek(self) -> dict:
         """Non-blocking snapshot of the running cell."""
@@ -85,20 +113,53 @@ class BackgroundExecutor:
         self._lock = threading.Lock()
         self._closed = False
 
+    #: Concurrently RUNNING background cells. Each one owns a kernel
+    #: subprocess of its own, so this bounds PROCESSES rather than
+    #: bookkeeping: a finished job stays in the registry for `exec_peek` and
+    #: does not hold a slot. There was no cap at all -- a loop calling
+    #: `host.exec_background` forked a worker per iteration until the machine
+    #: ran out of pids or memory, and nothing on the path said no.
+    MAX_ACTIVE_JOBS = 16
+
     def launch(self, code: str, origin: str = "agent") -> dict:
+        exec_id = f"exec-{uuid.uuid4().hex[:12]}"
+        job = _BackgroundJob(exec_id, code)
+        # Claim the slot BEFORE the kernel exists. The old order checked
+        # `_closed`, released the lock, spawned, and registered afterwards --
+        # so any number of concurrent launches passed the check together and
+        # every one of them spawned. A limit tested there would have been
+        # tested against processes that already existed, which is not a limit.
+        # Registering first makes the slot count the thing being limited.
         with self._lock:
             if self._closed:
                 raise RuntimeError("background executor is closed")
-        exec_id = f"exec-{uuid.uuid4().hex[:12]}"
-        job = _BackgroundJob(exec_id, code)
-        job._kernel = self._kernel_factory()
+            active = sum(1 for j in self._jobs.values() if j.status == "running")
+            if active >= self.MAX_ACTIVE_JOBS:
+                raise RuntimeError(
+                    f"{active} background cells are already running (limit "
+                    f"{self.MAX_ACTIVE_JOBS}); interrupt one with "
+                    f"host.exec_interrupt or wait for it to finish"
+                )
+            self._jobs[exec_id] = job
+        try:
+            job._kernel = self._kernel_factory()
+        except BaseException:
+            # A spawn failure has to give the slot back, or the cap leaks one
+            # slot per failure and eventually refuses every launch on a machine
+            # that is now perfectly able to serve them.
+            with self._lock:
+                self._jobs.pop(exec_id, None)
+            raise
         with self._lock:
             if self._closed:
+                # `shutdown()` ran while we were spawning. It walked a job whose
+                # `_kernel` was still None, so this worker is ours to stop --
+                # nobody else has a handle on it.
+                self._jobs.pop(exec_id, None)
                 try:
                     job._kernel.shutdown()
                 finally:
                     raise RuntimeError("background executor is closed")
-            self._jobs[exec_id] = job
 
         def _run() -> None:
             try:
@@ -162,22 +223,30 @@ class BackgroundExecutor:
             if job.status != "running":
                 continue
             stopped += 1
-            try:
-                job._kernel.interrupt()
-            except Exception:  # noqa: BLE001 — advance to the exact hard stop
-                pass
+            kernel = job._kernel
+            if kernel is not None:
+                try:
+                    kernel.interrupt()
+                except Exception:  # noqa: BLE001 — advance to the exact hard stop
+                    pass
             thread = job._thread
             if thread is not None:
                 thread.join(timeout=max(0.0, timeout_per_job))
-            # ``thread`` is None during the launch() window between registering
-            # the job and assigning its thread; the kernel worker already exists
-            # (created before registration), so it must still be hard-killed
-            # here or it leaks a running background worker past teardown.
+            # ``thread`` is None during the launch() window between claiming a
+            # slot and starting the runner, and ``_kernel`` is None for the part
+            # of that window before the spawn returns -- the slot is claimed
+            # first, on purpose. A worker that appears after this point is not
+            # leaked: launch() re-reads ``_closed`` once it has spawned and
+            # shuts down the worker it just created. Re-read ``_kernel`` here
+            # rather than reuse the value from before the join, which may have
+            # been None then and real now.
             if thread is None or thread.is_alive():
-                try:
-                    job._kernel.kill_worker()
-                except Exception:  # noqa: BLE001 — worker may already be dead
-                    pass
+                kernel = job._kernel
+                if kernel is not None:
+                    try:
+                        kernel.kill_worker()
+                    except Exception:  # noqa: BLE001 — worker may already be dead
+                        pass
                 if thread is not None:
                     thread.join(timeout=max(0.0, timeout_per_job))
         return stopped

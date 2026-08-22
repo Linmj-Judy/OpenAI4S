@@ -8,15 +8,22 @@ import hashlib
 import json
 import mimetypes
 import os
+import platform as _pf
 import re
 import shutil
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from openai4s.artifact_restore import ArtifactRestoreService
+from openai4s.artifact_restore import (
+    ArtifactRestoreRefused,
+    ArtifactRestoreService,
+    trusted_snapshot_roots,
+)
 from openai4s.execution import CaptureResult
+from openai4s.server.errors import record_diagnostic
 
 _JUNK_DIR_SEGMENTS = frozenset({"__pycache__", "node_modules", "site-packages", "venv"})
 _EMBEDDED_IMAGE_TYPES = frozenset(
@@ -144,7 +151,37 @@ def _write_confined_text(workspace: Path, relative: Path, content: str) -> Path:
     return target
 
 
+def _same_interpreter(interpreter: Any, has_generation: bool = False) -> bool:
+    """True when the kernel ran in this very process's interpreter.
+
+    Only then may this process's own version strings be attributed to it.
+
+    A *missing* interpreter is the daemon fallback only when there is no
+    generation on record. With a generation but no interpreter — a legacy or
+    imported one — the runtime is unknown, and stamping the daemon's Python
+    version and implementation onto it is the same confidently-wrong provenance
+    the package-list path already refuses. So a missing interpreter matches
+    only in the no-generation case.
+    """
+    if not interpreter:
+        return not has_generation
+    # Same executable *and* same environment. A virtualenv's bin/python is a
+    # symlink to the base python, so a resolved-executable match alone would
+    # stamp the daemon's version/implementation onto a different environment.
+    from openai4s.kernel.preinstall import _is_this_interpreter
+
+    try:
+        return _is_this_interpreter(str(interpreter))
+    except OSError:
+        return False
+
+
 class ArtifactManager:
+    #: A generation ends when its kernel does, so this cannot grow without
+    #: bound in practice. The ceiling is a backstop against a session that
+    #: restarts its kernel thousands of times, not a tuning knob.
+    _FREEZE_CACHE_MAX = 256
+
     def __init__(
         self,
         *,
@@ -152,7 +189,6 @@ class ArtifactManager:
         store: Any,
         workspace_for: Callable[[str], Path],
         broadcast: Callable[[str, dict], None],
-        environment_snapshot: Callable[[], dict],
         guess_content_type: Callable[[str], str],
         checksum: Callable[[Path], str],
     ) -> None:
@@ -160,9 +196,12 @@ class ArtifactManager:
         self.store = store
         self.workspace_for = workspace_for
         self.broadcast = broadcast
-        self.environment_snapshot = environment_snapshot
         self.guess_content_type = guess_content_type
         self.checksum = checksum
+        # (generation_id, interpreter) -> frozen packages, or None when the
+        # interpreter refused to be read. See _frozen_packages.
+        self._freeze_cache: dict[tuple[str, str], list[dict[str, Any]] | None] = {}
+        self._freeze_lock = threading.Lock()
 
     def _notify(
         self,
@@ -212,6 +251,42 @@ class ArtifactManager:
         except ValueError as error:
             raise PermissionError("artifact live path escapes its workspace") from error
         return target
+
+    def stage_version_bytes(self, filename: str, data: bytes) -> Path:
+        """Freeze bytes under a pending name, before any version row exists.
+
+        The strict half of `write_version_snapshot`, and the reason it exists:
+        that method swallows `OSError`, so on the upload path a failed snapshot
+        left a *committed* version whose `snapshot_path` was NULL and whose
+        frozen bytes were nowhere -- and the call still returned success. The
+        comment directly above the call said "a committed version must never
+        lack the frozen bytes its checksum describes"; the code said otherwise,
+        and `ArtifactRestoreService.verified_snapshot_bytes` refuses exactly
+        that version, so the upload reported success and produced something no
+        restore could ever read.
+
+        Swallowing is right for `protect_latest`, which backfills opportunistically
+        and must not fail a turn. It is wrong here, where the write is the thing
+        that makes a version legitimate. Writing under a pending name lets the
+        caller do it *before* the row is created, so a failure happens while
+        nothing is visible rather than after the commit.
+        """
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
+        directory = self.versions_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        pending = directory / f".pending-{uuid.uuid4().hex}__{safe}"
+        pending.write_bytes(data)
+        return pending
+
+    def promote_version_bytes(
+        self, version_id: str, filename: str, pending: Path
+    ) -> Path:
+        """Give staged bytes their version-scoped name and record it."""
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
+        final = self.versions_dir() / f"{version_id}__{safe}"
+        os.replace(str(pending), str(final))
+        self.store.set_version_snapshot(version_id, str(final))
+        return final
 
     def write_version_snapshot(
         self,
@@ -275,15 +350,28 @@ class ArtifactManager:
             restored = ArtifactRestoreService(
                 store=self.store,
                 primary_snapshot_dir=self.versions_dir(),
-                trusted_snapshot_dirs=(self.data_dir / "artifacts",),
+                trusted_snapshot_dirs=trusted_snapshot_roots(self.data_dir),
                 resolve_live_path=self.restore_live_path,
             ).restore(
                 artifact=artifact,
                 source_version_id=version_id,
                 frame_id=artifact.get("root_frame_id"),
             )
-        except (KeyError, OSError, PermissionError, RuntimeError, ValueError) as error:
-            return {"error": f"restore failed: {error}"}
+        except ArtifactRestoreRefused as refusal:
+            # Author-written, and the product: "checksum verification failed" is
+            # exactly what the user has to be told, and suppressing it to be
+            # safe would leave them with a restore that failed for no stated
+            # reason.
+            return {"error": f"restore failed: {refusal}", "code": "restore_refused"}
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            # Anything else escaped from the OS layer with its own text. An
+            # `OSError` here names the snapshot it could not read -- an absolute
+            # path under the data directory, so the account's username -- and
+            # this dict is the body of
+            # `POST /artifacts/<id>/versions/<vid>/restore`. The original goes
+            # to the operator record, redacted once and paired with the id.
+            record_diagnostic(error, surface="artifacts:restore")
+            return {"error": "restore failed", "code": "restore_failed"}
 
         current_artifact = self.store.get_artifact(artifact_id)
         root_frame_id = artifact.get("root_frame_id")
@@ -352,7 +440,10 @@ class ArtifactManager:
             live.parent.mkdir(parents=True, exist_ok=True)
             live.write_text(content, encoding="utf-8")
         except OSError as error:
-            raise ArtifactOperationError(500, f"write failed: {error}") from error
+            # Same reason as `restore` above: `strerror` arrives with the
+            # absolute path it failed on, and a 500 body is a public surface.
+            record_diagnostic(error, surface="artifacts:write")
+            raise ArtifactOperationError(500, "write failed") from error
 
         record = self.store.save_artifact(
             path=str(live),
@@ -418,45 +509,177 @@ class ArtifactManager:
         )
         return {"ok": True, "artifact_id": artifact_id, "filename": filename}
 
+    @staticmethod
+    def _upload_bytes(payload: dict) -> bytes:
+        """The exact bytes an upload carries, or a refusal.
+
+        Two ways this used to rewrite scientific data without saying so.
+
+        `b64decode` was called without `validate=True`, and in that mode it
+        *silently discards* characters outside the base64 alphabet -- so a
+        payload corrupted in transit decodes to different bytes and raises
+        nothing. The artifact then carries a checksum computed over the wrong
+        content, which is worse than a missing checksum because it is believed.
+
+        And when decoding did raise, the fallback stored
+        `encoded.encode("utf-8")`: the literal base64 *text* became the file.
+        Upload a `.npy` with one character lost and the artifact contains the
+        base64 string, versioned, hashed and indistinguishable from data.
+
+        A caller that wants to upload text says so with `content_text`. A
+        caller that sends base64 gets base64 or an error. The three fields are
+        mutually exclusive because "which one did you mean" has no safe
+        default.
+        """
+        fields = [
+            name
+            for name in ("content_base64", "content", "content_text")
+            if payload.get(name) not in (None, "")
+        ]
+        if len(fields) > 1:
+            raise ArtifactOperationError(
+                400,
+                "upload carries "
+                + " and ".join(sorted(fields))
+                + "; supply exactly one, because which one is authoritative "
+                "cannot be guessed",
+            )
+        if not fields:
+            return b""
+
+        field = fields[0]
+        value = payload[field]
+        if field == "content_text":
+            if not isinstance(value, str):
+                raise ArtifactOperationError(400, "content_text must be a string")
+            return value.encode("utf-8")
+        if not isinstance(value, str):
+            raise ArtifactOperationError(400, f"{field} must be a base64 string")
+        # Whitespace is transport formatting -- plenty of tools wrap base64 at
+        # 76 columns -- so it is stripped rather than rejected. Anything else
+        # outside the alphabet is corruption, and `validate=True` is what makes
+        # the difference visible: without it those characters are dropped and
+        # the payload decodes to *different bytes* with no error at all.
+        compact = re.sub(r"\s+", "", value)
+        try:
+            return base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ArtifactOperationError(
+                400,
+                f"{field} is not valid base64 ({error}); "
+                "send content_text to upload text",
+            ) from error
+
     def upload(
         self,
         payload: dict,
         *,
         broadcast: Broadcast | None = None,
     ) -> dict:
-        """Decode and register one JSON/base64 upload as a versioned artifact."""
+        """Decode and register one JSON/base64 upload as a versioned artifact.
+
+        The ordering is the contract. This used to be
+        `target.write_bytes(raw)` followed by the same-name lookup and then
+        `save_artifact`, whose scope resolution can still refuse -- so a
+        `project_id` that did not match the frame's left the previous version's
+        row naming a path whose bytes were now the *rejected* upload's. That is
+        client-reachable rather than theoretical: `app.js` sends
+        `S.project || undefined` and this method defaults the field to
+        `"default"`, so an upload into a non-default-project session with the
+        field omitted takes exactly that branch.
+
+        Now every refusal happens first, the bytes are staged beside the target,
+        and the live file is replaced only once the version is committed and its
+        immutable snapshot written. A failure anywhere leaves the previous live
+        bytes, the Artifact head, the checksum, the version count and the event
+        count all unchanged.
+        """
         filename = payload.get("filename") or f"upload-{uuid.uuid4().hex[:8]}"
-        encoded = payload.get("content_base64") or payload.get("content") or ""
         frame_id = payload.get("frame_id")
-        project_id = payload.get("project_id") or "default"
-        try:
-            raw = base64.b64decode(encoded) if encoded else b""
-        except (binascii.Error, ValueError):
-            raw = encoded.encode("utf-8") if isinstance(encoded, str) else b""
+        # `None` when the client said nothing, not `"default"`.
+        #
+        # `artifact_write_scope` treats a non-None `project_id` as an assertion
+        # about the frame's project and refuses when the two disagree -- which
+        # is right. Defaulting here turned "the client did not say" into "the
+        # client said `default`", so uploading into any session outside the
+        # `default` project raised `project_id conflicts with producer frame`
+        # from a request that named no project at all. Every session in a real
+        # project was un-uploadable-to. The resolver already falls back to
+        # `"default"` itself when there is no producer frame, so the frameless
+        # case is unchanged.
+        project_id = payload.get("project_id")
+        raw = self._upload_bytes(payload)
 
         workspace = (
             self.workspace_for(frame_id) if frame_id else self.data_dir / "uploads"
         )
         workspace.mkdir(parents=True, exist_ok=True)
         target = workspace / Path(filename).name
-        target.write_bytes(raw)
+
+        # Both of these can refuse, and neither touches disk.
+        try:
+            _explicit, _root, project_id = self.store.artifact_write_scope(
+                frame_id=frame_id, project_id=project_id
+            )
+        except ValueError as conflict:
+            # A scope disagreement is the caller's, not the daemon's. It used to
+            # leave the repository as a bare `ValueError`, reach the dispatcher's
+            # catch-all and be answered `500 internal_error` -- so a client that
+            # named the wrong project was told the server had broken, with
+            # nothing to act on. The message is the repository's own and names
+            # only field names.
+            raise ArtifactOperationError(409, str(conflict)) from conflict
         existing = (
             self.store.artifact_by_filename(target.name, frame_id, strict=True)
             if frame_id
             else None
         )
-        record = self.store.save_artifact(
-            path=str(target),
-            filename=target.name,
-            content_type=self.guess_content_type(target.name),
-            size_bytes=len(raw),
-            checksum=hashlib.sha256(raw).hexdigest(),
-            frame_id=frame_id,
-            project_id=project_id,
-            is_user_upload=True,
-            artifact_id=(existing["artifact_id"] if existing else None),
-        )
-        self.write_version_snapshot(record["version_id"], target.name, data=raw)
+
+        # Both stages happen before any row exists, so everything that can fail
+        # on the way in fails while nothing is visible: no version, no live
+        # file, no event. The old order committed the row first and then wrote
+        # the snapshot through a call that swallows `OSError`, which is how a
+        # successful-looking upload produced a version no restore could read.
+        staged = target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.part")
+        pending: Path | None = None
+        try:
+            staged.write_bytes(raw)
+            pending = self.stage_version_bytes(target.name, raw)
+        except OSError as error:
+            staged.unlink(missing_ok=True)
+            if pending is not None:
+                pending.unlink(missing_ok=True)
+            record_diagnostic(error, surface="artifacts:upload:stage")
+            raise ArtifactOperationError(500, "upload staging failed") from error
+        try:
+            record = self.store.save_artifact(
+                path=str(target),
+                filename=target.name,
+                content_type=self.guess_content_type(target.name),
+                size_bytes=len(raw),
+                checksum=hashlib.sha256(raw).hexdigest(),
+                frame_id=frame_id,
+                project_id=project_id,
+                is_user_upload=True,
+                # Committed already pointing at bytes that exist. Between here
+                # and `promote_version_bytes` the row names the pending file,
+                # which is a worse *name* and the same bytes -- the invariant
+                # that matters holds throughout.
+                snapshot_path=str(pending),
+                artifact_id=(existing["artifact_id"] if existing else None),
+            )
+        except Exception:
+            # Nothing was made visible: drop both stages and let the caller see
+            # the refusal.
+            staged.unlink(missing_ok=True)
+            pending.unlink(missing_ok=True)
+            raise
+        try:
+            self.promote_version_bytes(record["version_id"], target.name, pending)
+            os.replace(str(staged), str(target))
+        except Exception:
+            staged.unlink(missing_ok=True)
+            raise
         self._notify(
             frame_id,
             {
@@ -719,8 +942,46 @@ class ArtifactManager:
         figure_set = set(figures)
         files_written: list[str] = []
         artifacts: list[dict] = []
+        # `language` and the session's frame id were already in scope here and
+        # simply were not passed on, which is why every artifact was stamped
+        # with the daemon's Python environment regardless of what ran.
+        # Drained on EVERY cell, not only on cells that wrote files. The
+        # buffer's own docstring says "drained per cell", and it was not: a
+        # cell that ran a remote GPU job and produced no local output left its
+        # entry sitting there, and the next cell that happened to write a file
+        # was stamped with it. A fold in cell 3 became the provenance of a
+        # figure from cell 7 — provenance that is wrong rather than absent,
+        # which is the failure this subsystem exists to prevent.
+        #
+        # `capture_environment` is what performs the drain, so it is called
+        # either way; its result is only *kept* when there is an artifact to
+        # attach it to. A remote run whose cell produced nothing has no
+        # artifact to describe, and discarding it is the honest outcome.
+        # Two different concerns, separated because they want opposite answers
+        # on a cell that wrote nothing.
+        #
+        # The DRAIN must happen every cell. The buffer's own docstring says
+        # "drained per cell" and it was not: the whole block was gated on the
+        # cell having written files, so a cell that ran a remote GPU job and
+        # produced no local output left its entry sitting there, and the next
+        # cell that happened to write something was stamped with it. A fold in
+        # cell 3 became the provenance of a figure from cell 7 — provenance
+        # that is wrong rather than absent.
+        #
+        # The environment FREEZE should not happen on such a cell: it lists
+        # packages, and there is no artifact for it to describe. Skipping it
+        # was the sound half of the old behaviour and is kept.
+        remote_entries = (
+            drain_remote_provenance() if drain_remote_provenance is not None else None
+        )
         env_snapshot_id = (
-            self.capture_environment(drain_remote_provenance) if changed else None
+            self.capture_environment(
+                lambda: remote_entries,
+                root_frame_id=getattr(session, "root_frame_id", None),
+                language=language,
+            )
+            if changed
+            else None
         )
         for path in sorted(
             changed,
@@ -744,11 +1005,28 @@ class ArtifactManager:
         return CaptureResult(figures, files_written, artifacts)
 
     def capture_environment(
-        self, drain_remote_provenance: Callable[[], Any] | None = None
+        self,
+        drain_remote_provenance: Callable[[], Any] | None = None,
+        *,
+        root_frame_id: str | None = None,
+        language: str = "python",
     ) -> str | None:
-        """Freeze the local env plus buffered remote-compute provenance once."""
+        """Record the environment of the kernel that produced these files.
+
+        It used to record the *daemon's* — a zero-argument freeze of this
+        process, stamped ``kind: "python"`` whatever had actually run. An R
+        cell's artifact therefore carried a Python package list, and so did a
+        Python cell running in a selected conda environment. Both are the same
+        failure: provenance that is wrong rather than absent, presented by the
+        UI as the kernel's own.
+
+        The kernel generation is the authority. It knows the runtime, the
+        interpreter, and the environment name, and its id ties the artifact to
+        one exact kernel lifetime.
+        """
         try:
-            snapshot = self.environment_snapshot()
+            generation = self._generation_for(root_frame_id, language)
+            snapshot = self._snapshot_for(generation, language)
             if drain_remote_provenance is not None:
                 remote = drain_remote_provenance()
                 if remote:
@@ -756,6 +1034,164 @@ class ArtifactManager:
             return self.store.upsert_env_snapshot(snapshot)
         except Exception:  # noqa: BLE001 — provenance cannot break artifact saving
             return None
+
+    def _generation_for(
+        self, root_frame_id: str | None, language: str
+    ) -> dict[str, Any] | None:
+        """The generation that actually produced these files, on this branch.
+
+        Generations are registered per ``branch_id``, and the repository
+        defaults an omitted one to ``root_frame_id`` — the root branch. Omitting
+        it here meant a file written by a cell on a *forked* branch was
+        attributed to the root branch's most recent kernel, or, if the root had
+        none, degraded to the assumed snapshot. Either way the artifact's
+        interpreter and package provenance described a kernel that did not
+        produce it, which is the failure this whole path exists to prevent.
+        """
+        if not root_frame_id:
+            return None
+        latest = getattr(self.store, "latest_kernel_generation", None)
+        if latest is None:
+            return None
+        try:
+            active = getattr(self.store, "active_session_branch", None)
+            branch_id = active(root_frame_id) if callable(active) else None
+            return latest(root_frame_id, language, branch_id=branch_id or None)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _snapshot_for(
+        self, generation: dict[str, Any] | None, language: str
+    ) -> dict[str, Any]:
+        """Build the snapshot from what the generation actually says.
+
+        With no generation on record -- a cell that wrote files before any
+        kernel was registered, or a store that predates them -- fall back to
+        describing this process, but say so, so a reader can tell a measured
+        environment from an assumed one.
+        """
+        from openai4s.kernel import preinstall
+
+        environment = (generation or {}).get("environment")
+        environment = environment if isinstance(environment, dict) else {}
+        runtime = str(environment.get("runtime") or language or "python").lower()
+        interpreter = environment.get("interpreter")
+
+        snapshot: dict[str, Any] = {
+            "kind": runtime,
+            "interpreter": interpreter,
+            "environment_name": environment.get("environment_name"),
+            "platform": _pf.platform(),
+        }
+        if generation:
+            snapshot["generation_id"] = generation.get("generation_id")
+            snapshot["environment_manifest_id"] = generation.get(
+                "environment_manifest_id"
+            )
+        else:
+            snapshot["provenance"] = "assumed: no kernel generation on record"
+
+        if runtime == "python":
+            if interpreter:
+                packages = self._frozen_packages(interpreter, generation)
+            elif generation:
+                # A generation *is* on record — legacy, imported, or written
+                # before the environment carried an interpreter path. Freezing
+                # the daemon here attributed this process's packages to that
+                # generation id, which is confidently wrong provenance rather
+                # than absent provenance. The daemon may only describe the case
+                # where no generation exists at all.
+                packages = None
+            else:
+                packages = preinstall.full_freeze()
+            if packages is None:
+                # Naming what we could not read beats implying the daemon's
+                # packages were this kernel's.
+                snapshot["packages"] = []
+                snapshot["package_count"] = 0
+                snapshot["packages_unavailable"] = (
+                    f"could not read distributions from {interpreter!r}"
+                    if interpreter
+                    else (
+                        "this kernel generation records no interpreter, and "
+                        "the daemon's packages are not this kernel's"
+                    )
+                )
+            else:
+                snapshot["packages"] = packages
+                snapshot["package_count"] = len(packages)
+            snapshot["python_version"] = (
+                _pf.python_version()
+                if _same_interpreter(interpreter, bool(generation))
+                else None
+            )
+            snapshot["implementation"] = (
+                _pf.python_implementation()
+                if _same_interpreter(interpreter, bool(generation))
+                else None
+            )
+        else:
+            # A non-Python kernel has no Python package set, and claiming an
+            # empty one would read as "nothing installed" rather than "not
+            # applicable".
+            snapshot["packages"] = []
+            snapshot["package_count"] = 0
+            snapshot["packages_unavailable"] = (
+                f"{runtime} kernel: Python distribution metadata does not apply"
+            )
+        return snapshot
+
+    def invalidate_freeze_cache(self) -> None:
+        """Forget every cached package list.
+
+        The cache is keyed by kernel generation on the premise that an
+        environment cannot change within one — which `/kernel/install` breaks:
+        installing with ``restart: false`` (or installing successfully and then
+        failing to restart) mutates the *same* generation's interpreter. A stale
+        entry would then attribute the pre-install package list to artifacts the
+        new packages actually produced, which is provenance that is wrong rather
+        than absent. The installer calls this so the next capture re-probes.
+        """
+        with self._freeze_lock:
+            self._freeze_cache.clear()
+
+    def _frozen_packages(
+        self, interpreter: Any, generation: dict[str, Any] | None
+    ) -> list[dict[str, Any]] | None:
+        """Freeze a foreign interpreter once per kernel generation.
+
+        ``freeze_for`` launches the target interpreter and enumerates its
+        distributions — up to a 20-second wait. Its docstring says callers
+        cache per generation because an environment cannot change within one;
+        no caller did, so every cell that produced a file paid the full probe
+        again. A persistent kernel writing a figure per cell paid it per
+        figure.
+
+        A failed probe is cached too: an interpreter that could not be read
+        will not become readable within the same generation, and re-paying the
+        timeout to rediscover that is the worst version of this.
+
+        Keyed by generation because that is the exact lifetime over which the
+        answer is constant. Without one there is nothing bounding the
+        environment's stability, so the probe runs.
+        """
+        from openai4s.kernel import preinstall
+
+        generation_id = str((generation or {}).get("generation_id") or "")
+        if not generation_id:
+            return preinstall.freeze_for(interpreter)
+        key = (generation_id, str(interpreter))
+        with self._freeze_lock:
+            if key in self._freeze_cache:
+                return self._freeze_cache[key]
+        packages = preinstall.freeze_for(interpreter)
+        with self._freeze_lock:
+            # Bounded: one entry per (generation, interpreter), and a
+            # generation ends when its kernel does.
+            if len(self._freeze_cache) >= self._FREEZE_CACHE_MAX:
+                self._freeze_cache.clear()
+            self._freeze_cache[key] = packages
+        return packages
 
 
 def _capture_snippet(index: int) -> str:

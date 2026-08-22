@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from openai4s.config import Config, LLMConfig
 from openai4s.host_dispatch import HostDispatcher
 from openai4s.kernel import Kernel
@@ -33,10 +35,9 @@ class ArtifactHarness:
             store=self.store,
             workspace_for=lambda frame_id: self.workspace,
             broadcast=lambda frame_id, event: self.broadcasts.append((frame_id, event)),
-            environment_snapshot=self.environment_snapshot,
-            guess_content_type=lambda name: "text/csv"
-            if name.endswith(".csv")
-            else "application/octet-stream",
+            guess_content_type=lambda name: (
+                "text/csv" if name.endswith(".csv") else "application/octet-stream"
+            ),
             checksum=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
         )
         self.session = SimpleNamespace(
@@ -45,16 +46,20 @@ class ArtifactHarness:
             workspace=self.workspace,
         )
 
-    def environment_snapshot(self) -> dict:
-        self.environment_calls += 1
-        return {
-            "kind": "python",
-            "python_version": "3.14.0",
-            "implementation": "CPython",
-            "platform": "test",
-            "packages": [{"name": "numpy", "version": "2.0"}],
-            "package_count": 1,
-        }
+    def count_environment_captures(self) -> None:
+        """Freezing once per capture is the invariant, not once per file.
+
+        Previously counted through an injected `environment_snapshot` port;
+        the snapshot now comes from the kernel generation, so the counter
+        wraps the method that must stay called exactly once.
+        """
+        original = self.manager.capture_environment
+
+        def counting(*args, **kwargs):
+            self.environment_calls += 1
+            return original(*args, **kwargs)
+
+        self.manager.capture_environment = counting
 
 
 def test_register_freezes_version_before_emitting_event(tmp_path):
@@ -377,6 +382,67 @@ def test_restore_backfills_legacy_latest_before_broadcast(tmp_path):
     ]
 
 
+def test_restore_carries_the_retrieval_provenance_forward(tmp_path):
+    """A restored version must keep the source row's retrieval envelope — the URL,
+    timestamp and response hash that say where the bytes came from.
+
+    `record_artifact_restore` inserted the new latest row copying only
+    `env_snapshot_id`, so a retrieval-backed version looked *unsourced* after a
+    restore in latest-version exports and evidence checks, even though the
+    historical row it was restored from was fully sourced.
+    """
+    harness = ArtifactHarness(tmp_path)
+    snap = harness.workspace / ".snap-alpha"
+    snap.write_bytes(b"ALPHA")
+    envelope = {
+        "url": "https://example.org/data.csv",
+        "retrieved_at": 1_700_000_000,
+        "sha256": hashlib.sha256(b"ALPHA").hexdigest(),
+    }
+    first = harness.store.save_artifact(
+        path=str(harness.workspace / "data.csv"),
+        filename="data.csv",
+        content_type="text/csv",
+        size_bytes=5,
+        checksum=hashlib.sha256(b"ALPHA").hexdigest(),
+        producing_cell_id="cell-1",
+        frame_id=harness.frame_id,
+        project_id="default",
+        snapshot_path=str(snap),
+        source=envelope,
+    )
+    # A newer version becomes latest, so the sourced row is a historical one.
+    second = harness.store.save_artifact(
+        path=str(harness.workspace / "data.csv"),
+        filename="data.csv",
+        content_type="text/csv",
+        size_bytes=4,
+        checksum=hashlib.sha256(b"BETA").hexdigest(),
+        producing_cell_id="cell-2",
+        frame_id=harness.frame_id,
+        project_id="default",
+        artifact_id=first["artifact_id"],
+    )
+
+    restored = harness.store.record_artifact_restore(
+        artifact_id=first["artifact_id"],
+        source_version_id=first["version_id"],
+        expected_latest_version_id=second["version_id"],
+        version_id="v-restored-provenance",
+        path=str(harness.workspace / "data.csv"),
+        snapshot_path=str(snap),
+        size_bytes=5,
+        checksum=hashlib.sha256(b"ALPHA").hexdigest(),
+        frame_id=harness.frame_id,
+    )
+
+    restored_meta = harness.store.version_meta(restored["version_id"])
+    source_meta = harness.store.version_meta(first["version_id"])
+    assert restored_meta["source"], "restored version lost its retrieval envelope"
+    assert restored_meta["source"] == source_meta["source"]
+    assert "example.org/data.csv" in restored_meta["source"]
+
+
 def test_restore_rejects_corrupt_snapshot_and_workspace_drift(tmp_path):
     harness = ArtifactHarness(tmp_path)
     path = harness.workspace / "result.txt"
@@ -492,6 +558,7 @@ def test_python_capture_uses_one_environment_and_orders_figure_first(tmp_path):
         assert Path(version["snapshot_path"]).is_file()
         events.append(event)
 
+    harness.count_environment_captures()
     captured = harness.manager.capture(
         harness.session,
         1,
@@ -548,13 +615,17 @@ def test_r_capture_never_runs_python_figure_probe(tmp_path):
 
 def test_no_changes_skip_environment_and_remote_provenance(tmp_path):
     harness = ArtifactHarness(tmp_path)
+    # Without this the counter is never wrapped, so `environment_calls` stays 0
+    # whatever the code does — the assertion below asserted nothing at all.
+    # Found by mutating the gate away and watching the test stay green.
+    harness.count_environment_captures()
     before = harness.manager.snapshot(harness.workspace)
     remote_calls = 0
 
     def drain_remote():
         nonlocal remote_calls
         remote_calls += 1
-        return [{"job_id": "should-remain-buffered"}]
+        return [{"job_id": "must-not-outlive-this-cell"}]
 
     captured = harness.manager.capture(
         harness.session,
@@ -567,7 +638,16 @@ def test_no_changes_skip_environment_and_remote_provenance(tmp_path):
     )
 
     assert captured.artifacts == []
-    assert harness.environment_calls == remote_calls == 0
+    # The environment freeze is still skipped: it lists packages, and there is
+    # no artifact here for it to describe.
+    assert harness.environment_calls == 0
+    # The drain is NOT skipped, and this is the assertion that changed. The
+    # fixture above still calls its entry "should-remain-buffered", which is
+    # what the old contract wanted — and what made a remote job in a cell that
+    # wrote nothing reappear as the provenance of the next cell's artifact.
+    # A buffer that survives its own cell is how provenance becomes wrong
+    # rather than absent.
+    assert remote_calls == 1
 
 
 def test_snapshot_ignores_hidden_junk_and_nested_git_repositories(tmp_path):
@@ -734,3 +814,61 @@ def test_promote_cell_embeds_workspace_figures_as_safe_data_urls(tmp_path):
     text = next((harness.workspace / "promoted").glob("*.md")).read_text("utf-8")
     assert f"![{figure.name}](data:image/png;base64," in text
     assert f"]({figure.name})" not in text
+
+
+def test_imported_session_snapshots_are_inside_trusted_storage(tmp_path):
+    """The daemon refused to read a directory it writes itself.
+
+    Session import writes each version's immutable bytes to
+    ``<data_dir>/session-imports/<root>/artifacts/`` and points the version row
+    at them. Both `ArtifactRestoreService` construction sites listed only
+    ``artifacts/`` and ``artifact-versions/`` -- the same two directories, in
+    opposite orders -- so `verified_snapshot_bytes` answered every imported
+    artifact with "artifact snapshot is outside trusted storage".
+
+    The boundary is containment, not integrity: the bytes are still checked
+    against the version row's recorded sha256 and size on every read. Widening
+    it to a directory the daemon owns does not weaken what a restore proves.
+
+    Pinned as one shared derivation rather than two lists, because two lists
+    maintained by hand is how the third directory came to be written to and not
+    readable.
+    """
+    import hashlib as _hashlib
+
+    from openai4s.artifact_restore import ArtifactRestoreService, trusted_snapshot_roots
+
+    data_dir = tmp_path / "data"
+    snapshot = (
+        data_dir / "session-imports" / "f-imported" / "artifacts" / "000000-abc.bin"
+    )
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"imported bytes\n"
+    snapshot.write_bytes(payload)
+    version = {
+        "version_id": "v-1",
+        "snapshot_path": str(snapshot),
+        "checksum": _hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+
+    service = ArtifactRestoreService(
+        store=None,
+        primary_snapshot_dir=data_dir / "artifact-versions",
+        trusted_snapshot_dirs=trusted_snapshot_roots(data_dir),
+        resolve_live_path=lambda artifact, current: tmp_path / "live",
+    )
+    path, data = service.verified_snapshot_bytes(version)
+    assert data == payload
+    assert path == snapshot.resolve()
+
+    # The integrity check is untouched by the wider boundary.
+    tampered = dict(version, checksum="0" * 64)
+    with pytest.raises(RuntimeError, match="checksum verification failed"):
+        service.verified_snapshot_bytes(tampered)
+
+    # And the boundary still is one: an arbitrary path stays refused.
+    outside = tmp_path / "elsewhere.bin"
+    outside.write_bytes(payload)
+    with pytest.raises(PermissionError, match="outside trusted storage"):
+        service.verified_snapshot_bytes(dict(version, snapshot_path=str(outside)))

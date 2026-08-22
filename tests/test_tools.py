@@ -3,6 +3,7 @@
 These lock the registry shape, the ```tool parse convention, prompt rendering,
 tool-local prechecks, and the protected dispatch/observation contract.
 """
+
 import ast
 import inspect
 import time
@@ -60,6 +61,14 @@ def test_builtin_tools_are_named_classes_with_local_execute_behavior():
         assert type(tool).execute is not Tool.execute
         with pytest.raises(FrozenInstanceError):
             tool.name = "renamed"
+    # Each module-level alias must BE the registered singleton, not merely have
+    # the same class. This was `TOOL_TYPES[5:11]`, a positional slice: it held
+    # only while nothing was inserted before index 5, so adding a tool broke it
+    # for a reason unrelated to what it checks, and the fix was to bump the
+    # numbers -- which is a test nobody reads before editing. Identity is the
+    # property that actually matters here: two instances of the same class
+    # would satisfy the old assertion while the alias pointed at a tool the
+    # registry has never seen, and therefore at one with no permission wiring.
     compatibility_aliases = (
         edit_file,
         env_list,
@@ -68,8 +77,11 @@ def test_builtin_tools_are_named_classes_with_local_execute_behavior():
         web_search,
         web_fetch,
     )
-    expected_types = TOOL_TYPES[5:11]
-    assert tuple(type(tool) for tool in compatibility_aliases) == expected_types
+    for alias in compatibility_aliases:
+        assert alias is get_tool(
+            alias.name
+        ), f"the {alias.name!r} alias is not the registered instance"
+        assert type(alias) in TOOL_TYPES
 
 
 def test_builtin_tool_modules_do_not_construct_eager_singletons():
@@ -121,6 +133,11 @@ def test_control_tool_classes_own_their_security_policy():
         "env_setup",
         "web_search",
         "web_fetch",
+        # Approval-gated for the same reason as web_fetch -- the user is asked
+        # which host is being contacted -- and additionally because it writes.
+        # The write is already fenced to the session workspace, so the question
+        # put to the user is the network one.
+        "web_download",
         "science_search",
         "save_artifact",
         "restore_artifact_version",
@@ -153,6 +170,14 @@ def test_control_tool_classes_own_their_security_policy():
     assert get_tool("web_fetch").resource_keys(
         {"url": "https://www.example.org/a"}
     ) == ("network:example.org",)
+    assert "workspace directory only" in get_tool("list_dir").description
+    assert "use list_skills" in get_tool("list_dir").description
+    list_skills_description = get_tool("list_skills").description
+    assert "exact total count" in list_skills_description
+    assert "curated Skill names" in list_skills_description
+    assert "call load_skill" in list_skills_description
+    assert "next_offset" in list_skills_description
+    assert "Do not use workspace file tools" in list_skills_description
 
 
 def test_registration_rejects_shell_completion_and_metadata_only_tools():
@@ -305,6 +330,26 @@ def test_one_tool_result_respects_its_strict_output_limit():
     assert len(text) <= tool.output_limit
 
 
+def test_search_budget_checks_marker_discontinuities_before_dropping_body():
+    """A full document loses its pointer, so rendered size is not monotone."""
+
+    from openai4s.tools.skills import SearchSkillsTool
+
+    tool = SearchSkillsTool(output_limit=271)
+    rows = [
+        {"name": "a", "doc": "a" * 20},
+        {"name": "b", "doc": "b" * 155},
+    ]
+
+    fitted = tool.fit_to_budget(rows)
+
+    assert fitted[0]["doc"] == "a" * 20
+    assert fitted[1]["doc"].startswith("b" * 20 + "\n\n… [135 more characters.")
+    rendered = format_tool_result(tool, fitted)
+    assert len(rendered) == tool.output_limit
+    assert not rendered.endswith("… [truncated]")
+
+
 # --- prompt rendering -------------------------------------------------------
 def test_render_tools_prompt_lists_names_and_convention():
     prompt = render_tools_prompt()
@@ -379,6 +424,24 @@ def test_execute_bash_is_not_a_tool_and_never_dispatches():
     assert calls == []
     assert ok is False
     assert "unknown tool" in obs
+
+
+def test_execute_hallucinated_cell_runner_never_dispatches():
+    """Foreground code is a fenced Cell, never an invented native runner."""
+    calls = []
+
+    def disp(method, args):
+        calls.append((method, args))
+        return {"ok": True}
+
+    obs, ok = execute_tool_call(
+        disp,
+        {"name": "run_python_cell", "arguments": {"code": "print('unsafe')"}},
+    )
+    assert calls == []
+    assert ok is False
+    assert "unknown tool" in obs
+    assert "run_python_cell" in obs
 
 
 def test_execute_reports_error_only_result_as_not_ok():
