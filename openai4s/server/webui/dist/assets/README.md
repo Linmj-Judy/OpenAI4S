@@ -8,12 +8,12 @@ Committed output of `frontend/` (`npm run build`). The gateway serves this tree 
 
 | File | Responsibility |
 | --- | --- |
-| `CapabilityBadges-Dnb-rxLo.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
+| `CapabilityBadges-D8EJ6TXV.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
 | `en-BiWYNluY.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
-| `index-C_kiiG-G.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
+| `index-BXoqhCZv.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
 | `index-DxsFvRGA.css` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
 | `mount-3qhvSlgL.css` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
+| `mount-8YJ1TA_v.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
+| `mount-BFDYcGss.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
 | `mount-CGn0fciA.css` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
-| `mount-Cg-fJiRq.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
-| `mount-CiRhJ9i8.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
 | `zh-DZtw8kA9.js` | Vite build output. Do not edit by hand; rebuild from `frontend/`. |
