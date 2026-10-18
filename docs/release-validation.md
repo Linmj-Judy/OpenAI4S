@@ -152,9 +152,10 @@ from PyPI instead.
 
 Two properties of the image are deliberate. A local build without a configured
 Developer ID identity is **ad-hoc signed**; a configured release build may use
-Developer ID. Neither path currently submits the image for notarization or
-staples a ticket, so the release gate rejects the DMG even when the signature is
-valid. For local preview images Gatekeeper may therefore refuse first launch,
+Developer ID. The builder itself does not submit the image for notarization or
+staple a ticket: `notarize_macos_dmg.sh` performs that separate step. Until it
+succeeds, the release gate rejects even a correctly signed DMG.
+For local preview images Gatekeeper may therefore refuse first launch,
 and the shipped `READ ME` gives both the macOS 15+ ("Open Anyway" in Privacy &
 Security) and the macOS 12–14 (right-click → Open) paths, since Sequoia removed
 the latter. The image also bundles **Python only**: the R kernel needs a conda
@@ -164,6 +165,18 @@ to Python. The app therefore also ships the `openai4s` CLI at
 `Contents/Resources/runtime/bin/openai4s` — without it, `openai4s setup` (the
 one documented way to add that R environment) would be unreachable for anyone
 who only downloaded the image.
+
+Developer ID builds use `sign_macos_bundle.py` to sign every embedded Mach-O
+before sealing the app. Signing only the outer bundle with `--deep` misses
+Python and science libraries in Resources. Python alone receives
+`allow-jit` for Numba/LLVM and ctypes callbacks,
+`allow-unsigned-executable-memory` for UMAP's eager Numba compilation (which
+terminates during import with `allow-jit` alone), and `disable-library-validation`
+for scientific wheels installed into the user site. These executable-memory
+exceptions are limited to Python; libraries receive no
+entitlements. Every signature is verified, and distribution signatures require
+a Developer ID authority and secure timestamp. `--sign -` exercises this order
+locally with ad-hoc hardened-runtime signatures; it is not notarization evidence.
 
 Two contracts hold the runtime to that promise from opposite ends. Bytecode is
 precompiled with `--invalidation-mode unchecked-hash` **before** signing, so the
