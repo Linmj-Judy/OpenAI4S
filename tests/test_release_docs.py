@@ -77,7 +77,7 @@ def test_trusted_publication_spells_out_the_draft_first_dispatch():
     for needed in (
         "git tag -a vX.Y.Z",
         "gh release create vX.Y.Z --draft --verify-tag",
-        "gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f publish=true",
+        "gh workflow run release.yml --ref main -f tag=vX.Y.Z -f publish=true",
         "Never publish the GitHub Release by hand.",
         "`pypi_only` exists only to recover",
     ):
