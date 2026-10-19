@@ -8,6 +8,7 @@ Also keeps regression coverage for the arXiv /abs/ bug where
 <div class="authors">), returning only the title plus page boilerplate.
 """
 
+import io
 import json
 from pathlib import Path
 from urllib.parse import urlparse
@@ -287,3 +288,109 @@ def test_search_respects_overall_timeout_budget(monkeypatch):
     # 20s / ~8s per engine → at most 3 requests before the budget forces a bail;
     # the old per-request-only cap would have issued up to 16.
     assert calls["n"] <= 3
+
+
+# --------------------------------------------------------------------------- #
+#  You.com search — offline (stubbed _http_get / urlopen)
+# --------------------------------------------------------------------------- #
+_YOU_JSON = json.dumps(
+    {
+        "results": {
+            "web": [
+                {
+                    "url": "https://you-hit.example/a",
+                    "title": "You Hit",
+                    "description": "desc",
+                    "snippets": ["first snippet", "second snippet"],
+                },
+                {
+                    "url": "https://you-hit.example/b",
+                    "title": "B",
+                    "description": "only desc",
+                },
+            ]
+        }
+    }
+)
+
+
+def test_search_uses_keyless_you_before_scrapers(monkeypatch):
+    monkeypatch.delenv("YDC_API_KEY", raising=False)
+    seen = []
+
+    def handler(url):
+        seen.append(url)
+        if url.startswith("https://api.you.com/v1/agents/search?"):
+            return _YOU_JSON
+        return _DDG_HTML if "duckduckgo" in url else None
+
+    _stub_http(monkeypatch, handler)
+    out = webtools.web_search("CRISPR base editing", num_results=5)
+    assert out["source"] == "you.com"
+    assert out["count"] == 2
+    assert out["results"][0]["snippet"] == "first snippet second snippet"
+    assert out["results"][1]["snippet"] == "only desc"
+    assert "count=5" in seen[0]
+    assert not any("duckduckgo" in u for u in seen)
+
+
+def test_you_search_sends_integration_user_agent(monkeypatch):
+    monkeypatch.delenv("YDC_API_KEY", raising=False)
+    captured = {}
+
+    def fake(url, *, timeout=30.0, headers=None, _max_redirects=5):
+        captured["headers"] = headers
+        return _YOU_JSON.encode(), url, "application/json"
+
+    monkeypatch.setattr(webtools, "_http_get", fake)
+    webtools._you_search("q", 3, 5.0)
+    assert captured["headers"]["User-Agent"] == (
+        "youdotcom-integration/pku-yuangroup-openai4s"
+    )
+
+
+def test_you_search_failure_falls_through_to_scrapers(monkeypatch):
+    monkeypatch.delenv("YDC_API_KEY", raising=False)
+    # api.you.com "fails" (e.g. 429 past the free quota) → DDG answers.
+    _stub_http(monkeypatch, lambda url: _DDG_HTML if "duckduckgo" in url else None)
+    out = webtools.web_search("CRISPR base editing", num_results=5)
+    assert out["source"] == "duckduckgo"
+
+
+def test_you_search_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("OPENAI4S_YOU_SEARCH", "off")
+    seen = []
+
+    def handler(url):
+        seen.append(url)
+        return _DDG_HTML if "duckduckgo" in url else None
+
+    _stub_http(monkeypatch, handler)
+    out = webtools.web_search("q")
+    assert out["source"] == "duckduckgo"
+    assert not any("api.you.com" in u for u in seen)
+
+
+def test_you_search_with_key_uses_keyed_post(monkeypatch):
+    monkeypatch.setenv("YDC_API_KEY", "ydc-test")
+    captured = {}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _Resp(_YOU_JSON.encode())
+
+    monkeypatch.setattr(webtools.urllib.request, "urlopen", fake_urlopen)
+    out = webtools._you_search("q", 1, 5.0)
+    req = captured["req"]
+    assert req.full_url == "https://ydc-index.io/v1/search"
+    assert req.get_method() == "POST"
+    assert req.get_header("X-api-key") == "ydc-test"
+    assert json.loads(req.data) == {"query": "q", "count": 1}
+    assert len(out) == 1

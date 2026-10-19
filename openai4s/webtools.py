@@ -916,10 +916,81 @@ def _tavily_search(query: str, num_results: int, timeout: float) -> list[dict]:
     return out
 
 
+_YOU_FREE_URL = "https://api.you.com/v1/agents/search"
+_YOU_KEYED_URL = "https://ydc-index.io/v1/search"
+_YOU_UA = "youdotcom-integration/pku-yuangroup-openai4s"
+
+
+def _you_enabled() -> bool:
+    """You.com search is on unless ``OPENAI4S_YOU_SEARCH`` is set to off/0/false."""
+    val = os.environ.get("OPENAI4S_YOU_SEARCH", "").strip().lower()
+    return val not in ("0", "off", "false", "no")
+
+
+def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
+    """You.com Search API (https://you.com). Keyless by default: the free
+    endpoint allows 100 searches a day per IP with no account. With
+    ``YDC_API_KEY`` set, the keyed endpoint is used instead. Returns [] on any
+    error (including 429 past the free quota), so the scraper chain below
+    still runs. The keyless GET goes through ``_http_get`` so the egress
+    allowlist and SSRF guard apply; the keyed POST mirrors the Tavily helper.
+    stdlib-only."""
+    if timeout <= 0 or not _you_enabled():
+        return []
+    count = max(1, min(int(num_results), 20))
+    key = os.environ.get("YDC_API_KEY", "").strip()
+    try:
+        if key:
+            req = urllib.request.Request(
+                _YOU_KEYED_URL,
+                data=json.dumps({"query": query, "count": count}).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-Key": key,
+                    "User-Agent": _YOU_UA,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=min(timeout, 15.0)) as resp:
+                raw = resp.read()
+        else:
+            url = (
+                _YOU_FREE_URL
+                + "?"
+                + urllib.parse.urlencode({"query": query, "count": count})
+            )
+            raw, _final, _ctype = _http_get(
+                url,
+                timeout=min(timeout, 15.0),
+                headers={"User-Agent": _YOU_UA, "Accept": "application/json"},
+            )
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - any failure → fall back to the scrapers
+        return []
+    out: list[dict] = []
+    for r in (payload.get("results") or {}).get("web") or []:
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        snippets = [x for x in (r.get("snippets") or []) if isinstance(x, str)]
+        snippet = " ".join(snippets) or (r.get("description") or "")
+        out.append(
+            {
+                "title": (r.get("title") or "").strip() or url,
+                "url": url,
+                "snippet": snippet.strip()[:500],
+            }
+        )
+        if len(out) >= num_results:
+            break
+    return out
+
+
 def web_search(query: str, num_results: int = 8, timeout: float = 20.0) -> dict:
     """Multi-engine web search. When ``OPENAI4S_TAVILY_API_KEY`` is set, an
     authenticated Tavily query is tried first (the keyless scrapers get
-    bot-blocked). A DOI in the query is answered straight
+    bot-blocked), then the You.com Search API (keyless free tier, or keyed with
+    ``YDC_API_KEY``; disable with ``OPENAI4S_YOU_SEARCH=off``). A DOI in the query is answered straight
     from Crossref and an arXiv id from the arXiv API (structured, reliable
     metadata); otherwise the engine chain DuckDuckGo → Bing → DuckDuckGo lite →
     Mojeek is walked until one returns hits, retrying once (and once more with a
@@ -954,6 +1025,17 @@ def web_search(query: str, num_results: int = 8, timeout: float = 20.0) -> dict:
                 "count": len(tav),
                 "results": tav[:num_results],
                 "source": "tavily",
+            }
+    # You.com next: a structured keyless API, so it is tried before the HTML
+    # scrapers. Set OPENAI4S_YOU_SEARCH=off to skip it; YDC_API_KEY is optional.
+    if _time_left(deadline) > 0:
+        you = _dedupe(_you_search(query, num_results, _req_timeout(deadline)))
+        if you:
+            return {
+                "query": query,
+                "count": len(you),
+                "results": you[:num_results],
+                "source": "you.com",
             }
     results, source = _engine_sweep(query, num_results, deadline)
     note = None
