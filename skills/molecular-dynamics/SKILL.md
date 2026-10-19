@@ -3,6 +3,13 @@ name: molecular-dynamics
 description: Runs and analyzes molecular dynamics simulations with OpenMM and MDAnalysis. Sets up protein/small molecule systems, defines force fields, runs energy minimization and production MD, and analyzes trajectories (RMSD, RMSF, contact maps, free energy surfaces). For structural biology, drug binding, and biophysics.
 license: MIT
 compatibility: Requires Python 3.11+ with OpenMM and MDAnalysis; matplotlib for plots. Optional PDBFixer and OpenFF need separate installation. Network access for installation; local simulation and analysis run offline.
+origin: openai4s
+category: molecular-dynamics
+requirements: [science]
+capabilities:
+  network:
+    mode: none
+    domains: []
 metadata:
   version: "1.3"
   last-reviewed: "2026-10-01"
@@ -56,9 +63,12 @@ Use a new output prefix for every stage to avoid overwriting earlier results.
 ### 1. System Preparation
 
 ```python
-from openmm.app import *
-from openmm import *
-from openmm.unit import *
+from openmm.app import (
+    CheckpointReporter, DCDReporter, ForceField, HBonds, Modeller, PDBFile,
+    PME, StateDataReporter,
+)
+from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, Platform, Simulation
+from openmm.unit import angstroms, bar, kelvin, kilojoules_per_mole, molar, nanometer, picosecond, picoseconds
 
 def prepare_system_from_pdb(pdb_file, forcefield_name="amber14-all.xml",
                               water_model="amber14/tip3pfb.xml", ph=7.0):
@@ -111,9 +121,9 @@ def prepare_system_from_pdb(pdb_file, forcefield_name="amber14-all.xml",
 ### 2. Energy Minimization
 
 ```python
-from openmm.app import *
-from openmm import *
-from openmm.unit import *
+from openmm.app import PDBFile
+from openmm import LangevinMiddleIntegrator
+from openmm.unit import kelvin, picosecond, picoseconds
 
 def minimize_energy(modeller, system, output_pdb="minimized.pdb",
                      max_iterations=1000, tolerance=10.0, platform_name=None):
@@ -162,9 +172,8 @@ def minimize_energy(modeller, system, output_pdb="minimized.pdb",
 ### 3. NVT Equilibration
 
 ```python
-from openmm.app import *
-from openmm import *
-from openmm.unit import *
+from openmm.app import CheckpointReporter, DCDReporter, StateDataReporter
+from openmm.unit import bar, kelvin, nanoseconds, picoseconds
 
 def run_nvt_equilibration(simulation, n_steps=50000, temperature=300,
                             report_interval=1000, output_prefix="nvt"):
