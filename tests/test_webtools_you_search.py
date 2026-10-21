@@ -14,6 +14,13 @@ import pytest
 from openai4s import webtools
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_backoff(monkeypatch):
+    # The 429 backoff is process-wide; every test starts without one and
+    # monkeypatch puts the value back after the test that sets it.
+    monkeypatch.setattr(webtools, "_you_backoff_until", 0.0)
+
+
 def _stub_http(monkeypatch, handler):
     """Replace webtools._http_get with `handler(url) -> body_str`; None or a
     raise simulates that endpoint failing. Also disables the retry pause."""
@@ -229,3 +236,78 @@ def test_requests_branch_asks_for_identity_encoding(monkeypatch):
     body, _url, _ctype = webtools._http_get("https://api.you.com/v1/agents/search")
     assert body == b"{}"
     assert captured["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_tavily_goes_through_the_same_guarded_post(monkeypatch):
+    from openai4s import egress
+
+    monkeypatch.setenv("OPENAI4S_TAVILY_API_KEY", "tvly-test")
+    guarded, captured = [], {}
+    monkeypatch.setattr(
+        egress, "check_url", lambda url: guarded.append(("egress", url))
+    )
+    monkeypatch.setattr(
+        webtools, "_guard_url", lambda url: guarded.append(("ssrf", url))
+    )
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            captured["req"] = req
+            body = {"results": [{"url": "https://t.example/a", "title": "T"}]}
+            return io.BytesIO(json.dumps(body).encode())
+
+    monkeypatch.setattr(webtools, "_no_redirect_opener", lambda: _Opener())
+    out = webtools._tavily_search("q", 1, 5.0)
+    assert [r["url"] for r in out] == ["https://t.example/a"]
+    assert captured["req"].get_header("Authorization") == "Bearer tvly-test"
+    assert guarded == [
+        ("egress", "https://api.tavily.com/search"),
+        ("ssrf", "https://api.tavily.com/search"),
+    ]
+
+
+def _rate_limited(retry_after=None):
+    import urllib.error
+
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return urllib.error.HTTPError(
+        webtools._YOU_FREE_URL, 429, "Too Many", headers, None
+    )
+
+
+def test_a_429_skips_you_until_retry_after(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(webtools.time, "monotonic", lambda: clock["t"])
+    calls = []
+
+    def fake(url, *, timeout=30.0, headers=None, _max_redirects=5):
+        calls.append(timeout)
+        raise _rate_limited("120")
+
+    monkeypatch.setattr(webtools, "_http_get", fake)
+    assert webtools._you_search("q", 3, 12.0) == []
+    assert calls == [webtools._YOU_TIMEOUT]  # a stall cannot take the full 12 s
+    assert webtools._you_search("q", 3, 12.0) == []
+    assert len(calls) == 1  # skipped: no doomed round trip
+    clock["t"] += 121
+    webtools._you_search("q", 3, 12.0)
+    assert len(calls) == 2
+
+
+def test_a_requests_shaped_429_also_backs_off_and_other_errors_do_not(monkeypatch):
+    import types
+
+    requests_429 = RuntimeError("429")
+    requests_429.response = types.SimpleNamespace(status_code=429, headers={})
+    errors = iter([RuntimeError("timeout"), requests_429])
+    calls = []
+
+    def fake(url, *, timeout=30.0, headers=None, _max_redirects=5):
+        calls.append(url)
+        raise next(errors)
+
+    monkeypatch.setattr(webtools, "_http_get", fake)
+    webtools._you_search("q", 3, 5.0)  # a plain failure: no backoff
+    webtools._you_search("q", 3, 5.0)  # requests' 429: backoff starts
+    webtools._you_search("q", 3, 5.0)
+    assert len(calls) == 2

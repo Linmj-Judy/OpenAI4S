@@ -115,7 +115,7 @@ EGRESS_GROUPS: list[dict] = [
     {
         "name": "Web search",
         "enabled": True,
-        "exact_domains": ["open.feedcoopapi.com", "ydc-index.io"],
+        "exact_domains": ["open.feedcoopapi.com", "ydc-index.io", "api.tavily.com"],
         "domains": [
             # Exact authenticated Doubao Search upstream.  Keep this narrower
             # than feedcoopapi.com so the Agent Plan credential cannot be sent
@@ -124,6 +124,8 @@ EGRESS_GROUPS: list[dict] = [
             # You.com: keyless tier, and the exact host that receives YDC_API_KEY.
             "api.you.com",
             "ydc-index.io",
+            # Tavily's fixed endpoint; it receives the Tavily key.
+            "api.tavily.com",
             "bing.com",
             "duckduckgo.com",
             "html.duckduckgo.com",

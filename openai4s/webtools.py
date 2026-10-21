@@ -868,6 +868,27 @@ _AD_URL_BITS = (
 _TRACKING_PARAMS = {"fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "igshid"}
 
 
+def _post_json(url: str, body: dict, *, headers: dict, timeout: float) -> bytes:
+    """POST a JSON body to a keyed search API under the guards `_http_get`
+    applies per hop: the network switch, the egress allowlist, the SSRF check,
+    no followed redirect (urllib would copy the credential header onto the
+    hop) and a capped read. `_open_http_response` is GET/HEAD only, so every
+    keyed provider comes through here rather than opening its own socket."""
+    _require_network()
+    from openai4s import egress
+
+    egress.check_url(url)
+    _guard_url(url)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", **headers},
+    )
+    with _no_redirect_opener().open(req, timeout=timeout) as resp:  # noqa: S310
+        return _read_capped(resp, MAX_FETCH_BYTES)
+
+
 def _tavily_key() -> str:
     """Tavily API key from the environment. A key saved from the UI (global
     Search settings) is written to this env var — live by the Search settings
@@ -885,22 +906,19 @@ def _tavily_search(query: str, num_results: int, timeout: float) -> list[dict]:
     key = _tavily_key()
     if not key or timeout <= 0:
         return []
-    body = json.dumps(
-        {
-            "query": query,
-            "max_results": max(1, min(int(num_results), 20)),
-            "search_depth": "basic",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.tavily.com/search",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-    )
+    body = {
+        "query": query,
+        "max_results": max(1, min(int(num_results), 20)),
+        "search_depth": "basic",
+    }
     try:
-        with urllib.request.urlopen(req, timeout=min(timeout, 15.0)) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        raw = _post_json(
+            "https://api.tavily.com/search",
+            body,
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=min(timeout, 15.0),
+        )
+        payload = json.loads(raw.decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001 - any failure → fall back to keyless engines
         return []
     out: list[dict] = []
@@ -923,6 +941,32 @@ def _tavily_search(query: str, num_results: int, timeout: float) -> list[dict]:
 _YOU_FREE_URL = "https://api.you.com/v1/agents/search"
 _YOU_KEYED_URL = "https://ydc-index.io/v1/search"
 _YOU_UA = "youdotcom-integration/pku-yuangroup-openai4s"
+#: You.com answers JSON in a second or two; a stalled one must not take the
+#: whole 12 s per-engine slice from the engines behind it.
+_YOU_TIMEOUT = 5.0
+#: A spent free quota answers 429 until it resets. After one, You.com is
+#: skipped for the server's Retry-After (seconds) or an hour, instead of every
+#: search paying a doomed round trip first. Process-wide; a race between two
+#: searches at worst asks once more.
+_YOU_BACKOFF_DEFAULT = 3600.0
+_you_backoff_until = 0.0
+
+
+def _note_you_rate_limit(error: BaseException) -> None:
+    """Start the backoff if ``error`` is a 429 (urllib or requests shape)."""
+    global _you_backoff_until
+    status, headers = getattr(error, "code", None), getattr(error, "headers", None)
+    response = getattr(error, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", None)
+    if status != 429:
+        return
+    try:
+        wait = float((headers or {}).get("Retry-After") or _YOU_BACKOFF_DEFAULT)
+    except (TypeError, ValueError):  # an HTTP-date, or garbage
+        wait = _YOU_BACKOFF_DEFAULT
+    _you_backoff_until = time.monotonic() + min(max(wait, 0.0), 86400.0)
 
 
 def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
@@ -931,34 +975,20 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
     ``YDC_API_KEY`` set, the keyed endpoint is used instead. Returns [] on any
     error (including 429 past the free quota or an unexpected payload shape),
     so the next engine still runs. The keyless GET goes through
-    ``_http_get``; the keyed POST applies the same egress, SSRF, no-redirect
-    and read-cap guards itself. stdlib-only."""
-    if timeout <= 0:
+    ``_http_get``, the keyed POST through ``_post_json``. stdlib-only."""
+    if timeout <= 0 or time.monotonic() < _you_backoff_until:
         return []
+    timeout = min(timeout, _YOU_TIMEOUT)
     count = max(1, min(int(num_results), 20))
     key = os.environ.get("YDC_API_KEY", "").strip()
     try:
         if key:
-            from openai4s import egress
-
-            # `_http_get` is GET/HEAD only, so the keyed POST guards itself. No
-            # redirect is followed: urllib would copy X-API-Key onto the hop.
-            egress.check_url(_YOU_KEYED_URL)
-            _guard_url(_YOU_KEYED_URL)
-            req = urllib.request.Request(
+            raw = _post_json(
                 _YOU_KEYED_URL,
-                data=json.dumps({"query": query, "count": count}).encode("utf-8"),
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": key,
-                    "User-Agent": _YOU_UA,
-                },
+                {"query": query, "count": count},
+                headers={"X-API-Key": key, "User-Agent": _YOU_UA},
+                timeout=timeout,
             )
-            with _no_redirect_opener().open(  # noqa: S310
-                req, timeout=min(timeout, 15.0)
-            ) as resp:
-                raw = _read_capped(resp, MAX_FETCH_BYTES)
         else:
             url = (
                 _YOU_FREE_URL
@@ -967,7 +997,7 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
             )
             raw, _final, _ctype = _http_get(
                 url,
-                timeout=min(timeout, 15.0),
+                timeout=timeout,
                 headers={"User-Agent": _YOU_UA, "Accept": "application/json"},
             )
         payload = json.loads(raw.decode("utf-8", "replace"))
@@ -990,7 +1020,8 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
             )
             if len(out) >= num_results:
                 break
-    except Exception:  # noqa: BLE001 - any failure → fall back to the scrapers
+    except Exception as error:  # noqa: BLE001 - any failure → next engine
+        _note_you_rate_limit(error)
         return []
     return out
 
