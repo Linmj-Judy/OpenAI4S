@@ -353,6 +353,7 @@ OpenAI4S 的离线正确性门禁。`uv run pytest` 用确定性 fake 跑完这�
 | [`test_science_control_tools.py`](test_science_control_tools.py) | 关于科学检索两个表面（原生的与内核内的）的三个测试：两个扁平且做过 schema 检查的注册表条目、一个不用网络也能跑的目录，以及只编码顶层字段的 Host wire。 |
 | [`test_sdk_compute.py`](test_sdk_compute.py) | worker 侧的 `host.compute` 命名空间：provider、实例、传输、attach、清理。带安全锋刃的是路径处理——本地路径按允许名单做相对化，绝对路径直接拒绝。 |
 | [`test_security.py`](test_security.py) | 纵深防御的几层，LLM 全程被 mock。快路径和失败即放行的那几处，要和拦截一样仔细读：常规代码根本不进分类器，而注入筛查在没有配置 key 时是失败即放行的。不失败即放行的是 query 的拒绝名单——即使用拆分标识符绕，它也把 `host.query` 挡在设置、connector 与秘密表之外。 |
+| [`test_search_settings.py`](test_search_settings.py) | 备用搜索引擎：保存的顺序与开关（新安装沿用原有顺序，拒绝没有可用引擎的配置）、首次设置选项、豆包配额回退确认（已记住的规则直接生效，新的确认只在有人时弹出，选中的引擎就是规则的 pattern）、调度器接线，以及 `/search/config`。 |
 | [`test_server_agent_run.py`](test_server_agent_run.py) | 纯引擎外围的 Web 适配器，其中大半在讲用户不该看到什么。fence 要跨增量边界一直藏住；代码草稿是临时的、可丢弃的；只用于完成的 Cell 在执行之前先把草稿清掉。旧版的 fenced Tool 调用仍然会执行，并以一条用户 observation 的形式回来。 |
 | [`test_server_completions.py`](test_server_completions.py) | 一轮结束时给用户看的东西。完成消息由真实的 Artifact／capture 增量和实际输出渲染出来，绝不依赖隐藏的推理内容；可信链接来自服务端 helper 与精确 version id；只跑了代码的一轮，会拿到一个如实的状态，而不是被暗示成成功。 |
 | [`test_stage1_browser_fixture.py`](test_stage1_browser_fixture.py) | 为浏览器验收构造本地 metadata readiness fixture，并用生产 Store、Artifact manager 与 completion-delivery verifier 原子种入 100 条交付，以及 same-head/head-change 和 delegated-producer 证据。定向测试保证种入路径确定、带作用域，且不触发 LLM 或网络。 |
@@ -419,6 +420,7 @@ OpenAI4S 的离线正确性门禁。`uv run pytest` 用确定性 fake 跑完这�
 | [`test_variable_inspector_service.py`](test_variable_inspector_service.py) | 三个测试，把变量检查限制得很窄。它从不进入 Cell 状态；读任何东西之前先检查语言和 lease；协议出错时只给出笼统信息，而不是内核内部细节。 |
 | [`test_webtools.py`](test_webtools.py) | HTML 转 Markdown 与几个搜索后端，跑在离线 fixture 上。前三个测试是围着同一个 bug 织的回归网：arXiv 的摘要页，摘要、作者和标题被转换器整个丢掉了。 |
 | [`test_webtools_redirect_guard.py`](test_webtools_redirect_guard.py) | 重定向之后，SSRF 与 egress 检查还在不在。`_http_get` 的文档说它手动跟随重定向、好让每一跳都受检——但那只在可选的 `requests` 分支上成立。兜底分支调的是 `urllib.request.urlopen`，它在标准库内部自己跟随重定向；而零依赖安装走的永远是这条分支。修复前用本地 302 实测：取了两个 URL，只有一个过了检查。这些用例**故意不打** `network` 标记——那台服务器是进程内的 loopback socket，而 `addopts` 默认剔除 `network`，打上标记等于把三条安全测试从每次运行里悄悄拿掉、表面上却还在。 |
+| [`test_webtools_you_search.py`](test_webtools_you_search.py) | `web_search` 里的 You.com 一步：免 key 的 GET 先于爬虫、集成 User-Agent、关闭开关、带 key 的 POST 经过 egress 检查、SSRF 守卫和不跟随重定向的 opener、畸形响应回退而不是让整个搜索失败，`_http_get` 要求 `requests` 使用 identity 编码、Tavily 共用受防护的 POST，以及 You.com 返回 429 后的退避。之所以不放进 `test_webtools.py`：那个模块缺 bs4 时会整体跳过，而 CI 没有任何 job 安装 bs4。 |
 | [`test_webui_static_contract.py`](test_webui_static_contract.py) | 把静态前端当源码读，不开浏览器也不起网关。它抓的是别处抓不到的东西——引用了却不存在的资源、重复的 DOM ID、有名字却没有 SVG 的图标——同时钉住 UI 自己作出的安全声明，包括 connector 编辑器只读取掩码后的 env 名称而非 secret 值、提升后的 Markdown 只允许安全的位图 data 图片、Timeline 是一个按允许名单做的投影。它证明不了 UI 能用；那是 `browser_smoke.mjs` 的活。 |
 | [`test_ws_frames.py`](test_ws_frames.py) | 加固过的 RFC 6455 编解码：长度阶梯、客户端掩码往返、掩码方向强制、截断/RSV/分片/未知 opcode/超大控制帧/非 canonical 长度的拒绝、载荷上限、严格模式 UTF-8，以及 RFC 的 accept 示例。 |
 | [`test_workbench_state_service.py`](test_workbench_state_service.py) | Context 与 Security 两个面板。安全投影是刻意往小了说的：worker 还没启动时，它绝不宣称沙箱是生效的；Python 与 R 的说法不一致时，它报两者中更弱的那个。 |
