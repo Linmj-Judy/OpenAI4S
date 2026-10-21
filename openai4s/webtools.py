@@ -3,9 +3,11 @@
 These give the Code-as-Action agent the same online reach opencode's `websearch`
 and `webfetch` tools provide, implemented over the stdlib + (optionally) requests
 and BeautifulSoup, which the kernel ships preinstalled. No API key is required:
-search walks a chain of keyless engines (DuckDuckGo → Bing → DuckDuckGo lite →
-Mojeek) with scholarly fast paths (a DOI resolves via Crossref, an arXiv id via
-the arXiv API); fetch downloads a URL and converts HTML to readable markdown/text.
+search tries the You.com Search API's keyless tier (``OPENAI4S_YOU_SEARCH=off``
+skips it), then walks a chain of keyless engines (DuckDuckGo → Bing →
+DuckDuckGo lite → Mojeek), with scholarly fast paths (a DOI resolves via
+Crossref, an arXiv id via the arXiv API); fetch downloads a URL and converts
+HTML to readable markdown/text.
 
 Networking can be globally gated by ``OPENAI4S_ALLOW_NETWORK`` (default on);
 the daemon's Customize → Network panel flips this.
@@ -358,7 +360,9 @@ def _open_http_response(
     method = str(method or "GET").upper()
     if method not in ("GET", "HEAD"):
         raise ValueError(f"unsupported method {method!r}; expected GET or HEAD")
-    hdrs = {"User-Agent": _UA, "Accept": "*/*"}
+    # identity: `requests` would otherwise ask for gzip and the caller reads
+    # the undecoded `response.raw`. http.client already sends identity.
+    hdrs = {"User-Agent": _UA, "Accept": "*/*", "Accept-Encoding": "identity"}
     if headers:
         hdrs.update(headers)
     try:
@@ -931,16 +935,22 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
     """You.com Search API (https://you.com). Keyless by default: the free
     endpoint allows 100 searches a day per IP with no account. With
     ``YDC_API_KEY`` set, the keyed endpoint is used instead. Returns [] on any
-    error (including 429 past the free quota), so the scraper chain below
-    still runs. The keyless GET goes through ``_http_get`` so the egress
-    allowlist and SSRF guard apply; the keyed POST mirrors the Tavily helper.
-    stdlib-only."""
+    error (including 429 past the free quota or an unexpected payload shape),
+    so the scraper chain below still runs. The keyless GET goes through
+    ``_http_get``; the keyed POST applies the same egress, SSRF, no-redirect
+    and read-cap guards itself. stdlib-only."""
     if timeout <= 0 or not _you_enabled():
         return []
     count = max(1, min(int(num_results), 20))
     key = os.environ.get("YDC_API_KEY", "").strip()
     try:
         if key:
+            from openai4s import egress
+
+            # `_http_get` is GET/HEAD only, so the keyed POST guards itself. No
+            # redirect is followed: urllib would copy X-API-Key onto the hop.
+            egress.check_url(_YOU_KEYED_URL)
+            _guard_url(_YOU_KEYED_URL)
             req = urllib.request.Request(
                 _YOU_KEYED_URL,
                 data=json.dumps({"query": query, "count": count}).encode("utf-8"),
@@ -951,8 +961,10 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
                     "User-Agent": _YOU_UA,
                 },
             )
-            with urllib.request.urlopen(req, timeout=min(timeout, 15.0)) as resp:
-                raw = resp.read()
+            with _no_redirect_opener().open(  # noqa: S310
+                req, timeout=min(timeout, 15.0)
+            ) as resp:
+                raw = _read_capped(resp, MAX_FETCH_BYTES)
         else:
             url = (
                 _YOU_FREE_URL
@@ -965,24 +977,27 @@ def _you_search(query: str, num_results: int, timeout: float) -> list[dict]:
                 headers={"User-Agent": _YOU_UA, "Accept": "application/json"},
             )
         payload = json.loads(raw.decode("utf-8", "replace"))
+        out: list[dict] = []
+        for r in (payload.get("results") or {}).get("web") or []:
+            url = (r.get("url") or "").strip()
+            if not url:
+                continue
+            snippets = r.get("snippets")
+            if not isinstance(snippets, list):
+                snippets = []
+            snippets = [x for x in snippets if isinstance(x, str)]
+            snippet = " ".join(snippets) or (r.get("description") or "")
+            out.append(
+                {
+                    "title": (r.get("title") or "").strip() or url,
+                    "url": url,
+                    "snippet": snippet.strip()[:500],
+                }
+            )
+            if len(out) >= num_results:
+                break
     except Exception:  # noqa: BLE001 - any failure → fall back to the scrapers
         return []
-    out: list[dict] = []
-    for r in (payload.get("results") or {}).get("web") or []:
-        url = (r.get("url") or "").strip()
-        if not url:
-            continue
-        snippets = [x for x in (r.get("snippets") or []) if isinstance(x, str)]
-        snippet = " ".join(snippets) or (r.get("description") or "")
-        out.append(
-            {
-                "title": (r.get("title") or "").strip() or url,
-                "url": url,
-                "snippet": snippet.strip()[:500],
-            }
-        )
-        if len(out) >= num_results:
-            break
     return out
 
 
@@ -990,8 +1005,9 @@ def web_search(query: str, num_results: int = 8, timeout: float = 20.0) -> dict:
     """Multi-engine web search. When ``OPENAI4S_TAVILY_API_KEY`` is set, an
     authenticated Tavily query is tried first (the keyless scrapers get
     bot-blocked), then the You.com Search API (keyless free tier, or keyed with
-    ``YDC_API_KEY``; disable with ``OPENAI4S_YOU_SEARCH=off``). A DOI in the query is answered straight
-    from Crossref and an arXiv id from the arXiv API (structured, reliable
+    ``YDC_API_KEY``; disable with ``OPENAI4S_YOU_SEARCH=off``). A DOI in the
+    query is answered straight from Crossref and an arXiv id from the arXiv API
+    (structured, reliable
     metadata); otherwise the engine chain DuckDuckGo → Bing → DuckDuckGo lite →
     Mojeek is walked until one returns hits, retrying once (and once more with a
     simplified query) if everything comes back empty. Results are deduplicated
@@ -1030,11 +1046,12 @@ def web_search(query: str, num_results: int = 8, timeout: float = 20.0) -> dict:
     # scrapers. Set OPENAI4S_YOU_SEARCH=off to skip it; YDC_API_KEY is optional.
     if _time_left(deadline) > 0:
         you = _dedupe(_you_search(query, num_results, _req_timeout(deadline)))
+        you = you[:num_results]
         if you:
             return {
                 "query": query,
                 "count": len(you),
-                "results": you[:num_results],
+                "results": you,
                 "source": "you.com",
             }
     results, source = _engine_sweep(query, num_results, deadline)
@@ -1055,7 +1072,7 @@ def web_search(query: str, num_results: int = 8, timeout: float = 20.0) -> dict:
         out["note"] = note
     if not results:
         out["note"] = (
-            "no results from any engine (DuckDuckGo/Bing/Mojeek) — "
+            "no results from any engine (You.com/DuckDuckGo/Bing/Mojeek) — "
             "they may be rate-limiting; retry shortly with different "
             "terms, or use host.web_fetch on a known URL / a specific "
             "database API instead."

@@ -372,8 +372,17 @@ def test_you_search_can_be_disabled(monkeypatch):
 
 
 def test_you_search_with_key_uses_keyed_post(monkeypatch):
+    from openai4s import egress
+
     monkeypatch.setenv("YDC_API_KEY", "ydc-test")
     captured = {}
+    guarded = []
+    monkeypatch.setattr(
+        egress, "check_url", lambda url: guarded.append(("egress", url))
+    )
+    monkeypatch.setattr(
+        webtools, "_guard_url", lambda url: guarded.append(("ssrf", url))
+    )
 
     class _Resp(io.BytesIO):
         def __enter__(self):
@@ -382,11 +391,13 @@ def test_you_search_with_key_uses_keyed_post(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    def fake_urlopen(req, timeout=None):
-        captured["req"] = req
-        return _Resp(_YOU_JSON.encode())
+    class _Opener:
+        def open(self, req, timeout=None):
+            captured["req"] = req
+            return _Resp(_YOU_JSON.encode())
 
-    monkeypatch.setattr(webtools.urllib.request, "urlopen", fake_urlopen)
+    # The no-redirect opener, not urlopen: a followed 3xx would carry X-API-Key.
+    monkeypatch.setattr(webtools, "_no_redirect_opener", lambda: _Opener())
     out = webtools._you_search("q", 1, 5.0)
     req = captured["req"]
     assert req.full_url == "https://ydc-index.io/v1/search"
@@ -394,3 +405,86 @@ def test_you_search_with_key_uses_keyed_post(monkeypatch):
     assert req.get_header("X-api-key") == "ydc-test"
     assert json.loads(req.data) == {"query": "q", "count": 1}
     assert len(out) == 1
+    assert guarded == [
+        ("egress", "https://ydc-index.io/v1/search"),
+        ("ssrf", "https://ydc-index.io/v1/search"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "null",
+        "[]",
+        '{"results": ["x"]}',
+        '{"results": {"web": ["x"]}}',
+        '{"results": {"web": [{"url": 5}]}}',
+    ],
+)
+def test_malformed_you_payload_falls_through_to_scrapers(monkeypatch, body):
+    def handler(url):
+        if url.startswith(webtools._YOU_FREE_URL):
+            return body
+        return _DDG_HTML if "duckduckgo" in url else None
+
+    _stub_http(monkeypatch, handler)
+    out = webtools.web_search("CRISPR base editing", num_results=5)
+    assert out["source"] == "duckduckgo"
+
+
+def test_you_search_ignores_a_string_snippets_field(monkeypatch):
+    body = json.dumps(
+        {
+            "results": {
+                "web": [
+                    {
+                        "url": "https://you-hit.example/a",
+                        "description": "desc",
+                        "snippets": "first snippet",
+                    }
+                ]
+            }
+        }
+    )
+    _stub_http(monkeypatch, lambda url: body)
+    assert webtools._you_search("q", 3, 5.0)[0]["snippet"] == "desc"
+
+
+def test_you_count_matches_results_when_none_are_asked_for(monkeypatch):
+    _stub_http(
+        monkeypatch,
+        lambda url: _YOU_JSON if url.startswith(webtools._YOU_FREE_URL) else None,
+    )
+    out = webtools.web_search("CRISPR base editing", num_results=0)
+    assert out["count"] == len(out["results"])
+
+
+def test_requests_branch_asks_for_identity_encoding(monkeypatch):
+    # `requests` hands back `response.raw` undecoded, so a gzip answer would
+    # reach json.loads as compressed bytes.
+    import sys
+    import types
+
+    captured = {}
+
+    class _Response:
+        is_redirect = False
+        status_code = 200
+        url = "https://api.you.com/v1/agents/search"
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            self.raw = io.BytesIO(b"{}")
+
+        def close(self):
+            pass
+
+    def request(method, url, *, headers, **_kwargs):
+        captured["headers"] = headers
+        return _Response()
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(request=request))
+    monkeypatch.setattr(webtools, "_guard_url", lambda _url: None)
+    body, _url, _ctype = webtools._http_get("https://api.you.com/v1/agents/search")
+    assert body == b"{}"
+    assert captured["headers"]["Accept-Encoding"] == "identity"
