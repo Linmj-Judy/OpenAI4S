@@ -2010,6 +2010,10 @@ class ArtifactRepository:
             snapshot_path = candidate["snapshot_path"]
             if self._identify_file(candidate["path"]) == identity or (
                 snapshot_path is not None
+                # A snapshot is a regular file, so resolving it keeps its stored
+                # basename: skip the realpath for every row that cannot match.
+                and os.path.normcase(os.path.basename(snapshot_path))
+                == os.path.basename(identity)
                 and self._identify_file(snapshot_path) == identity
             ):
                 return candidate["version_id"]

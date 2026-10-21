@@ -637,6 +637,13 @@ def _patch_dataframe_getitem(pd: Any) -> None:
             pass
 
 
+#: Immutable atoms CPython shares by identity -- None, the bools, small ints,
+#: one-character strings. A side-table tag on one is not this call's input:
+#: `json.loads("false")` from a tracked file would otherwise attribute that file
+#: to every `as_index=False` grouping. A `_TaggedStr` is a subclass and counts.
+_SHARED_ATOM_TYPES = (type(None), bool, int, float, complex, str, bytes)
+
+
 def _prov_wrap_grouped_result(fn: Callable, *, is_groupby: bool = False) -> Callable:
     """Forward native pandas behavior, then retain only known operand tags."""
 
@@ -646,7 +653,12 @@ def _prov_wrap_grouped_result(fn: Callable, *, is_groupby: bool = False) -> Call
         if _off():
             return result
         try:
-            tags = merge_tags(self, result, *args, *kwargs.values())
+            operands = [
+                value
+                for value in (*args, *kwargs.values())
+                if type(value) not in _SHARED_ATOM_TYPES
+            ]
+            tags = merge_tags(self, result, *operands)
             if tags:
                 set_tags(result, tags)
             if is_groupby:

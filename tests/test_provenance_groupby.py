@@ -25,7 +25,8 @@ import pandas as pd
 from openai4s.kernel import provenance
 
 folder, mode = Path(sys.argv[1]), sys.argv[2]
-paths = {'input.csv': 'v-input', 'keys.csv': 'v-keys', 'unrelated.csv': 'v-unrelated'}
+paths = {'input.csv': 'v-input', 'keys.csv': 'v-keys', 'unrelated.csv': 'v-unrelated',
+         'flag.json': 'v-flag'}
 events = []
 def host_call(method, args):
     if method == 'prov_resolve_path':
@@ -61,6 +62,11 @@ elif mode == 'attribute-selection':
 elif mode == 'untracked':
     literal = pd.DataFrame({'group': ['a', 'a', 'b'], 'value': [1, 2, 4]})
     result = literal.groupby('group')['value'].sum()
+elif mode == 'shared-option':
+    with open(folder / 'flag.json') as handle:
+        flag = json.loads(handle.read())  # side-tags the shared False singleton
+    literal = pd.DataFrame({'group': ['a', 'a', 'b'], 'value': [1, 2, 4]})
+    result = literal.groupby('group', as_index=flag).sum()
 elif mode == 'native-error':
     try:
         data.groupby('missing').sum()
@@ -121,6 +127,12 @@ print(json.dumps({'pandas': pd.__version__, 'values': values, 'tags': tags,
         ("dataframe-selection", [{"value": 3}, {"value": 4}], ["v-input"], None),
         ("attribute-selection", [3, 4], ["v-input"], None),
         ("untracked", [3, 4], [], None),
+        (
+            "shared-option",
+            [{"group": "a", "value": 3}, {"group": "b", "value": 4}],
+            [],
+            None,
+        ),
         ("disabled", [3, 4], [], None),
         ("tagging-error", [3, 4], [], None),
         ("native-error", None, [], "KeyError"),
@@ -143,6 +155,7 @@ print(json.dumps({'pandas': pd.__version__, 'values': values, 'tags': tags,
         "dataframe-selection",
         "attribute-selection",
         "untracked",
+        "shared-scalar-option",
         "disabled",
         "tracing-failure",
         "native-error",
@@ -158,13 +171,15 @@ def test_real_pandas_grouped_values_and_known_input_tags(
     )
     (tmp_path / "keys.csv").write_text("key\nx\nx\ny\n", encoding="utf-8")
     (tmp_path / "unrelated.csv").write_text("value\n900\n", encoding="utf-8")
+    (tmp_path / "flag.json").write_text("false", encoding="utf-8")
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_PROBE), str(tmp_path), mode],
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
         timeout=30,
     )
+    assert completed.returncode == 0, completed.stderr
     observed = json.loads(completed.stdout)
     assert observed["values"] == values
     assert observed["error"] == error
@@ -193,35 +208,35 @@ def test_real_kernel_grouped_writer_and_store_reopen(tmp_path):
         llm=LLMConfig(provider="deepseek", api_key="test-key"),
     )
     store = get_store(cfg.db_path)
-    frame = store.new_frame(kind="turn", project_id="default")
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    source = workspace / "input.csv"
-    source.write_text("group,value\na,1\na,2\nb,4\n", encoding="utf-8")
-    input_version = store.save_artifact(
-        path=str(source),
-        filename="input.csv",
-        content_type="text/csv",
-        size_bytes=source.stat().st_size,
-        checksum=hashlib.sha256(source.read_bytes()).hexdigest(),
-        frame_id=frame,
-        project_id="default",
-    )
-    dispatcher = HostDispatcher(cfg=cfg, frame_id=frame, workspace=workspace)
-    manager = ArtifactManager(
-        data_dir=cfg.data_dir,
-        store=store,
-        workspace_for=lambda _frame: workspace,
-        broadcast=lambda *_args: None,
-        guess_content_type=lambda _name: "application/json",
-        checksum=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
-    )
-    session = SimpleNamespace(
-        root_frame_id=frame, project_id="default", workspace=workspace
-    )
-    before = manager.snapshot(workspace)
     expected = [{"group": "a", "total": 3}, {"group": "b", "total": 4}]
     try:
+        frame = store.new_frame(kind="turn", project_id="default")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        source = workspace / "input.csv"
+        source.write_text("group,value\na,1\na,2\nb,4\n", encoding="utf-8")
+        input_version = store.save_artifact(
+            path=str(source),
+            filename="input.csv",
+            content_type="text/csv",
+            size_bytes=source.stat().st_size,
+            checksum=hashlib.sha256(source.read_bytes()).hexdigest(),
+            frame_id=frame,
+            project_id="default",
+        )
+        dispatcher = HostDispatcher(cfg=cfg, frame_id=frame, workspace=workspace)
+        manager = ArtifactManager(
+            data_dir=cfg.data_dir,
+            store=store,
+            workspace_for=lambda _frame: workspace,
+            broadcast=lambda *_args: None,
+            guess_content_type=lambda _name: "application/json",
+            checksum=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        session = SimpleNamespace(
+            root_frame_id=frame, project_id="default", workspace=workspace
+        )
+        before = manager.snapshot(workspace)
         with Kernel(dispatcher=dispatcher, cwd=str(workspace)) as kernel:
             result = kernel.execute(
                 "import pandas as pd\n"

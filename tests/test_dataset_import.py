@@ -805,7 +805,6 @@ def _discover_dataset_input(runner, state, events):
 
 def _analyse_dataset_version(runner, state, version_id, events):
     """Use a real persistent kernel and let production record the input edge."""
-    pytest.importorskip("pandas")
     # Use the production scientific reader/writer hooks. csv.DictReader,
     # scalar conversion and json.dump do not preserve object provenance.
     code = (
@@ -857,6 +856,7 @@ def test_native_input_analysis_keeps_its_exact_lineage_after_store_reopen(
     attaching the current head's lineage would pass a same-byte check but fail
     this workflow. No test code creates a lineage edge or an analysis artifact.
     """
+    pytest.importorskip("pandas")
     from openai4s.store import get_store
 
     with native_dataset_session(tmp_path, monkeypatch, stage1=stage1) as (
@@ -924,6 +924,7 @@ def test_native_input_analysis_keeps_its_exact_lineage_after_store_reopen(
 def test_refused_reimport_leaves_the_prior_input_available_for_exact_analysis(
     tmp_path, monkeypatch, stage1, fault
 ):
+    pytest.importorskip("pandas")
     with native_dataset_session(tmp_path, monkeypatch, stage1=stage1) as (
         runner,
         state,

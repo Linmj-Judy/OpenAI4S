@@ -25,10 +25,9 @@ OpenAI4S 的离线正确性门禁。`uv run pytest` 用确定性 fake 跑完这�
 | [`test_project_history_autosave.py`](test_project_history_autosave.py) | 无浏览器时在持久边界保存（每次执行一次，而非每个代码单元）、重试与失败状态保留、重启补存以及先归档后删除顺序。 |
 | [`test_project_history_routes.py`](test_project_history_routes.py) | 真实 HTTP 验证历史查看、不可变文件下载、本地绑定门禁以及删除并重新绑定项目后保留存档。 |
 | [`browser_project_folders.mjs`](browser_project_folders.mjs) | 独立真实浏览器验证项目目录选择、预览，以及导入源文件后的 Python 分析。 |
-| [`test_provenance_groupby.py`](test_provenance_groupby.py) | 已知 Artifact 标签经过 pandas 分组聚合及列选择仍保留；检查真实 pandas 值/异常、关闭/未追踪数据、追踪故障、外部分组操作数以及真实 Kernel/Store 重开，不手工写入输出血缘边。 |
 | [`test_compute_job_routes.py`](test_compute_job_routes.py) | compute-jobs 路由必须给领域失败一个 HTTP 状态：读取或取消不存在的作业、以及每一次被拒绝的提交，过去都被序列化为携带软 `{"error": ...}` 的 200——于是工作台把不存在的作业显示为「输出为空」，把被拒绝的提交显示为已接受。现在不存在的作业是 404；未能停止一个仍在运行的作业的取消是 500（不是 404——它存在）；客户端输入错误（含字段类型错误与 `NaN` 截止时间）是 400；容量/工作区/关停分别是 429/500/503；未登记的 code 是 400 而不是 200——与 skills 共用同一个按 code 投影的 `_soft_failure_status`，且管理器返回的每个 code 都必须登记在 `JOB_FAILURE_STATUS` 中。 |
 | [`test_dataset_import_live.py`](test_dataset_import_live.py) | 显式启用的真实 PaRoutes 原生导入与 Store 重开验收；不属于默认离线套件。 |
-| [`test_dataset_import.py`](test_dataset_import.py) | 离线发现/选择、权限、取消及原生捕获；真实内核分析在同字节再次导入、替换被拒和 Store 重开后仍绑定精确输入版本与自动血缘。 |
+| [`test_dataset_import.py`](test_dataset_import.py) | 离线发现/选择、权限、取消、原生捕获、来源不可变/重开及捕获失败/重试否决合同；真实内核分析在同字节再次导入、替换被拒和 Store 重开后仍绑定精确输入版本与自动血缘。 |
 | [`test_download_integrity.py`](test_download_integrity.py) | 来源大小/checksum、有界传输、取消及发布顺序。 |
 | [`test_live_ark_calls.py`](test_live_ark_calls.py) | 显式 live_llm Ark 流式停止与下一调用恢复；凭据通过继承描述符传递、输出脱敏凭证，不进入离线 CI。 |
 | [`test_llm_usage_evidence.py`](test_llm_usage_evidence.py) | 原始用量证据、未知计量、安全错误投影与旧调用结算回归。 |
@@ -308,6 +307,7 @@ OpenAI4S 的离线正确性门禁。`uv run pytest` 用确定性 fake 跑完这�
 | [`test_protein_mutation_enhancement_skill.py`](test_protein_mutation_enhancement_skill.py) | 蛋白突变 Skill 的纯 helper。枚举、排序与选择轮次都是确定性的；错误路径被明确检查：野生型残基对不上的突变、越界的位点、没有位点的变体，一律抛错，而不是被悄悄打了分。 |
 | [`test_protein_design_mcp.py`](test_protein_design_mcp.py) | 原子 protein-design MCP connector，使用真实 stdio 和临时 fake backend 子进程驱动。它固定内置 connector-directory 入口、九工具 catalog、RFdiffusion 的 `deterministic + design_startnum` seed 契约及 PDB/TRB 配对、ProteinMPNN 官方 chain/fixed-position 参数和独立 motif/target/map 校验、blind ColabFold 的断网 namespace 与冻结参数、失败终态记录、路径约束，以及修正后的 Rosetta unsatisfied-H-bond 字段。整个模块标为 `stubbed_backend`，伪造的科学响应不会进入 API schema capture。 |
 | [`test_prov_record_confinement.py`](test_prov_record_confinement.py) | 一个 cell 可以把哪些文件登记成本会话的 artifact。`provenance_record` 用 `Path(path).expanduser()` 解析路径、只检查文件是否存在，于是宿主上任意绝对路径都能登记——修复前实测：写在工作区之外的一把私钥拿到了 version id，并出现在所有展示 artifact 的界面上、可下载。约束机制并非缺失，而是没被用上：`self._resolve_path` 本来就注入进了这个 service，它的兄弟方法都在调。同一个函数还会把整个文件读进守护进程内存来算校验和，而其它 artifact 路径都是流式处理的。 |
+| [`test_provenance_groupby.py`](test_provenance_groupby.py) | 已知 Artifact 标签经过 pandas 分组聚合及列选择仍保留；检查真实 pandas 值/异常、关闭/未追踪数据、共享标量参数不带标签、追踪故障、外部分组操作数以及真实 Kernel/Store 重开，不手工写入输出血缘边。 |
 | [`test_provenance_identity.py`](test_provenance_identity.py) | 被打了标签的对象，还是不是当初被打标签的那个对象。侧表原先是 `id(obj) -> tags`，而 id 不是身份：CPython 会立刻复用已释放对象的地址，于是一个毫不相干的对象继承了它的血缘——**第一次分配**就能复现。这是在「结果可复现」这一核心主张所依赖的子系统里伪造了一条血缘边；而且侧表是主路径而非边角情况：`list` 和 `dict` 都走这里，而它们正是 `json.loads` 的返回类型。其中两条用例的存在要归功于变异测试打掉了第一版——干等真实地址复用无法证伪修复（钉住对象本身就杜绝了复用，于是测试落到了一条更弱的断言上），而用 `MAX_SIDE_TAGS` 来决定循环次数会让「上限被调大」表现为卡死而不是失败。 |
 | [`test_provenance_paths.py`](test_provenance_paths.py) | worker 内部的文件系统身份——溯源正是在这里悄悄断掉的。一个 Cell 若在打开文件和写入文件之间换了工作目录，仍然必须给出同一个规范路径；最后那个测试拿真实内核验证了这一点。 |
 | [`test_public_api_contract.py`](test_public_api_contract.py) | 公开的 import 表面，钉住它是为了让后端还能继续搬家：包版本、构造函数的参数名、`run_task` 的调用约定，以及 Host 与 server 两个门面。它钉住的只是调用方看得见的东西，仅此而已。 |
