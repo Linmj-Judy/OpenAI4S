@@ -186,7 +186,7 @@ for what the gate stands in front of.
 
 `OPENAI4S_EGRESS` (`off`) — `allowlist` applies the host domain allowlist to `web_fetch`, `web_search`, and authorized `host.bash`. In that mode a new Python or R Cell is also admitted only when the kernel sandbox is enforced, its self-test passed, and `network_policy` is `blocked`. Anything else, including a remote kernel, is refused before the Cell runs with `egress_boundary_unavailable`. `off` leaves Cell execution unchanged. See [Security](security.md).
 
-`OPENAI4S_YOU_SEARCH` (on) — `web_search` tries the You.com Search API after Doubao and Tavily and before the keyless HTML engines. Without `YDC_API_KEY` the query goes to `api.you.com` (free tier, 100 searches a day per IP); with it, to `ydc-index.io`. Set to `off` / `0` / `false` / `no` to skip the step. Both hosts are on the built-in egress allowlist, `ydc-index.io` as an exact host because it receives the key.
+**Web search engines.** With an Agent Plan key configured, Doubao Search always answers first. Behind it, `web_search` tries the backup engines in the order set in Settings → Network: Tavily (only with a key), You.com and the built-in keyless engines (DuckDuckGo → Bing → DuckDuckGo lite → Mojeek). All three are on by default; each can be reordered or switched off, but at least one usable engine stays on. You.com without a key uses the free tier at `api.you.com` (100 searches a day per IP); with a key (`YDC_API_KEY`, the Network tab, or `OPENAI4S_SECRET_SEARCH_YOU_API_KEY` through the env broker) it uses `ydc-index.io`. Both hosts are on the built-in egress allowlist, `ydc-index.io` as an exact host because it receives the key. When Doubao's quota or rate limit is spent, the user is asked on an approval card whether to fall back and to which switched-on engine; a remembered answer applies later without asking, and with nobody to ask (a delegated child, a run with no UI, an active Auto Mode run) the search returns the quota error. A rejected Agent Plan key never falls back.
 
 `OPENAI4S_KERNEL_SANDBOX` (`auto`) — `enforce` fails closed when Seatbelt or bubblewrap cannot prove the boundary; `auto` warns and continues unsandboxed; `off` disables the OS boundary. Under `OPENAI4S_EGRESS=allowlist`, Cell admission needs the enforced, self-tested, `network_policy=blocked` posture. `OPENAI4S_KERNEL_ALLOW_RAW_NETWORK=1` reports `raw_allowed` and is refused while allowlist is on.
 
@@ -391,6 +391,13 @@ OpenAI4S settings database. Interactive API-key input is hidden; automation may
 pipe one line to `openai4s init --api-key-stdin --non-interactive`. An API key
 is never accepted as a command-line value or returned by `--json`, keeping it
 out of shell history and structured command output.
+
+The same command makes one web-search choice. Interactively it asks after the
+model; `--search doubao|tavily|you|builtin` makes it non-interactively, with
+`--search-key-stdin` supplying the Agent Plan, Tavily or You.com key (stdin
+carries one key per run, so not together with `--api-key-stdin`). `doubao`
+stores the Agent Plan key; any other choice moves that engine to the front of
+the backup list, and `builtin` keeps only the keyless engines.
 
 ## Platform support
 

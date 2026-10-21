@@ -99,8 +99,7 @@ def test_you_search_failure_falls_through_to_scrapers(monkeypatch):
     assert out["source"] == "duckduckgo"
 
 
-def test_you_search_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("OPENAI4S_YOU_SEARCH", "off")
+def test_a_switched_off_you_is_never_asked(monkeypatch):
     seen = []
 
     def handler(url):
@@ -108,7 +107,7 @@ def test_you_search_can_be_disabled(monkeypatch):
         return _DDG_HTML if "duckduckgo" in url else None
 
     _stub_http(monkeypatch, handler)
-    out = webtools.web_search("q")
+    out = webtools.web_search("q", engines=("tavily", "builtin"))
     assert out["source"] == "duckduckgo"
     assert not any("api.you.com" in u for u in seen)
 

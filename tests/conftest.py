@@ -407,9 +407,8 @@ def isolated_openai4s_home(tmp_path, monkeypatch):
         "OPENAI4S_WEBUI",
         "OPENAI4S_WEBUI_NEXT",
         # A real You.com key would turn the stubbed search tests into a live
-        # POST; an exported off switch would hide the You.com step from them.
+        # POST to ydc-index.io.
         "YDC_API_KEY",
-        "OPENAI4S_YOU_SEARCH",
     ):
         monkeypatch.delenv(var, raising=False)
     # The BYOC confinement self-test caches its verdict process-wide, keyed by
