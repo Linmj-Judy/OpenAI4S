@@ -213,6 +213,47 @@ describe("execution response ownership", () => {
     expect(execSourcesState().error).toBe("");
   });
 
+  it("clears a failed frame's banner when selecting a cached frame", async () => {
+    const st = execSourcesState();
+    st.cells.child = [2];
+    setExecutionFetch(vi.fn().mockRejectedValue(new Error("frame-x failed")));
+    await selectExecFrame("frame-x");
+    expect(st.error).toContain("frame-x failed");
+    await selectExecFrame("child");
+    expect(st.cells.child).toEqual([2]);
+    expect(st.error).toBe("");
+  });
+
+  it("retries a failed refresh on selection while retaining the last successful cells", async () => {
+    const st = execSourcesState();
+    st.cells["frame-x"] = [1];
+    const fetch = vi.fn().mockRejectedValueOnce(new Error("refresh failed"))
+      .mockResolvedValueOnce(response({ entries: [2] }));
+    setExecutionFetch(fetch);
+    await selectExecFrame("frame-x", true);
+    expect(st.cells["frame-x"]).toEqual([1]);
+    expect(st.error).toContain("refresh failed");
+    await selectExecFrame("frame-x");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(st.cells["frame-x"]).toEqual([2]);
+    expect(st.error).toBe("");
+  });
+
+  it("shows an in-flight refresh failure after returning to its cached frame", async () => {
+    const pending = deferred();
+    const st = execSourcesState();
+    st.cells["frame-x"] = [1];
+    st.cells.child = [2];
+    setExecutionFetch(() => pending.promise);
+    const refresh = selectExecFrame("frame-x", true);
+    await selectExecFrame("child");
+    await selectExecFrame("frame-x");
+    pending.reject(new Error("refresh failed after returning"));
+    await refresh;
+    expect(st.cells["frame-x"]).toEqual([1]);
+    expect(st.error).toContain("refresh failed after returning");
+  });
+
   it.each(["session", "state"])("discards log reads after %s replacement", async (replacement) => {
     const old = deferred();
     setExecutionFetch(() => old.promise);

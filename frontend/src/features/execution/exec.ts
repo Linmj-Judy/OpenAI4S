@@ -40,7 +40,7 @@ export function execSourcesState(): ExecSourcesState {
 }
 
 // Per-frame ownership lets unrelated reads populate their own cache slots.
-const cellRequests = new WeakMap<ExecSourcesState, Map<string, number>>();
+const cellRequests = new WeakMap<ExecSourcesState, Map<string, { failed: boolean }>>();
 
 let paintExec: (() => void) | null = null;
 
@@ -126,26 +126,30 @@ export async function selectExecFrame(frameId: string, force = false): Promise<v
   const st = execSourcesState();
   const snapshot = st.request;
   st.selected = frameId;
-  // Even a cached selection retires the previous selection's error ownership.
-  const request = (st.cellRequest = (st.cellRequest || 0) + 1);
+  // The banner belongs to the selected frame, including cached selections.
+  st.error = "";
   paint();
-  if (!force && st.cells[frameId]) return;
   let requests = cellRequests.get(st);
+  if (!force && st.cells[frameId] && !requests?.get(frameId)?.failed) return;
   if (!requests) cellRequests.set(st, (requests = new Map()));
-  requests.set(frameId, request);
+  const cellRequest = { failed: false };
+  requests.set(frameId, cellRequest);
   const ownsRequest = () =>
     id === currentId.value && execSources.value === st && snapshot === st.request &&
-    requests.get(frameId) === request;
+    requests.get(frameId) === cellRequest;
   try {
     const d = (await api(`/frames/${encodeURIComponent(frameId)}/execution-log`)) as {
       entries?: unknown[];
     };
     if (!ownsRequest()) return;
     st.cells[frameId] = (d && d.entries) || [];
-    if (request === st.cellRequest) st.error = "";
+    if (st.selected === frameId) st.error = "";
   } catch (e) {
-    // Do not cache the failure: an empty slot lets the next click retry.
-    if (ownsRequest() && request === st.cellRequest)
+    if (!ownsRequest()) return;
+    // Keep the last successful cells visible, but retry this failed refresh
+    // on the next selection instead of treating the retained cache as fresh.
+    cellRequest.failed = true;
+    if (st.selected === frameId)
       st.error = t("nb.exec.loadFailed", publicText(apiErrorText(e), 200));
   }
   if (ownsRequest() && st.open) paint();
