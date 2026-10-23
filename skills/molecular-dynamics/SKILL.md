@@ -12,7 +12,7 @@ capabilities:
     domains: []
 metadata:
   version: "1.3"
-  last-reviewed: "2026-10-01"
+  last-reviewed: "2026-10-22"
   skill-author: Kuan-lin Huang
 ---
 
@@ -25,10 +25,11 @@ Molecular dynamics (MD) simulation computationally models the time evolution of 
 - **OpenMM** (https://openmm.org/): High-performance MD simulation engine with GPU support, Python API, and flexible force field support
 - **MDAnalysis** (https://mdanalysis.org/): Python library for reading, writing, and analyzing MD trajectories from all major simulation packages
 
-**Reviewed versions:** OpenMM 8.6.1 and MDAnalysis 2.10.0. Reference-platform
-smoke checks use small synthetic systems; GPU performance and scientific convergence
-are not established by them. OpenMM latest API pages identify a development build,
-so the installed 8.6.1 API is the executable reference.
+**Validated versions:** OpenMM 8.6.1 and MDAnalysis 2.10.0. The offline
+`tests/test_molecular_dynamics_skill.py` checks execute these code blocks on tiny
+synthetic systems, using OpenMM's Reference platform. They cover staged simulation,
+trajectory timestamps, RMSF and periodic contacts; they do not establish GPU
+performance, ligand parameterization or scientific convergence.
 
 **Installation into a dedicated environment:**
 ```bash
@@ -65,9 +66,9 @@ Use a new output prefix for every stage to avoid overwriting earlier results.
 ```python
 from openmm.app import (
     CheckpointReporter, DCDReporter, ForceField, HBonds, Modeller, PDBFile,
-    PME, StateDataReporter,
+    PME, Simulation, StateDataReporter,
 )
-from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, Platform, Simulation
+from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, Platform
 from openmm.unit import angstroms, bar, kelvin, kilojoules_per_mole, molar, nanometer, picosecond, picoseconds
 
 def prepare_system_from_pdb(pdb_file, forcefield_name="amber14-all.xml",
@@ -206,6 +207,7 @@ def run_nvt_equilibration(simulation, n_steps=50000, temperature=300,
             f"{output_prefix}_log.txt",
             report_interval,
             step=True,
+            time=True,
             potentialEnergy=True,
             kineticEnergy=True,
             temperature=True,
@@ -271,6 +273,7 @@ def run_npt_production(simulation, n_steps=500000, temperature=300, pressure=1.0
             f"{output_prefix}_log.txt",
             report_interval,
             step=True,
+            time=True,
             potentialEnergy=True,
             temperature=True,
             density=True,
@@ -303,6 +306,13 @@ Use the solvated topology with exactly the DCD atom count and order (e.g. the
 `minimized.pdb` above), not the original unsolvated input. MDAnalysis converts
 lengths to Å and time to ps by default; OpenMM bare coordinates use nm. Preserve
 frame box vectors and actual timestamps; do not infer time from frame number.
+OpenMM's DCDReporter starts each new file's time header at one reporting interval,
+even when the Context has already advanced through earlier stages. For these
+examples, load each DCD with its matching StateDataReporter log, e.g.
+`load_trajectory("minimized.pdb", "npt_traj.dcd", state_log="npt_log.txt")`.
+The log records the Context time in ps at the same reporting steps. Without a
+log, the loader keeps the input file's time convention; do not interpret a later
+OpenMM stage's DCD header as an absolute simulation time.
 
 ```python
 import MDAnalysis as mda
@@ -310,15 +320,30 @@ from MDAnalysis.analysis import rms, align, contacts
 import numpy as np
 import matplotlib.pyplot as plt
 
-def load_trajectory(topology_file, trajectory_file):
+def load_trajectory(topology_file, trajectory_file, *, state_log=None):
     """
     Load an MD trajectory with MDAnalysis.
 
     Args:
         topology_file: PDB, PSF, or other topology file
         trajectory_file: DCD, XTC, TRR, or other trajectory
+        state_log: Matching OpenMM CSV log with a Time (ps) column, one row per frame
     """
     u = mda.Universe(topology_file, trajectory_file)
+    if state_log is not None:
+        import csv
+
+        with open(state_log, newline="") as handle:
+            times = np.array([float(row["Time (ps)"]) for row in csv.DictReader(handle)])
+        if (len(times) != u.trajectory.n_frames or not np.all(np.isfinite(times))
+                or np.any(np.diff(times) <= 0)):
+            raise ValueError("State log must have one finite, increasing time per frame")
+
+        def restore_time(ts):
+            ts.time = float(times[ts.frame])
+            return ts
+
+        u.trajectory.add_transformations(restore_time)
     print(f"Universe: {u.atoms.n_atoms} atoms, {u.trajectory.n_frames} frames")
     first, last = u.trajectory[0].time, u.trajectory[-1].time
     print(f"Time range: {first:g} to {last:g} ps")
@@ -415,6 +440,7 @@ def analyze_contacts(u, protein_sel="protein", ligand_sel="resname LIG",
     Returns sets of (resindex, segid, resid, resname), one per analyzed frame.
     """
     from MDAnalysis.lib.distances import distance_array
+    from MDAnalysis.lib.mdamath import box_volume
 
     protein = u.select_atoms(protein_sel)
     ligand = u.select_atoms(ligand_sel)
@@ -425,9 +451,15 @@ def analyze_contacts(u, protein_sel="protein", ligand_sel="resname LIG",
         raise ValueError("radius must be finite and positive")
     contact_frames = []
     for ts in u.trajectory[start_frame:]:
-        if periodic and (ts.dimensions is None or not np.all(np.isfinite(ts.dimensions))
-                         or np.any(ts.dimensions[:3] <= 0)):
-            raise ValueError("Periodic contacts require valid frame box dimensions")
+        if periodic:
+            box = ts.dimensions
+            # Positive lengths alone do not establish a physical triclinic cell.
+            with np.errstate(invalid="ignore"):
+                volume = box_volume(box) if box is not None else 0
+            if box is None or not np.all(np.isfinite(box)) or not np.isfinite(volume) or volume <= 0:
+                raise ValueError("Periodic contacts require valid frame box dimensions")
+        if not np.all(np.isfinite(protein.positions)) or not np.all(np.isfinite(ligand.positions)):
+            raise ValueError("Contact coordinates must be finite")
         # This includes hydrogen atoms unless the caller selects heavy atoms.
         distances = contacts.contact_matrix(
             distance_array(protein.positions, ligand.positions, box=ts.dimensions if periodic else None),

@@ -43,6 +43,23 @@ same-named copy in `<data_dir>/user-skills`. Targets, provenance, and what the
 installer refuses to do:
 [`tools/skills-installer/`](../../tools/skills-installer/README.md).
 
+## Offline recipe checks
+
+From the repository root, after creating the dedicated environment described in
+`SKILL.md`, run:
+
+```bash
+uv pip install --python .venv-md/bin/python pytest
+.venv-md/bin/python -m pytest tests/test_molecular_dynamics_skill.py
+```
+
+These tests execute the documented code with OpenMM 8.6.1 and MDAnalysis 2.10.0
+on small synthetic fixtures: minimization, NVT/NPT stages, log-derived trajectory
+timestamps, RMSF indexing, and periodic contacts including invalid geometry.
+They use the Reference platform and no network or GPU. The default offline suite
+checks syntax and skips execution when the optional packages are absent. This is
+API/geometry evidence, not validation of a protein-ligand model or convergence.
+
 ## Files
 
 | File | Responsibility |

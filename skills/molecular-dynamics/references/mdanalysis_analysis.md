@@ -3,6 +3,10 @@
 Reviewed against MDAnalysis 2.10.0 on 2026-10-01. Examples use local topology
 and trajectory files and are illustrative outside the synthetic regression checks.
 Atom order, molecule integrity, box vectors and time units must be checked first.
+For a DCD produced by one of the staged OpenMM examples, use the main recipe's
+`load_trajectory(..., state_log="npt_log.txt")` with the matching stage log to
+restore Context timestamps. A new DCD's header restarts its time origin; loading
+it directly below does not recover the elapsed time of preceding stages.
 
 ## MDAnalysis Universe and AtomGroup
 
