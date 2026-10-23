@@ -85,6 +85,7 @@ host.save_artifact(plot(frames))             # ...only "<DataFrame 100000×20>" 
 
 ## 📣 News
 
+- **`2026-10-18`** 📁 **[`v0.3.1`](https://github.com/PKU-YuanGroup/OpenAI4S/releases/tag/v0.3.1) — local project folders and portable history** — link source folders, browse saved conversation history, import scientific datasets with checksum verification, and work with **611 bundled Skills**. Linux and Windows/WSL2 packages are on GitHub, Python packages on PyPI, and the public container image on GHCR. macOS uses PyPI while signing and notarization are deferred. The database moves from schema 32 to 35; read **[Upgrading to 0.3.1](docs/upgrading.md)** before the first start.
 - **`2026-09`** 🧭 **`v0.3.0` — the new workbench, and the first Windows package** — the Preact/TypeScript workbench replaces the `app.js` monolith as the default UI, and the release adds the first **Windows/WSL2 zip** beside the Linux tarball. Every local daemon now requires its access token: the `OPENAI4S_REQUIRE_TOKEN=0` loopback opt-out is gone. Interactive HTML reports run on a separate sandboxed origin, Notebook cells keep the exact artifact versions they produced, long-context compaction actually lands and survives a restart, delegated sub-agents inherit their environment and leave durable, exportable cell records, and Auto Mode admits budget atomically and stops a run that makes no progress. The single-cell RNA analysis Skill brings the total to 604. The Apple Silicon **macOS image** is an ad-hoc-signed preview, not a notarized one. The database schema moves from 27 to 32, so read **[Upgrading from 0.2.x](docs/upgrading.md)** before the first start.
 - **`2026-08-24`** 🚀 **`v0.2.0` — the multi-platform release** — one release, two desktop packages: the Apple Silicon **`.dmg`** and a relocatable **Linux `x86_64` tarball** carrying the same embedded Python and science stack (the Windows/WSL2 zip is built and under stabilization — it ships in a coming release). Underneath: **Auto Mode** with a Guardian review boundary, honest **completion-evidence reconciliation** (a crashed cell can no longer render as a clean success), the **MCP Streamable HTTP** transport with the Volcengine DataPro connector and Doubao web search, **Anthropic Messages SSE streaming**, the pinned **561-recipe bioSkills collection** (603 Skills in all, installable anywhere via `npx`), a trajectory-ledger view in the workbench, Docker/Kubernetes deployment, `openai4s --version`, and the interrupt-signal train that makes a running R cell reliably stoppable on every platform.
 - **`2026-08-04`** 🔭 **`main` — on the way to `v0.2.0`** — **read-only session sharing** over an outbound relay tunnel (`openai4s share` / `openai4s relay`), **seven normalized public-database connectors** that carry where a record came from and when, a versioned **`/api/v1`** surface (keyset pagination, one error envelope, a resumable WebSocket cursor), **environments as a transaction** (`openai4s env plan|apply|rollback`), a redacted `doctor` / `diagnostics` support bundle, consent-gated revocable telemetry, a retrosynthesis-planning Skill, and a **10-workflow / 20-case benchmark** that runs against the real Store, kernels, and dispatcher. Linux and Windows desktop packages were built and tested here — the Linux package ships in `v0.2.0` above, and the Windows package follows in a coming release.
@@ -153,8 +154,20 @@ States. → [Experimental semantic judgment](docs/experimental-judgment.md)
 
 ## ⚡ Quickstart
 
+**Current release: [0.3.1](https://github.com/PKU-YuanGroup/OpenAI4S/releases/tag/v0.3.1).** Choose an installation channel below. If you already have data from 0.3.0 or earlier, stop the daemon and back up the whole data directory before installing; see [Upgrading](docs/upgrading.md).
+
+| Channel | 0.3.1 download |
+| --- | --- |
+| Linux x86_64 | [Standalone tarball](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/OpenAI4S-0.3.1-linux-x86_64.tar.gz) |
+| Windows x86_64 with WSL2 | [Complete ZIP](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/OpenAI4S-0.3.1-windows-x86_64.zip) |
+| Python, including macOS | [PyPI: openai4s 0.3.1](https://pypi.org/project/openai4s/0.3.1/) |
+| Containers (linux/amd64) | [GHCR: openai4s](https://github.com/orgs/PKU-YuanGroup/packages/container/package/openai4s), tag `0.3.1` |
+| Download verification | [SHA256SUMS](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/SHA256SUMS) · [Build and validation evidence](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/openai4s-0.3.1-evidence.zip) |
+
+To run the released source:
+
 ```bash
-git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
+git clone --branch v0.3.1 --depth 1 https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 ./setup.sh     # one-time: build the environment with uv
 ./start.sh     # launch the web UI at http://127.0.0.1:8760/
 ```
@@ -164,13 +177,13 @@ git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 ### macOS
 
 > [!NOTE]
-> **`v0.3.0` ships a preview macOS image, not a notarized one.** `OpenAI4S-0.3.0-macos-arm64.dmg` on the [v0.3.0 release page](https://github.com/PKU-YuanGroup/OpenAI4S/releases/tag/v0.3.0) is Apple Silicon only, ad-hoc signed and not notarized, so Gatekeeper blocks its first launch; the [startup guide](docs/startup-guide.md) has the steps. It was built and attached outside the release workflow, which still uploads a `.dmg` only when it is Developer-ID-signed and notarized, and the credentials for that do not exist yet. Use that pinned page rather than the newest release, because a release the workflow produces carries no image. On an Intel Mac, or if you would rather not run an un-notarized app, install from PyPI as below or run from the source checkout above. Coming from the v0.2.0 app, read [Upgrading from 0.2.x](docs/upgrading.md) first: 0.3.0 upgrades the data directory, and 0.2.0 must not open it afterwards.
+> **0.3.1 has no macOS DMG while Developer ID signing and notarization are deferred.** Use [PyPI 0.3.1](https://pypi.org/project/openai4s/0.3.1/) on Apple Silicon or Intel, or the tagged source checkout above. The old preview images install older versions; see the historical notes in the [startup guide](docs/startup-guide.md).
 
 Install from PyPI into a virtual environment of its own. This works on Apple Silicon and Intel, with Python 3.10 or newer:
 
 ```bash
 python3 -m venv ~/.venvs/openai4s && source ~/.venvs/openai4s/bin/activate
-pip install "openai4s[science]"   # numpy · pandas · matplotlib · scikit-learn; use [science,chemistry] for RDKit
+python -m pip install --upgrade "openai4s[science]==0.3.1"   # use "openai4s[science,chemistry]==0.3.1" for RDKit
 openai4s serve                    # starts the daemon and opens the workbench with its access token
 ```
 
@@ -181,26 +194,27 @@ Data lives in `~/.openai4s`. If you close the tab, `openai4s url` prints the aut
 1. **Model API** — open **Settings ⚙ → Models**, pick a protocol (**Ark-compatible** for Doubao/GLM/Kimi/DeepSeek/MiniMax, or **OpenAI-** / **Anthropic-compatible**), paste your **API Key**, click **Add**, then **Set active**. Cheapest path: the `ark` protocol on Volcengine Ark's ¥9.9/mo plan.
 2. **Search API** *(optional, recommended)* — open **Settings ⚙ → Network**, keep **Allow network access** on, and paste your Ark **Agent Plan Key** into the primary **Doubao Search Custom** card → **Save credential**. If the active model is an Ark **Agent Plan**, you can skip this step: OpenAI4S saves that key as the default for both Doubao Search and DataPro professional datasets, and they keep working after you switch to another model. Tavily and keyless engines remain backup options; the dedicated Doubao health check never reports a fallback result as Doubao.
 
-Full walkthrough (install → model → search → R kernel, plus the Gatekeeper steps for the v0.2.0 preview image): **[Startup guide](docs/startup-guide.md)**.
+Full 0.3.1 walkthrough (install → model → search → R kernel): **[Startup guide](docs/startup-guide.md)**.
 
 ### Linux app (no toolchain required)
 
-> [!NOTE]
-> The Linux package ships with `v0.2.0` and every later release. The Windows/WSL2 package ships from `v0.3.0` on; see its section below. On older releases (`v0.1.0` carried the macOS image only, and `v0.2.0` had no Windows package), use the source checkout above or `pip install openai4s`.
-
-Download `OpenAI4S-<version>-linux-x86_64.tar.gz` from the [latest release](https://github.com/PKU-YuanGroup/OpenAI4S/releases/latest), unpack it anywhere, and run it. It embeds its own Python and the pre-baked science stack, as a relocatable directory:
+Download the [0.3.1 Linux tarball](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/OpenAI4S-0.3.1-linux-x86_64.tar.gz) and [SHA256SUMS](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/SHA256SUMS) into the same directory. Verify it, unpack it anywhere, and run it. It embeds its own Python and the pre-baked science stack, as a relocatable directory:
 
 ```bash
-tar -xzf OpenAI4S-*-linux-x86_64.tar.gz && cd OpenAI4S-*-linux-x86_64
+sha256sum --ignore-missing -c SHA256SUMS   # the Linux tarball must report OK
+tar -xzf OpenAI4S-0.3.1-linux-x86_64.tar.gz
+cd OpenAI4S-0.3.1-linux-x86_64
 ./OpenAI4S          # starts the daemon and opens http://127.0.0.1:8760/
 ./install.sh        # optional: `openai4s` on your PATH + an application-menu entry
 ```
 
-`install.sh` is per-user and needs no root — it only writes into `$HOME`, and `./uninstall.sh` undoes it while leaving your data in `~/.openai4s` alone. Install `bubblewrap` (`apt install bubblewrap`) so cells run sandboxed; without it the default `OPENAI4S_KERNEL_SANDBOX=auto` reports a visibly degraded, unisolated kernel. Only `x86_64` is published — on arm64 Linux, install from PyPI (`pip install openai4s`).
+`install.sh` is per-user and needs no root — it only writes into `$HOME`, and `./uninstall.sh` undoes it while leaving your data in `~/.openai4s` alone. Install `bubblewrap` (`apt install bubblewrap`) so cells run sandboxed; without it the default `OPENAI4S_KERNEL_SANDBOX=auto` reports a visibly degraded, unisolated kernel. Only `x86_64` is published — on arm64 Linux, use a virtual environment and the pinned PyPI command above.
 
 ### Windows (via WSL2)
 
-Download `OpenAI4S-<version>-windows-x86_64.zip`, unzip it, and double-click `OpenAI4S.cmd`. The first run checks WSL2 and a working bubblewrap 0.8.0+ sandbox, verifies and installs the bundled Linux payload, creates `~/.local/bin/openai4s`, starts the daemon there, and opens an authenticated local URL in your Windows browser. No application download, no `pip`, no toolchain. Ubuntu 24.04 is the supported baseline; mainland PyPI/Conda mirrors and an optional WSL-reachable proxy can be configured by the launcher. See the bilingual [Windows/WSL2 guide](docs/windows-wsl.md).
+Download the [complete 0.3.1 Windows ZIP](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/OpenAI4S-0.3.1-windows-x86_64.zip) and [SHA256SUMS](https://github.com/PKU-YuanGroup/OpenAI4S/releases/download/v0.3.1/SHA256SUMS), verify the ZIP as described in the [Windows/WSL2 guide](docs/windows-wsl.md#english), then extract all files and double-click `OpenAI4S.cmd`. No split-file restoration is needed. The first run checks WSL2 and a working bubblewrap 0.8.0+ sandbox, verifies and installs the bundled Linux payload, creates `~/.local/bin/openai4s`, starts the daemon there, and opens an authenticated local URL in your Windows browser. No application download, no `pip`, no toolchain. Ubuntu 24.04 is the supported baseline; mainland PyPI/Conda mirrors and an optional WSL-reachable proxy can be configured by the launcher.
+
+**0.3.1 validation:** archive structure, launcher checks, and the embedded Linux payload passed verification; full Windows/WSL2 runtime acceptance was not performed for this version.
 
 `v0.3.0` is the first release that ships this package. Its acceptance evidence covers WSL2 on x86_64 with the tested Ubuntu 24.04 distribution. The last section of the [WSL2 parity audit](docs/windows-wsl-parity-audit.md) ("Fix verification — 2026-09-07") leaves the following unverified:
 
@@ -216,14 +230,21 @@ Download `OpenAI4S-<version>-windows-x86_64.zip`, unzip it, and double-click `Op
 
 ### 🐳 Docker and Kubernetes
 
+The [public GHCR package](https://github.com/orgs/PKU-YuanGroup/packages/container/package/openai4s) can be pulled without signing in. Pin `0.3.1` for this release; `latest` follows future releases. The image is **linux/amd64**; ARM hosts require amd64 emulation.
+
 ```bash
-docker compose up -d --build          # http://127.0.0.1:8760/
-docker compose exec openai4s openai4s url   # the URL, token included
+docker pull --platform linux/amd64 ghcr.io/pku-yuangroup/openai4s:0.3.1
+docker run -d --name openai4s --platform linux/amd64 \
+  -p 127.0.0.1:8760:8760 \
+  -v openai4s-data:/data \
+  -e OPENAI4S_SECRET_LLM_LLM_API_KEY="$OPENAI4S_LLM_API_KEY" \
+  ghcr.io/pku-yuangroup/openai4s:0.3.1
+docker exec openai4s openai4s url   # the URL, token included
 ```
 
-The image is built from this tree — Debian-slim CPython, the wheel, and the `science` extra — and runs as an unprivileged user with one volume at `/data`. Supply the model key as `OPENAI4S_SECRET_LLM_LLM_API_KEY` (a `Secret` in the cluster); the image reads credentials from the environment and writes nothing credential-shaped to the volume. For a cluster, `kubectl apply -f deploy/kubernetes.yaml` gives a single-replica Deployment, a `ReadWriteOnce` claim and a ClusterIP Service, with probes on `/health`.
+The image contains Debian-slim CPython, the wheel, and the `science` extra, and runs as an unprivileged user with one volume at `/data`. The command forwards the model key from your shell's `OPENAI4S_LLM_API_KEY` to the container's `OPENAI4S_SECRET_LLM_LLM_API_KEY`; configure the provider and model as described in the [container guide](docs/docker.md). Credentials are read from the environment. To build from the checkout instead, use `docker compose up -d --build`. For Kubernetes, replace `image: openai4s:local` in `deploy/kubernetes.yaml` with `image: ghcr.io/pku-yuangroup/openai4s:0.3.1` before applying it to amd64 nodes; the guide covers the Secret, persistent volume, and access URL.
 
-Release images are published to GitHub Packages as `ghcr.io/pku-yuangroup/openai4s:<version>` and `:latest` (linux/amd64, from `0.2.0` on) by `publish-image.yml`, which pushes an image only after it passes the same `container_smoke.sh` that gates every pull request. If `docker pull ghcr.io/pku-yuangroup/openai4s:latest` asks you to log in, build the image from the checkout as above. Two things are worth knowing before you expose it. Binding `0.0.0.0` inside the container makes the access token mandatory and switches the DNS-rebind `Host` allowlist off, so the token becomes the only control in front of endpoints that execute code — which is why the compose file publishes to loopback and the Service is a `ClusterIP`. And an unprivileged container cannot give bubblewrap the namespaces it needs, so the kernel sandbox degrades visibly and the container becomes the boundary; that is a coarser one, and **[the container guide](docs/docker.md)** says exactly what it stops covering.
+Release images pass `container_smoke.sh` before publication. Binding `0.0.0.0` inside the container makes the access token mandatory and switches the DNS-rebind `Host` allowlist off, so keep the published port on loopback. An unprivileged container cannot give bubblewrap the namespaces it needs, so the kernel sandbox degrades visibly and the container becomes the boundary; **[the container guide](docs/docker.md)** explains these limits.
 
 ### 🧩 Take the Skills anywhere (`npx`)
 
@@ -256,8 +277,8 @@ The canonical bilingual documentation is published at **[openai4s.org/docs](http
 
 | doc | what's inside |
 |---|---|
-| [**Startup guide**](docs/startup-guide.md) | macOS walkthrough: install the v0.3.0 preview image (Apple Silicon, ad-hoc signed, with its Gatekeeper steps) or from PyPI, model setup, and one-key Doubao Search authorization (with Tavily/keyless backups) |
-| [**Upgrading**](docs/upgrading.md) | Newest first. The next release (schema 32 → 35): stop the daemon and copy the data directory before the first start, because going back is unsupported. From 0.2.x: back up the database before the 27 → 32 schema migration, why going back to 0.2.x is unsupported, and the access token that is now always required |
+| [**Startup guide**](docs/startup-guide.md) | macOS 0.3.1 walkthrough: PyPI installation on Apple Silicon and Intel, model setup, and Doubao Search; older previews remain as historical reference |
+| [**Upgrading**](docs/upgrading.md) | Newest first. 0.3.1 (schema 32 → 35): stop the daemon and copy the data directory before the first start, because going back is unsupported. From 0.2.x: back up the database before the 27 → 32 schema migration, why going back to 0.2.x is unsupported, and the access token that is now always required |
 | [**Architecture**](docs/architecture.md) | the hybrid action router, Action Ledger, `host` RPC, and lazy kernels |
 | [**Backend extension guide**](docs/backend-extension-guide.md) | where new Tool classes, host services, repositories, and session behaviour belong |
 | [**Model backend bring-up**](docs/model-backend-bringup.md) | local/remote GPU selection, checkpoint staging, real-inference canary admission, and connector portability |
@@ -305,7 +326,7 @@ The canonical bilingual documentation is published at **[openai4s.org/docs](http
 
 ### Next
 
-- [ ] **A notarized macOS image and arm64 packages.** The Linux package ships from `v0.2.0` and the Windows/WSL2 package from `v0.3.0`, but the macOS image is still an ad-hoc-signed preview that Gatekeeper blocks on first launch, and only `x86_64` is published for Linux and Windows. A Developer ID-signed, notarized `.dmg` plus arm64 Linux and Windows-on-ARM packages would let every supported platform install without a toolchain.
+- [ ] **A notarized macOS image and arm64 packages.** The Linux package ships from `v0.2.0` and the Windows/WSL2 package from `v0.3.0`, while 0.3.1 omits the macOS DMG (older images remain unnotarized previews), and only `x86_64` is published for Linux and Windows. A Developer ID-signed, notarized `.dmg` plus arm64 Linux and Windows-on-ARM packages would let every supported platform install without a toolchain.
 - [ ] **NVIDIA scientific computing suites** — bring **BioNeMo** (biomolecular foundation models) and **Parabricks** (GPU-accelerated genomics pipelines) in as first-class Skills and BYOC backends, beyond today's NVIDIA NIM integration.
 - [ ] Local GPU model serving so structure/design Skills run without remote compute.
 - [ ] More BYOC providers (Modal / SLURM) beyond SSH + NVIDIA NIM.
@@ -393,26 +414,27 @@ Released under the **MIT License** — see [`LICENSE`](LICENSE).
 <a href="https://github.com/Nobody-Zhang" title="Nobody-Zhang"><img src=".github/contributors/Nobody-Zhang.png" width="64" height="64" alt="Nobody-Zhang" /></a>
 <a href="https://github.com/wangyu-sd" title="wangyu-sd"><img src=".github/contributors/wangyu-sd.png" width="64" height="64" alt="wangyu-sd" /></a>
 <a href="https://github.com/HowardLi1984" title="HowardLi1984"><img src=".github/contributors/HowardLi1984.png" width="64" height="64" alt="HowardLi1984" /></a>
+<a href="https://github.com/dvd233" title="dvd233"><img src=".github/contributors/dvd233.png" width="64" height="64" alt="dvd233" /></a>
 <a href="https://github.com/Linmj-Judy" title="Linmj-Judy"><img src=".github/contributors/Linmj-Judy.png" width="64" height="64" alt="Linmj-Judy" /></a>
 <a href="https://github.com/YuyangSunshine" title="YuyangSunshine"><img src=".github/contributors/YuyangSunshine.png" width="64" height="64" alt="YuyangSunshine" /></a>
-<a href="https://github.com/Weifeng2Wu" title="Weifeng2Wu"><img src=".github/contributors/Weifeng2Wu.png" width="64" height="64" alt="Weifeng2Wu" /></a>
-<a href="https://github.com/CyrusAuyeung" title="CyrusAuyeung"><img src=".github/contributors/CyrusAuyeung.png" width="64" height="64" alt="CyrusAuyeung" /></a>
-<a href="https://github.com/Lyu6PosHao" title="Lyu6PosHao"><img src=".github/contributors/Lyu6PosHao.png" width="64" height="64" alt="Lyu6PosHao" /></a>
-<a href="https://github.com/ClarenceYC" title="ClarenceYC"><img src=".github/contributors/ClarenceYC.png" width="64" height="64" alt="ClarenceYC" /></a>
-<a href="https://github.com/muzimu217" title="muzimu217"><img src=".github/contributors/muzimu217.png" width="64" height="64" alt="muzimu217" /></a>
-<a href="https://github.com/WenyuLiang" title="WenyuLiang"><img src=".github/contributors/WenyuLiang.png" width="64" height="64" alt="WenyuLiang" /></a>
 <a href="https://github.com/Grace-xyx" title="Grace-xyx"><img src=".github/contributors/Grace-xyx.png" width="64" height="64" alt="Grace-xyx" /></a>
-<a href="https://github.com/Devin-jun" title="Devin-jun"><img src=".github/contributors/Devin-jun.png" width="64" height="64" alt="Devin-jun" /></a>
-<a href="https://github.com/ChampionZhong" title="ChampionZhong"><img src=".github/contributors/ChampionZhong.png" width="64" height="64" alt="ChampionZhong" /></a>
+<a href="https://github.com/difficulttopickaname" title="difficulttopickaname"><img src=".github/contributors/difficulttopickaname.png" width="64" height="64" alt="difficulttopickaname" /></a>
+<a href="https://github.com/Weifeng2Wu" title="Weifeng2Wu"><img src=".github/contributors/Weifeng2Wu.png" width="64" height="64" alt="Weifeng2Wu" /></a>
 <a href="https://github.com/cursoragent" title="cursoragent"><img src=".github/contributors/cursoragent.png" width="64" height="64" alt="cursoragent" /></a>
+<a href="https://github.com/Lyu6PosHao" title="Lyu6PosHao"><img src=".github/contributors/Lyu6PosHao.png" width="64" height="64" alt="Lyu6PosHao" /></a>
+<a href="https://github.com/CyrusAuyeung" title="CyrusAuyeung"><img src=".github/contributors/CyrusAuyeung.png" width="64" height="64" alt="CyrusAuyeung" /></a>
+<a href="https://github.com/Devin-jun" title="Devin-jun"><img src=".github/contributors/Devin-jun.png" width="64" height="64" alt="Devin-jun" /></a>
+<a href="https://github.com/WenyuLiang" title="WenyuLiang"><img src=".github/contributors/WenyuLiang.png" width="64" height="64" alt="WenyuLiang" /></a>
+<a href="https://github.com/muzimu217" title="muzimu217"><img src=".github/contributors/muzimu217.png" width="64" height="64" alt="muzimu217" /></a>
+<a href="https://github.com/ClarenceYC" title="ClarenceYC"><img src=".github/contributors/ClarenceYC.png" width="64" height="64" alt="ClarenceYC" /></a>
+<a href="https://github.com/brainsparker" title="brainsparker"><img src=".github/contributors/brainsparker.png" width="64" height="64" alt="brainsparker" /></a>
+<a href="https://github.com/ChampionZhong" title="ChampionZhong"><img src=".github/contributors/ChampionZhong.png" width="64" height="64" alt="ChampionZhong" /></a>
 <a href="https://github.com/yusowa0716" title="yusowa0716"><img src=".github/contributors/yusowa0716.png" width="64" height="64" alt="yusowa0716" /></a>
 <a href="https://github.com/riiiiiiin" title="riiiiiiin"><img src=".github/contributors/riiiiiiin.png" width="64" height="64" alt="riiiiiiin" /></a>
 <a href="https://github.com/jiangzx25" title="jiangzx25"><img src=".github/contributors/jiangzx25.png" width="64" height="64" alt="jiangzx25" /></a>
 <a href="https://github.com/stau-7001" title="stau-7001"><img src=".github/contributors/stau-7001.png" width="64" height="64" alt="stau-7001" /></a>
 <a href="https://github.com/EQSTLab" title="EQSTLab"><img src=".github/contributors/EQSTLab.png" width="64" height="64" alt="EQSTLab" /></a>
-<a href="https://github.com/difficulttopickaname" title="difficulttopickaname"><img src=".github/contributors/difficulttopickaname.png" width="64" height="64" alt="difficulttopickaname" /></a>
 <a href="https://github.com/Pandasama2025" title="Pandasama2025"><img src=".github/contributors/Pandasama2025.png" width="64" height="64" alt="Pandasama2025" /></a>
-<a href="https://github.com/dvd233" title="dvd233"><img src=".github/contributors/dvd233.png" width="64" height="64" alt="dvd233" /></a>
 <!-- CONTRIBUTORS:END -->
 
 <sub>Auto-generated daily from the GitHub <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">contributors graph</a> and a maintained public-recognition list by <code>scripts/update_contributors.py</code>.</sub>
